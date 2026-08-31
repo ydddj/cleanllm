@@ -1,4 +1,5 @@
 (() => {
+  const polish = document.createElement("style"); polish.textContent = ".advanced-model-actions{display:inline-flex;flex-wrap:wrap;gap:6px;margin-right:8px}.advanced-model-actions .button{min-height:34px;padding:0 11px}.data-table td{vertical-align:middle}.data-table td:first-child code{overflow-wrap:anywhere}.log-view,.log-line{font-size:11px!important}.modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:20px}#cleanllm-modal dl{display:grid;grid-template-columns:90px 1fr;gap:10px;margin:18px 0}#cleanllm-modal dt{color:var(--muted)}#cleanllm-modal dd{margin:0;overflow-wrap:anywhere}"; document.head.append(polish);
   const $ = (selector) => document.querySelector(selector);
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
   const request = async (url, options) => {
@@ -9,7 +10,7 @@
   };
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
   const nav = document.querySelector(".nav");
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.0";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.1";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const securityPage = document.querySelector('[data-view="security"] .panel-body');
   if (securityPage && !document.querySelector("#restart-container")) {
@@ -36,22 +37,22 @@
   if (patterns) {
     patterns.insertAdjacentHTML("beforebegin", `<label class="field wide"><span>备用上游（JSON）</span><textarea id="upstreams" rows="6" spellcheck="false" placeholder='[{"name":"备用","url":"http://server/v1/chat/completions","api_key":""}]'></textarea><small>默认上游失败后按顺序切换。</small></label><label class="field wide"><span>模型路由（JSON）</span><textarea id="model_routes" rows="5" spellcheck="false" placeholder='[{"pattern":"qwen*","upstreams":["默认上游","备用"]}]'></textarea><small>支持 * 和 ? 通配符。</small></label>`);
     const footer = $("#settings-form .form-footer");
-    footer.insertAdjacentHTML("beforebegin", `<div class="wide" style="display:flex;gap:9px;flex-wrap:wrap"><button id="save-routing" class="button primary" type="button">保存路由设置</button><button id="test-connections" class="button" type="button">测试全部连接</button><button id="export-settings" class="button" type="button">导出脱敏配置</button><label class="button" style="display:inline-flex;align-items:center">导入配置<input id="import-settings" type="file" accept="application/json" hidden></label><button id="reset-settings" class="button" type="button" style="color:var(--red)">恢复默认值</button></div><div id="connection-results" class="wide"></div>`);
+    footer.insertAdjacentHTML("beforebegin", `<div class="wide" style="display:flex;gap:9px;flex-wrap:wrap"><button id="test-connections" class="button" type="button">测试全部连接</button><button id="export-settings" class="button" type="button">导出脱敏配置</button><label class="button" style="display:inline-flex;align-items:center">导入配置<input id="import-settings" type="file" accept="application/json" hidden></label><button id="reset-settings" class="button" type="button" style="color:var(--red)">恢复默认值</button></div><div id="connection-results" class="wide"></div>`);
     request("/api/settings").then((data) => {
       $("#upstreams").value = JSON.stringify(data.upstreams || [], null, 2);
       $("#model_routes").value = JSON.stringify(data.model_routes || [], null, 2);
     }).catch(() => {});
   }
 
-  $("#save-routing")?.addEventListener("click", async () => {
+  $("#settings-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault(); event.stopImmediatePropagation();
+    const button=event.currentTarget.querySelector('button[type="submit"]'); button.disabled=true;
     try {
-      const current = await request("/api/settings");
-      current.upstreams = JSON.parse($("#upstreams").value || "[]");
-      current.model_routes = JSON.parse($("#model_routes").value || "[]");
-      await request("/api/settings", {method:"PUT", headers:{"Content-Type":"application/json"}, body:JSON.stringify(current)});
-      notify("多上游与模型路由已保存");
-    } catch (error) { notify(`保存失败：${error.message}`, true); }
-  });
+      const current=await request("/api/settings");
+      Object.assign(current,{target_api_url:$("#target_api_url").value,api_key:$("#api_key").value,timeout_seconds:Number($("#timeout_seconds").value),models_api_url:$("#models_api_url").value,ollama_api_url:$("#ollama_api_url").value,upstreams:JSON.parse($("#upstreams").value||"[]"),model_routes:JSON.parse($("#model_routes").value||"[]"),clean_patterns:$("#clean_patterns").value.split("\n").map(line=>line.trim()).filter(Boolean)});
+      await request("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(current)}); notify("全部设置已保存");
+    } catch(error) { notify(`保存失败：${error.message}`,true); } finally { button.disabled=false; }
+  }, true);
   $("#test-connections")?.addEventListener("click", async (event) => {
     event.currentTarget.disabled = true;
     try {
