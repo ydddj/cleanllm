@@ -9,6 +9,8 @@
   };
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
   const nav = document.querySelector(".nav");
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.0";
+  const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const securityPage = document.querySelector('[data-view="security"] .panel-body');
   if (securityPage && !document.querySelector("#restart-container")) {
     securityPage.insertAdjacentHTML("beforeend", '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)"><button id="restart-container" class="button" style="color:var(--red)">重启容器</button><p class="form-note">仅重启 CleanLLM 容器，不会删除设置或模型。</p></div>');
@@ -27,6 +29,10 @@
   }
 
   const patterns = $("#clean_patterns")?.closest(".field");
+  const logPage = document.querySelector('[data-view="logs"] .panel-header');
+  if (logPage) logPage.insertAdjacentHTML("beforeend", '<label style="display:flex;align-items:center;gap:7px;font-size:12px">日志上限 <input id="log-max-mb" type="number" min="1" max="50" step="1" style="width:68px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft)"> MB <button id="save-log-limit" class="button">保存</button></label>');
+  request("/api/settings").then((data) => { if ($("#log-max-mb")) $("#log-max-mb").value = Math.round((data.log_max_bytes || 5242880) / 1048576); }).catch(() => {});
+  $("#save-log-limit")?.addEventListener("click", async () => { try { const current=await request("/api/settings"), mb=Number($("#log-max-mb").value); current.log_max_bytes=mb*1048576; await request("/api/settings", {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(current)}); notify(`日志上限已设置为 ${mb} MB`); } catch(error) { notify(error.message,true); } });
   if (patterns) {
     patterns.insertAdjacentHTML("beforebegin", `<label class="field wide"><span>备用上游（JSON）</span><textarea id="upstreams" rows="6" spellcheck="false" placeholder='[{"name":"备用","url":"http://server/v1/chat/completions","api_key":""}]'></textarea><small>默认上游失败后按顺序切换。</small></label><label class="field wide"><span>模型路由（JSON）</span><textarea id="model_routes" rows="5" spellcheck="false" placeholder='[{"pattern":"qwen*","upstreams":["默认上游","备用"]}]'></textarea><small>支持 * 和 ? 通配符。</small></label>`);
     const footer = $("#settings-form .form-footer");

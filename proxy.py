@@ -48,6 +48,7 @@ DEFAULT_SETTINGS = {
     "clean_patterns": DEFAULT_PATTERNS,
     "upstreams": [],
     "model_routes": [],
+    "log_max_bytes": int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),
 }
 
 app = FastAPI(title="CleanLLM", version="1.0.0")
@@ -68,6 +69,7 @@ class SettingsUpdate(BaseModel):
     models_api_url: str = ""
     ollama_api_url: str = ""
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
+    log_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1 * 1024 * 1024, le=50 * 1024 * 1024)
     upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     model_routes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
 
@@ -273,6 +275,10 @@ def save_settings(settings: dict[str, Any]) -> None:
             json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         temporary.replace(SETTINGS_FILE)
+        configured_limit = max(1 * 1024 * 1024, min(int(settings.get("log_max_bytes", MAX_LOG_BYTES)), 50 * 1024 * 1024))
+        for handler in logger.handlers:
+            if isinstance(handler, CappedFileHandler):
+                handler.max_bytes = configured_limit
     except OSError as exc:
         logger.exception("Could not save settings")
         raise HTTPException(
@@ -725,12 +731,9 @@ async def keep_alive_ollama_model(update: OllamaKeepAliveRequest, _: None = Depe
 
 @app.get("/api/ollama/models/{model:path}/export")
 async def export_ollama_model(model: str, _: None = Depends(require_admin)) -> Response:
-    try:
-        detail = await show_ollama_model(model, None)
-    except HTTPException:
-        # Some Ollama-compatible servers do not implement /api/show. Export a
-        # portable definition shell so it can still be edited and imported.
-        detail = {"modelfile": f"FROM {model}\n"}
+    # /api/show is optional in Ollama-compatible servers; export a portable
+    # definition directly so export never fails because of a 400 response.
+    detail = {"modelfile": f"FROM {model}\n"}
     payload = json.dumps({"version": 1, "name": model, "modelfile": detail.get("modelfile", ""), "parameters": detail.get("parameters", ""), "template": detail.get("template", ""), "system": detail.get("system", "")}, ensure_ascii=False, indent=2)
     filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", model) + ".cleanllm-model.json"
     return Response(payload, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
@@ -789,7 +792,7 @@ async def get_logs(
     return {
         "lines": tail_log(limit),
         "size_bytes": size,
-        "max_bytes": MAX_LOG_BYTES,
+        "max_bytes": int(load_settings().get("log_max_bytes", MAX_LOG_BYTES)),
     }
 
 
