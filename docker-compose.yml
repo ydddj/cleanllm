@@ -7,6 +7,8 @@ services:
       - "${HOST_PORT:-11515}:11515"
     environment:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
       TARGET_API_URL: ${TARGET_API_URL:-http://host.docker.internal:11434/v1/chat/completions}
       UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}

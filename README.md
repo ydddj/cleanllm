@@ -1,6 +1,6 @@
 # CleanLLM
 
-带网页设置界面的 OpenAI 兼容代理，可连接 Ollama 或其他兼容服务，并清理模型响应中的思考和系统标签。
+带网页登录设置界面的 OpenAI 兼容代理，可连接 Ollama 或其他兼容服务，并使用自定义正则表达式清理模型响应。
 
 ## Docker Compose 启动
 
@@ -15,6 +15,7 @@ services:
       - "11515:11515"
     environment:
       ADMIN_PASSWORD: "请改成强密码"
+      SESSION_SECRET: "请改成另一段足够长的随机字符串"
     volumes:
       - cleanllm-data:/data
     extra_hosts:
@@ -45,11 +46,13 @@ docker compose logs -f
 docker compose down
 ```
 
-打开 `http://localhost:11515`，输入 `ADMIN_PASSWORD` 后设置上游服务。
+打开 `http://localhost:11515`，在登录页输入 `ADMIN_PASSWORD` 后设置上游服务。登录状态保存在 HttpOnly 会话 Cookie 中，有效期为 12 小时。
 
 客户端请求地址为 `http://你的主机:11515/v1/chat/completions`。设置保存在 Docker 数据卷中，升级容器不会丢失。
 
-常用环境变量：`ADMIN_PASSWORD`（管理密码）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存后以数据卷设置为准。
+常用环境变量：`ADMIN_PASSWORD`（管理密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存后以数据卷设置为准。
+
+响应清洗规则在网页中按“每行一条正则表达式”填写，匹配内容会被删除。默认规则兼容原有的 Channel、Think 和孤立标签清理；保存时会自动检查正则语法。
 
 如果需要从源码构建，请复制 `.env.example` 为 `.env`，然后执行：
 
