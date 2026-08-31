@@ -9,10 +9,21 @@
   };
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
   const nav = document.querySelector(".nav");
+  const securityPage = document.querySelector('[data-view="security"] .panel-body');
+  if (securityPage && !document.querySelector("#restart-container")) {
+    securityPage.insertAdjacentHTML("beforeend", '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)"><button id="restart-container" class="button" style="color:var(--red)">重启容器</button><p class="form-note">仅重启 CleanLLM 容器，不会删除设置或模型。</p></div>');
+    $("#restart-container").onclick = async () => { if (!confirm("确定重启 CleanLLM 容器？")) return; try { const result=await request("/api/system/restart", {method:"POST"}); notify(result.message); } catch(error) { notify(error.message, true); } };
+  }
   if (nav && !document.querySelector('[data-page="changelog"]')) {
     nav.insertAdjacentHTML("beforeend", '<a href="#changelog" data-page="changelog"><span>▤</span><span>更新日志</span></a>');
     document.querySelector(".content-wrap")?.insertAdjacentHTML("beforeend", '<section class="page" data-view="changelog"><section class="panel"><div id="changelog-content" class="panel-body">正在读取更新日志…</div></section></section>');
     request("/api/changelog").then((data) => { $("#changelog-content").innerHTML = `<pre style="white-space:pre-wrap;font:13px/1.7 inherit">${escape(data.content)}</pre>`; }).catch((error) => { $("#changelog-content").textContent = error.message; });
+    nav.querySelector('[data-page="changelog"]').addEventListener("click", (event) => {
+      event.preventDefault();
+      document.querySelectorAll(".nav a").forEach((link) => link.classList.toggle("active", link.dataset.page === "changelog"));
+      document.querySelectorAll(".page").forEach((view) => view.classList.toggle("active", view.dataset.view === "changelog"));
+      $("#page-eyebrow").textContent = "系统"; $("#page-title").textContent = "更新日志"; $("#page-description").textContent = "查看 CleanLLM 的功能更新与修复记录"; $("#page-actions").innerHTML = "";
+    });
   }
 
   const patterns = $("#clean_patterns")?.closest(".field");

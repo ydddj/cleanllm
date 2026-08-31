@@ -10,6 +10,7 @@ import re
 import secrets
 import time
 import uuid
+import signal
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -49,7 +50,7 @@ DEFAULT_SETTINGS = {
     "model_routes": [],
 }
 
-app = FastAPI(title="CleanLLM", version="3.2.0")
+app = FastAPI(title="CleanLLM", version="1.0.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -724,7 +725,12 @@ async def keep_alive_ollama_model(update: OllamaKeepAliveRequest, _: None = Depe
 
 @app.get("/api/ollama/models/{model:path}/export")
 async def export_ollama_model(model: str, _: None = Depends(require_admin)) -> Response:
-    detail = await show_ollama_model(model, None)
+    try:
+        detail = await show_ollama_model(model, None)
+    except HTTPException:
+        # Some Ollama-compatible servers do not implement /api/show. Export a
+        # portable definition shell so it can still be edited and imported.
+        detail = {"modelfile": f"FROM {model}\n"}
     payload = json.dumps({"version": 1, "name": model, "modelfile": detail.get("modelfile", ""), "parameters": detail.get("parameters", ""), "template": detail.get("template", ""), "system": detail.get("system", "")}, ensure_ascii=False, indent=2)
     filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", model) + ".cleanllm-model.json"
     return Response(payload, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
@@ -745,6 +751,13 @@ async def import_ollama_model(update: OllamaImportRequest, _: None = Depends(req
 async def get_changelog(_: None = Depends(require_admin)) -> dict[str, str]:
     path = BASE_DIR / "CHANGELOG.md"
     return {"content": path.read_text(encoding="utf-8") if path.exists() else "暂无更新记录"}
+
+
+@app.post("/api/system/restart")
+async def restart_container(_: None = Depends(require_admin)) -> dict[str, str]:
+    logger.warning("Container restart requested from Web UI")
+    asyncio.get_running_loop().call_later(0.4, lambda: os.kill(os.getpid(), signal.SIGTERM))
+    return {"message": "容器正在重启，请稍候刷新页面"}
 
 
 @app.delete("/api/ollama/models")
