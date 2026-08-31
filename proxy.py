@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import base64
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 class LoginRequest(BaseModel):
+    username: str = "admin"
     password: str
 
 
@@ -70,8 +72,54 @@ class SettingsUpdate(BaseModel):
         return cleaned
 
 
+class AccountUpdate(BaseModel):
+    current_password: str
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 def admin_password() -> str:
     return os.getenv("ADMIN_PASSWORD", "")
+
+
+def admin_username() -> str:
+    return os.getenv("ADMIN_USERNAME", "admin")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=32)
+    return "scrypt$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    try:
+        algorithm, salt_text, digest_text = encoded.split("$", 2)
+        if algorithm != "scrypt":
+            return False
+        salt = base64.urlsafe_b64decode(salt_text.encode())
+        expected = base64.urlsafe_b64decode(digest_text.encode())
+        actual = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=len(expected))
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def configured_credentials() -> tuple[str, str | None]:
+    settings = load_settings()
+    password_hash = settings.get("admin_password_hash")
+    if isinstance(password_hash, str) and password_hash:
+        return str(settings.get("admin_username") or "admin"), password_hash
+    return admin_username(), None
+
+
+def credentials_valid(username: str, password: str) -> bool:
+    configured_username, password_hash = configured_credentials()
+    username_ok = secrets.compare_digest(username.encode(), configured_username.encode())
+    if password_hash:
+        return username_ok and verify_password(password, password_hash)
+    password_ok = bool(admin_password()) and secrets.compare_digest(password.encode(), admin_password().encode())
+    return username_ok and password_ok
 
 
 def session_secret() -> bytes:
@@ -79,25 +127,31 @@ def session_secret() -> bytes:
     return value.encode("utf-8")
 
 
+def auth_revision() -> str:
+    return str(load_settings().get("_auth_revision") or "environment")
+
+
 def create_session_token() -> str:
     timestamp = str(int(time.time()))
-    signature = hmac.new(session_secret(), timestamp.encode(), hashlib.sha256).hexdigest()
-    return f"{timestamp}.{signature}"
+    revision = auth_revision()
+    message = f"{timestamp}.{revision}"
+    signature = hmac.new(session_secret(), message.encode(), hashlib.sha256).hexdigest()
+    return f"{message}.{signature}"
 
 
 def valid_session(token: str | None) -> bool:
-    if not token or not admin_password():
+    if not token or not session_secret():
         return False
     try:
-        timestamp_text, signature = token.split(".", 1)
+        timestamp_text, revision, signature = token.split(".", 2)
         timestamp = int(timestamp_text)
     except (ValueError, TypeError):
         return False
     if timestamp > time.time() + 60 or time.time() - timestamp > SESSION_MAX_AGE:
         return False
-    expected = hmac.new(
-        session_secret(), timestamp_text.encode(), hashlib.sha256
-    ).hexdigest()
+    if not secrets.compare_digest(revision, auth_revision()):
+        return False
+    expected = hmac.new(session_secret(), f"{timestamp_text}.{revision}".encode(), hashlib.sha256).hexdigest()
     return secrets.compare_digest(signature, expected)
 
 
@@ -164,11 +218,11 @@ async def login_page(request: Request):
 
 @app.post("/api/login")
 async def login(login_data: LoginRequest) -> JSONResponse:
-    password = admin_password()
-    if not password:
-        raise HTTPException(status_code=503, detail="尚未配置 ADMIN_PASSWORD")
-    if not secrets.compare_digest(login_data.password.encode(), password.encode()):
-        raise HTTPException(status_code=401, detail="密码错误")
+    _, password_hash = configured_credentials()
+    if not password_hash and not admin_password():
+        raise HTTPException(status_code=503, detail="尚未配置初始 ADMIN_PASSWORD")
+    if not credentials_valid(login_data.username, login_data.password):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
     response = JSONResponse({"message": "登录成功"})
     response.set_cookie(
         SESSION_COOKIE,
@@ -196,15 +250,41 @@ async def health() -> dict[str, str]:
 
 @app.get("/api/settings")
 async def get_settings(_: None = Depends(require_admin)) -> dict[str, Any]:
-    return load_settings()
+    settings = load_settings()
+    return {key: settings[key] for key in DEFAULT_SETTINGS}
 
 
 @app.put("/api/settings")
 async def update_settings(
     update: SettingsUpdate, _: None = Depends(require_admin)
 ) -> dict[str, str]:
-    save_settings(update.model_dump(mode="json"))
+    settings = load_settings()
+    settings.update(update.model_dump(mode="json"))
+    save_settings(settings)
     return {"message": "设置已保存"}
+
+
+@app.get("/api/account")
+async def get_account(_: None = Depends(require_admin)) -> dict[str, str]:
+    username, _ = configured_credentials()
+    return {"username": username}
+
+
+@app.put("/api/account")
+async def update_account(
+    update: AccountUpdate, _: None = Depends(require_admin)
+) -> JSONResponse:
+    current_username, _ = configured_credentials()
+    if not credentials_valid(current_username, update.current_password):
+        raise HTTPException(status_code=403, detail="当前密码错误")
+    settings = load_settings()
+    settings["admin_username"] = update.username
+    settings["admin_password_hash"] = hash_password(update.new_password)
+    settings["_auth_revision"] = secrets.token_hex(16)
+    save_settings(settings)
+    response = JSONResponse({"message": "账户已更新，请重新登录"})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 @app.post("/v1/chat/completions")

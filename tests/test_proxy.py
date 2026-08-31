@@ -16,7 +16,9 @@ def client_for(tmp_path: Path) -> TestClient:
 
 
 def login(client: TestClient) -> None:
-    response = client.post("/api/login", json={"password": "test-password"})
+    response = client.post(
+        "/api/login", json={"username": "admin", "password": "test-password"}
+    )
     assert response.status_code == 200
     assert response.cookies.get(proxy.SESSION_COOKIE)
 
@@ -25,7 +27,9 @@ def test_web_login_and_protected_settings(tmp_path: Path) -> None:
     client = client_for(tmp_path)
     assert client.get("/").status_code == 200
     assert client.get("/api/settings").status_code == 401
-    assert client.post("/api/login", json={"password": "wrong"}).status_code == 401
+    assert client.post(
+        "/api/login", json={"username": "admin", "password": "wrong"}
+    ).status_code == 401
     login(client)
     assert client.get("/api/settings").status_code == 200
 
@@ -59,6 +63,62 @@ def test_invalid_regex_returns_json_validation_error(tmp_path: Path) -> None:
     )
     assert response.status_code == 422
     assert response.headers["content-type"].startswith("application/json")
+
+
+def test_account_change_hashes_password_and_invalidates_session(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    response = client.put(
+        "/api/account",
+        json={
+            "current_password": "test-password",
+            "username": "new-admin",
+            "new_password": "new-secure-password",
+        },
+    )
+    assert response.status_code == 200, response.text
+    saved_text = proxy.SETTINGS_FILE.read_text(encoding="utf-8")
+    assert "new-secure-password" not in saved_text
+    saved = proxy.load_settings()
+    assert saved["admin_username"] == "new-admin"
+    assert saved["admin_password_hash"].startswith("scrypt$")
+    assert client.get("/api/settings").status_code == 401
+    assert client.post(
+        "/api/login",
+        json={"username": "admin", "password": "test-password"},
+    ).status_code == 401
+    assert client.post(
+        "/api/login",
+        json={"username": "new-admin", "password": "new-secure-password"},
+    ).status_code == 200
+
+
+def test_proxy_settings_save_preserves_account_hash(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    assert client.put(
+        "/api/account",
+        json={
+            "current_password": "test-password",
+            "username": "owner",
+            "new_password": "another-secure-password",
+        },
+    ).status_code == 200
+    assert client.post(
+        "/api/login",
+        json={"username": "owner", "password": "another-secure-password"},
+    ).status_code == 200
+    original_hash = proxy.load_settings()["admin_password_hash"]
+    response = client.put(
+        "/api/settings",
+        json={
+            "target_api_url": "http://ollama:11434/v1/chat/completions",
+            "timeout_seconds": 90,
+            "clean_patterns": [],
+        },
+    )
+    assert response.status_code == 200
+    assert proxy.load_settings()["admin_password_hash"] == original_hash
 
 
 def test_save_permission_error_is_json(tmp_path: Path) -> None:
