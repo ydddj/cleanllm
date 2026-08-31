@@ -1,0 +1,19 @@
+services:
+  api-proxy:
+    build: .
+    image: ${DOCKER_IMAGE:-cleanllm:latest}
+    container_name: cleanllm
+    ports:
+      - "${HOST_PORT:-11515}:11515"
+    environment:
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      TARGET_API_URL: ${TARGET_API_URL:-http://host.docker.internal:11434/v1/chat/completions}
+      UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
+    volumes:
+      - cleanllm-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+volumes:
+  cleanllm-data:
