@@ -8,6 +8,12 @@
     return data;
   };
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
+  const nav = document.querySelector(".nav");
+  if (nav && !document.querySelector('[data-page="changelog"]')) {
+    nav.insertAdjacentHTML("beforeend", '<a href="#changelog" data-page="changelog"><span>▤</span><span>更新日志</span></a>');
+    document.querySelector(".content-wrap")?.insertAdjacentHTML("beforeend", '<section class="page" data-view="changelog"><section class="panel"><div id="changelog-content" class="panel-body">正在读取更新日志…</div></section></section>');
+    request("/api/changelog").then((data) => { $("#changelog-content").innerHTML = `<pre style="white-space:pre-wrap;font:13px/1.7 inherit">${escape(data.content)}</pre>`; }).catch((error) => { $("#changelog-content").textContent = error.message; });
+  }
 
   const patterns = $("#clean_patterns")?.closest(".field");
   if (patterns) {
@@ -55,16 +61,16 @@
       const name = cell.querySelector("code")?.textContent;
       if (!name) return;
       const button = document.createElement("button");
-      button.className = "copy-model"; button.title = "复制模型名称"; button.setAttribute("aria-label", "复制模型名称"); button.textContent = "⧉";
+      button.className = "copy-model"; button.title = "复制名称"; button.setAttribute("aria-label", "复制名称"); button.textContent = "⧉";
       button.style.cssText = "margin-left:8px;border:0;background:transparent;color:var(--primary);font-size:17px";
-      button.onclick = async () => { await navigator.clipboard.writeText(name); notify(`已复制：${name}`); };
+      button.onclick = async () => { try { await navigator.clipboard.writeText(name); } catch (_) { const area=document.createElement("textarea"); area.value=name; document.body.append(area); area.select(); document.execCommand("copy"); area.remove(); } notify(`已复制：${name}`); };
       cell.append(button);
     });
     document.querySelectorAll("#ollama-models tbody tr").forEach((row) => {
       const action = row.lastElementChild, model = row.querySelector("code")?.textContent;
       if (!action || !model || action.querySelector(".advanced-model-actions")) return;
       const controls = document.createElement("span"); controls.className = "advanced-model-actions";
-      controls.innerHTML = `<button class="button" data-model-action="detail">详情</button> <button class="button" data-model-action="duplicate">复制模型</button> <button class="button" data-model-action="load">加载</button> <button class="button" data-model-action="unload">卸载</button>`;
+      controls.innerHTML = `<button class="button" data-model-action="detail">详情</button> <button class="button" data-model-action="duplicate">克隆模型</button> <button class="button" data-model-action="load">加载</button> <button class="button" data-model-action="unload">卸载</button> <button class="button" data-model-action="export">导出</button>`;
       action.prepend(controls);
       controls.querySelectorAll("button").forEach((button) => button.onclick = (event) => { event.stopPropagation(); modelAction(model, button.dataset.modelAction); });
     });
@@ -76,18 +82,24 @@
     try {
       if (action === "detail") {
         const detail = await request(`/api/ollama/models/${encodeURIComponent(model)}`), info = detail.details || {};
-        alert(`模型：${model}\n系列：${info.family || '—'}\n参数：${info.parameter_size || '—'}\n量化：${info.quantization_level || '—'}\n格式：${info.format || '—'}\n上下文：${detail.model_info?.['llama.context_length'] || detail.model_info?.['qwen2.context_length'] || '—'}`);
+        showModal(`<h3>模型详情</h3><p><strong>${escape(model)}</strong></p><dl><dt>系列</dt><dd>${escape(info.family || '—')}</dd><dt>参数</dt><dd>${escape(info.parameter_size || '—')}</dd><dt>量化</dt><dd>${escape(info.quantization_level || '—')}</dd><dt>格式</dt><dd>${escape(info.format || '—')}</dd><dt>上下文</dt><dd>${escape(detail.model_info?.['llama.context_length'] || detail.model_info?.['qwen2.context_length'] || '—')}</dd></dl>`);
       } else if (action === "duplicate") {
-        const destination = prompt("复制后的模型名称：", `${model}-copy`); if (!destination) return;
+        const destination = await askModal("克隆模型", "克隆后的模型名称", `${model}-copy`); if (!destination) return;
         const result = await request("/api/ollama/copy", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source:model,destination})}); notify(result.message); if(typeof loadOllama === "function") loadOllama();
+      } else if (action === "export") { location.assign(`/api/ollama/models/${encodeURIComponent(model)}/export`);
       } else {
         const result = await request("/api/ollama/keep-alive", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model,keep_alive:action==='unload'?'0':'5m'})}); notify(result.message);
       }
     } catch (error) { notify(error.message, true); }
   }
 
+  function showModal(content) { let modal=$("#cleanllm-modal"); if(!modal){document.body.insertAdjacentHTML("beforeend",'<div id="cleanllm-modal" style="position:fixed;inset:0;background:#0008;z-index:200;display:grid;place-items:center"><div style="background:var(--surface);color:var(--text);padding:24px;border-radius:16px;width:min(520px,92vw);max-height:80vh;overflow:auto"><div id="cleanllm-modal-body"></div><button class="button primary" id="close-cleanllm-modal">关闭</button></div></div>');modal=$("#cleanllm-modal");$("#close-cleanllm-modal").onclick=()=>modal.remove();} $("#cleanllm-modal-body").innerHTML=content; }
+  function askModal(title,label,value){ return new Promise((resolve)=>{showModal(`<h3>${title}</h3><label class="field"><span>${label}</span><input id="modal-input" value="${escape(value)}"></label><button class="button primary" id="modal-ok">确定</button>`);$("#modal-ok").onclick=()=>{const result=$("#modal-input").value;$("#cleanllm-modal").remove();resolve(result);};}); }
+
   const ollamaPanel = $("#ollama-panel .panel-body");
   if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", `<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><strong>后台拉取任务</strong><button id="background-pull" class="button">后台拉取当前模型</button></div><div id="ollama-tasks" style="margin-top:10px"></div></div>`);
+  if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", '<div style="margin-top:12px"><label class="button">导入模型定义<input id="import-model" type="file" accept=".json,application/json" hidden></label></div>');
+  $("#import-model")?.addEventListener("change", async (event) => { try { const data=JSON.parse(await event.target.files[0].text()); const result=await request("/api/ollama/models/import", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:data.name,modelfile:data.modelfile || data.template || ""})}); notify(result.message); if(typeof loadOllama === "function") loadOllama(); } catch(error) { notify(`导入失败：${error.message}`,true); } });
   $("#background-pull")?.addEventListener("click", async () => {
     const model = $("#ollama-model-name").value.trim();
     if (!model) return notify("请输入模型名称", true);

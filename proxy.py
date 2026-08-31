@@ -122,6 +122,11 @@ class OllamaKeepAliveRequest(BaseModel):
     keep_alive: str = Field(default="5m", max_length=20)
 
 
+class OllamaImportRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    modelfile: str = Field(min_length=1, max_length=2_000_000)
+
+
 class CappedFileHandler(logging.FileHandler):
     def __init__(self, filename: Path, max_bytes: int) -> None:
         self.max_bytes = max_bytes
@@ -715,6 +720,31 @@ async def keep_alive_ollama_model(update: OllamaKeepAliveRequest, _: None = Depe
         except (httpx.RequestError, httpx.HTTPStatusError) as exc:
             raise HTTPException(status_code=502, detail=f"模型加载状态修改失败：{exc}") from exc
     return {"message": "模型已卸载" if update.keep_alive == "0" else "模型已加载"}
+
+
+@app.get("/api/ollama/models/{model:path}/export")
+async def export_ollama_model(model: str, _: None = Depends(require_admin)) -> Response:
+    detail = await show_ollama_model(model, None)
+    payload = json.dumps({"version": 1, "name": model, "modelfile": detail.get("modelfile", ""), "parameters": detail.get("parameters", ""), "template": detail.get("template", ""), "system": detail.get("system", "")}, ensure_ascii=False, indent=2)
+    filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", model) + ".cleanllm-model.json"
+    return Response(payload, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.post("/api/ollama/models/import")
+async def import_ollama_model(update: OllamaImportRequest, _: None = Depends(require_admin)) -> dict[str, str]:
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            response = await client.post(f"{ollama_base_url(load_settings())}/api/create", json={"model": update.name, "modelfile": update.modelfile, "stream": False})
+            response.raise_for_status()
+    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+        raise HTTPException(status_code=502, detail=f"导入模型定义失败：{exc}") from exc
+    return {"message": f"模型 {update.name} 已导入"}
+
+
+@app.get("/api/changelog")
+async def get_changelog(_: None = Depends(require_admin)) -> dict[str, str]:
+    path = BASE_DIR / "CHANGELOG.md"
+    return {"content": path.read_text(encoding="utf-8") if path.exists() else "暂无更新记录"}
 
 
 @app.delete("/api/ollama/models")
