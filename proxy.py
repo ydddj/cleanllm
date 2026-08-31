@@ -9,6 +9,7 @@ import secrets
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 import uvicorn
@@ -21,6 +22,8 @@ logger = logging.getLogger("cleanllm")
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
 SETTINGS_FILE = DATA_DIR / "settings.json"
+LOG_FILE = DATA_DIR / "cleanllm.log"
+MAX_LOG_BYTES = 5 * 1024 * 1024
 STATIC_DIR = BASE_DIR / "static"
 SESSION_COOKIE = "cleanllm_session"
 SESSION_MAX_AGE = 12 * 60 * 60
@@ -36,10 +39,11 @@ DEFAULT_SETTINGS = {
     ),
     "api_key": os.getenv("UPSTREAM_API_KEY", ""),
     "timeout_seconds": int(os.getenv("REQUEST_TIMEOUT", "120")),
+    "models_api_url": os.getenv("MODELS_API_URL", ""),
     "clean_patterns": DEFAULT_PATTERNS,
 }
 
-app = FastAPI(title="CleanLLM", version="3.0.0")
+app = FastAPI(title="CleanLLM", version="3.2.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -52,7 +56,18 @@ class SettingsUpdate(BaseModel):
     target_api_url: HttpUrl
     api_key: str = ""
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
+    models_api_url: str = ""
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
+
+    @field_validator("models_api_url")
+    @classmethod
+    def validate_models_url(cls, value: str) -> str:
+        value = value.strip()
+        if value:
+            parsed = urlsplit(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError("模型列表地址必须是有效的 HTTP/HTTPS URL")
+        return value
 
     @field_validator("clean_patterns")
     @classmethod
@@ -76,6 +91,49 @@ class AccountUpdate(BaseModel):
     current_password: str
     username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     new_password: str = Field(min_length=8, max_length=128)
+
+
+class CappedFileHandler(logging.FileHandler):
+    def __init__(self, filename: Path, max_bytes: int) -> None:
+        self.max_bytes = max_bytes
+        super().__init__(filename, encoding="utf-8")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        try:
+            if self.stream and self.stream.tell() > self.max_bytes:
+                self.stream.flush()
+                self.stream.close()
+                keep_bytes = self.max_bytes // 2
+                with open(self.baseFilename, "rb") as source:
+                    source.seek(max(0, os.path.getsize(self.baseFilename) - keep_bytes))
+                    tail = source.read()
+                newline = tail.find(b"\n")
+                if newline >= 0:
+                    tail = tail[newline + 1 :]
+                with open(self.baseFilename, "wb") as target:
+                    target.write(b"--- older log entries trimmed (5 MB limit) ---\n")
+                    target.write(tail)
+                self.stream = self._open()
+        except OSError:
+            self.handleError(record)
+
+
+def configure_file_logging() -> None:
+    if any(isinstance(handler, CappedFileHandler) for handler in logger.handlers):
+        return
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        handler = CappedFileHandler(LOG_FILE, MAX_LOG_BYTES)
+        handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = True
+    except OSError as exc:
+        logging.getLogger("uvicorn.error").warning("File logging disabled: %s", exc)
+
+
+configure_file_logging()
 
 
 def admin_password() -> str:
@@ -196,10 +254,53 @@ def clean_content(text: str, settings: dict[str, Any]) -> str:
     return text.strip()
 
 
+def models_url(settings: dict[str, Any]) -> str:
+    override = str(settings.get("models_api_url") or "").strip()
+    if override:
+        return override
+    parsed = urlsplit(str(settings["target_api_url"]))
+    path = parsed.path.rstrip("/")
+    for suffix in ("/chat/completions", "/responses"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)] + "/models"
+            break
+    else:
+        path = path.rsplit("/", 1)[0] + "/models"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def tail_log(limit: int) -> list[str]:
+    try:
+        if not LOG_FILE.exists():
+            return []
+        with LOG_FILE.open("rb") as handle:
+            size = handle.seek(0, 2)
+            handle.seek(max(0, size - min(size, 512 * 1024)))
+            text = handle.read().decode("utf-8", errors="replace")
+        return text.splitlines()[-limit:]
+    except OSError as exc:
+        logger.warning("Could not read log file: %s", exc)
+        return []
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception(_: Request, exc: Exception) -> JSONResponse:
     logger.exception("Unhandled server error", exc_info=exc)
     return JSONResponse(status_code=500, content={"detail": "服务器内部错误，请查看容器日志"})
+
+
+@app.middleware("http")
+async def request_log_middleware(request: Request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        logger.exception("%s %s failed", request.method, request.url.path)
+        raise
+    if request.url.path != "/health":
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info("%s %s -> %s (%.1f ms)", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
 
 
 @app.get("/", include_in_schema=False)
@@ -285,6 +386,61 @@ async def update_account(
     response = JSONResponse({"message": "账户已更新，请重新登录"})
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response
+
+
+@app.get("/api/models")
+async def get_models(_: None = Depends(require_admin)) -> dict[str, Any]:
+    settings = load_settings()
+    url = models_url(settings)
+    headers: dict[str, str] = {"Accept": "application/json"}
+    if settings.get("api_key"):
+        headers["Authorization"] = f"Bearer {settings['api_key']}"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                url, headers=headers, timeout=min(float(settings["timeout_seconds"]), 30.0)
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+        logger.warning("Model discovery failed for %s: %s", url, exc)
+        raise HTTPException(status_code=502, detail=f"获取上游模型失败：{exc}") from exc
+    raw_models = payload.get("data", []) if isinstance(payload, dict) else []
+    if not raw_models and isinstance(payload, dict):
+        raw_models = payload.get("models", [])
+    models: list[dict[str, Any]] = []
+    for item in raw_models if isinstance(raw_models, list) else []:
+        if isinstance(item, str):
+            models.append({"id": item, "owned_by": "upstream", "created": None})
+        elif isinstance(item, dict):
+            model_id = item.get("id") or item.get("name") or item.get("model")
+            if model_id:
+                models.append(
+                    {
+                        "id": str(model_id),
+                        "owned_by": str(item.get("owned_by") or item.get("owner") or "upstream"),
+                        "created": item.get("created") or item.get("modified_at"),
+                    }
+                )
+    models.sort(key=lambda item: item["id"].lower())
+    logger.info("Discovered %d upstream models from %s", len(models), url)
+    return {"source": url, "count": len(models), "data": models}
+
+
+@app.get("/api/logs")
+async def get_logs(
+    limit: int = 500, _: None = Depends(require_admin)
+) -> dict[str, Any]:
+    limit = max(1, min(limit, 2000))
+    try:
+        size = LOG_FILE.stat().st_size if LOG_FILE.exists() else 0
+    except OSError:
+        size = 0
+    return {
+        "lines": tail_log(limit),
+        "size_bytes": size,
+        "max_bytes": MAX_LOG_BYTES,
+    }
 
 
 @app.post("/v1/chat/completions")

@@ -1,6 +1,6 @@
 # CleanLLM
 
-带网页登录设置界面的 OpenAI 兼容代理，可连接 Ollama 或其他兼容服务，并使用自定义正则表达式清理模型响应。
+带 Web 管理中心的 OpenAI 兼容代理，可连接 Ollama 或其他兼容服务，支持自定义正则清洗、上游模型发现和限量运行日志。
 
 ## Docker Compose 启动
 
@@ -56,6 +56,10 @@ docker compose down
 `extra_hosts` 仅用于让 Linux 容器通过 `host.docker.internal` 访问宿主机。如果上游使用局域网 IP、公网地址或同一 Compose 中的服务名，可以删除这段配置；默认上游在宿主机时建议保留。
 
 响应清洗规则在网页中按“每行一条正则表达式”填写，匹配内容会被删除。默认规则兼容原有的 Channel、Think 和孤立标签清理；保存时会自动检查正则语法。
+
+管理中心可通过上游的 OpenAI 兼容 `/v1/models` 接口展示全部可用模型。默认地址由 Chat Completions 地址自动推导；非标准上游可通过网页或 `MODELS_API_URL` 单独指定。
+
+运行日志保存在数据卷的 `/data/cleanllm.log`，仅记录请求状态和系统事件，不记录 API Key 或请求正文。日志文件严格限制为 5 MB，达到上限后自动裁剪最旧内容。
 
 如果需要从源码构建，请复制 `.env.example` 为 `.env`，然后执行：
 
