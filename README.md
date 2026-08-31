@@ -2,15 +2,60 @@
 
 带网页设置界面的 OpenAI 兼容代理，可连接 Ollama 或其他兼容服务，并清理模型响应中的思考和系统标签。
 
-## 启动
+## Docker Compose 启动
 
-1. 复制 `.env.example` 为 `.env`，至少修改 `ADMIN_PASSWORD`。
-2. 执行 `docker compose up -d --build`。
-3. 打开 `http://localhost:11515`，输入管理密码后设置上游服务。
+新建 `compose.yml`：
+
+```yaml
+services:
+  cleanllm:
+    image: ydddj/cleanllm:latest
+    container_name: cleanllm
+    ports:
+      - "11515:11515"
+    environment:
+      ADMIN_PASSWORD: "请改成强密码"
+    volumes:
+      - cleanllm-data:/data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  cleanllm-data:
+```
+
+启动服务：
+
+```bash
+docker compose up -d
+```
+
+更新到最新镜像：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+查看日志或停止服务：
+
+```bash
+docker compose logs -f
+docker compose down
+```
+
+打开 `http://localhost:11515`，输入 `ADMIN_PASSWORD` 后设置上游服务。
 
 客户端请求地址为 `http://你的主机:11515/v1/chat/completions`。设置保存在 Docker 数据卷中，升级容器不会丢失。
 
 常用环境变量：`ADMIN_PASSWORD`（管理密码）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存后以数据卷设置为准。
+
+如果需要从源码构建，请复制 `.env.example` 为 `.env`，然后执行：
+
+```bash
+docker compose up -d --build
+```
 
 ## 自动发布到 Docker Hub
 
