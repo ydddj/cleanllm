@@ -10,6 +10,7 @@
   };
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
   const nav = document.querySelector(".nav");
+  const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
   const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.1";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const securityPage = document.querySelector('[data-view="security"] .panel-body');
@@ -104,7 +105,7 @@
       } else if (action === "duplicate") {
         const destination = await askModal("克隆模型", "克隆后的模型名称", `${model}-copy`); if (!destination) return;
         const result = await request("/api/ollama/copy", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source:model,destination})}); notify(result.message); if(typeof loadOllama === "function") loadOllama();
-      } else if (action === "export") { location.assign(`/api/ollama/models/${encodeURIComponent(model)}/export`);
+      } else if (action === "export") { location.assign(`/api/ollama/export?model=${encodeURIComponent(model)}`);
       } else {
         const result = await request("/api/ollama/keep-alive", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model,keep_alive:action==='unload'?'0':'5m'})}); notify(result.message);
       }

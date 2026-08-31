@@ -696,6 +696,11 @@ async def retry_ollama_task(task_id: str, _: None = Depends(require_admin)) -> d
     return await create_ollama_task(OllamaModelRequest(model=old["model"]), None)
 
 
+@app.get("/api/ollama/export")
+async def export_ollama_model_safe(model: str, _: None = Depends(require_admin)) -> Response:
+    return await export_ollama_model(model, None)
+
+
 @app.get("/api/ollama/models/{model:path}")
 async def show_ollama_model(model: str, _: None = Depends(require_admin)) -> dict[str, Any]:
     async with httpx.AsyncClient() as client:
