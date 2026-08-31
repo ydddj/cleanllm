@@ -1,12 +1,15 @@
 import hashlib
 import hmac
 import base64
+import asyncio
+import fnmatch
 import json
 import logging
 import os
 import re
 import secrets
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -14,7 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -42,10 +45,14 @@ DEFAULT_SETTINGS = {
     "models_api_url": os.getenv("MODELS_API_URL", ""),
     "ollama_api_url": os.getenv("OLLAMA_API_URL", ""),
     "clean_patterns": DEFAULT_PATTERNS,
+    "upstreams": [],
+    "model_routes": [],
 }
 
 app = FastAPI(title="CleanLLM", version="3.2.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
+OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
 
 
 class LoginRequest(BaseModel):
@@ -60,6 +67,8 @@ class SettingsUpdate(BaseModel):
     models_api_url: str = ""
     ollama_api_url: str = ""
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
+    upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    model_routes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
 
     @field_validator("models_api_url", "ollama_api_url")
     @classmethod
@@ -97,6 +106,20 @@ class AccountUpdate(BaseModel):
 
 class OllamaModelRequest(BaseModel):
     model: str = Field(min_length=1, max_length=200)
+
+
+class ConfigImportRequest(BaseModel):
+    settings: dict[str, Any]
+
+
+class OllamaCopyRequest(BaseModel):
+    source: str = Field(min_length=1, max_length=200)
+    destination: str = Field(min_length=1, max_length=200)
+
+
+class OllamaKeepAliveRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
+    keep_alive: str = Field(default="5m", max_length=20)
 
 
 class CappedFileHandler(logging.FileHandler):
@@ -283,6 +306,57 @@ def ollama_base_url(settings: dict[str, Any]) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
 
 
+def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
+    primary = {
+        "name": "默认上游",
+        "url": str(settings["target_api_url"]),
+        "api_key": str(settings.get("api_key") or ""),
+        "timeout": int(settings.get("timeout_seconds") or 120),
+    }
+    result = [primary]
+    for item in settings.get("upstreams", []):
+        if not isinstance(item, dict) or not item.get("url"):
+            continue
+        parsed = urlsplit(str(item["url"]))
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        result.append({
+            "name": str(item.get("name") or f"上游 {len(result) + 1}"),
+            "url": str(item["url"]),
+            "api_key": str(item.get("api_key") or ""),
+            "timeout": max(1, min(int(item.get("timeout") or 120), 3600)),
+        })
+    return result
+
+
+def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]]:
+    upstreams = configured_upstreams(settings)
+    names = {item["name"]: item for item in upstreams}
+    preferred: list[dict[str, Any]] = []
+    for route in settings.get("model_routes", []):
+        if not isinstance(route, dict) or not fnmatch.fnmatchcase(model, str(route.get("pattern") or "")):
+            continue
+        for name in route.get("upstreams", []):
+            if name in names and names[name] not in preferred:
+                preferred.append(names[name])
+        break
+    return preferred + [item for item in upstreams if item not in preferred]
+
+
+def clean_stream_line(line: str, settings: dict[str, Any]) -> str:
+    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+        return line
+    try:
+        payload = json.loads(line[6:])
+        for choice in payload.get("choices", []):
+            delta = choice.get("delta") or {}
+            if isinstance(delta.get("content"), str):
+                delta["content"] = clean_content(delta["content"], settings)
+        return "data: " + json.dumps(payload, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        return line
+
+
 def tail_log(limit: int) -> list[str]:
     try:
         if not LOG_FILE.exists():
@@ -377,6 +451,65 @@ async def update_settings(
     settings.update(update.model_dump(mode="json"))
     save_settings(settings)
     return {"message": "设置已保存"}
+
+
+@app.post("/api/settings/test")
+async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
+    settings = load_settings()
+    results = []
+    async with httpx.AsyncClient() as client:
+        for upstream in configured_upstreams(settings):
+            headers = {"Authorization": f"Bearer {upstream['api_key']}"} if upstream["api_key"] else {}
+            url = upstream["url"]
+            parsed = urlsplit(url)
+            probe = urlunsplit((parsed.scheme, parsed.netloc, "/v1/models", "", ""))
+            started = time.perf_counter()
+            try:
+                response = await client.get(probe, headers=headers, timeout=8.0)
+                response.raise_for_status()
+                results.append({"name": upstream["name"], "ok": True, "latency_ms": round((time.perf_counter()-started)*1000), "detail": "模型接口正常"})
+            except Exception as exc:
+                results.append({"name": upstream["name"], "ok": False, "latency_ms": round((time.perf_counter()-started)*1000), "detail": str(exc)})
+        try:
+            response = await client.get(f"{ollama_base_url(settings)}/api/version", timeout=5.0)
+            response.raise_for_status()
+            results.append({"name": "Ollama 管理接口", "ok": True, "detail": response.json().get("version", "正常")})
+        except Exception as exc:
+            results.append({"name": "Ollama 管理接口", "ok": False, "detail": str(exc)})
+    return {"results": results}
+
+
+@app.get("/api/settings/export")
+async def export_settings(_: None = Depends(require_admin)) -> Response:
+    settings = load_settings()
+    safe = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS}
+    safe["api_key"] = ""
+    for upstream in safe.get("upstreams", []):
+        if isinstance(upstream, dict):
+            upstream["api_key"] = ""
+    payload = json.dumps({"version": 1, "settings": safe}, ensure_ascii=False, indent=2)
+    return Response(payload, media_type="application/json", headers={"Content-Disposition": "attachment; filename=cleanllm-settings.json"})
+
+
+@app.post("/api/settings/import")
+async def import_settings(update: ConfigImportRequest, _: None = Depends(require_admin)) -> dict[str, str]:
+    current = load_settings()
+    candidate = {key: update.settings.get(key, current.get(key)) for key in DEFAULT_SETTINGS}
+    validated = SettingsUpdate.model_validate(candidate).model_dump(mode="json")
+    current.update(validated)
+    save_settings(current)
+    return {"message": "配置已导入"}
+
+
+@app.post("/api/settings/reset")
+async def reset_settings(_: None = Depends(require_admin)) -> dict[str, str]:
+    current = load_settings()
+    preserved = {key: current[key] for key in ("admin_username", "admin_password_hash", "_auth_revision") if key in current}
+    reset = DEFAULT_SETTINGS.copy()
+    reset["clean_patterns"] = DEFAULT_PATTERNS.copy()
+    reset.update(preserved)
+    save_settings(reset)
+    return {"message": "代理设置已恢复默认值"}
 
 
 @app.get("/api/account")
@@ -502,6 +635,88 @@ async def pull_ollama_model(
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
 
+async def run_ollama_pull(task_id: str, model: str) -> None:
+    task = OLLAMA_TASKS[task_id]
+    task.update(status="running", updated_at=int(time.time()))
+    try:
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", f"{ollama_base_url(load_settings())}/api/pull", json={"name": model, "stream": True}) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    item = json.loads(line)
+                    task.update(message=item.get("status", "处理中"), completed=item.get("completed", 0), total=item.get("total", 0), updated_at=int(time.time()))
+        task.update(status="completed", message="拉取完成", updated_at=int(time.time()))
+    except asyncio.CancelledError:
+        task.update(status="cancelled", message="已取消", updated_at=int(time.time()))
+    except Exception as exc:
+        task.update(status="failed", message=str(exc), updated_at=int(time.time()))
+
+
+@app.post("/api/ollama/tasks")
+async def create_ollama_task(update: OllamaModelRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
+    task_id = uuid.uuid4().hex
+    OLLAMA_TASKS[task_id] = {"id": task_id, "model": update.model, "status": "queued", "message": "等待开始", "completed": 0, "total": 0, "created_at": int(time.time()), "updated_at": int(time.time())}
+    OLLAMA_HANDLES[task_id] = asyncio.create_task(run_ollama_pull(task_id, update.model))
+    return OLLAMA_TASKS[task_id]
+
+
+@app.get("/api/ollama/tasks")
+async def list_ollama_tasks(_: None = Depends(require_admin)) -> dict[str, Any]:
+    return {"data": sorted(OLLAMA_TASKS.values(), key=lambda item: item["created_at"], reverse=True)}
+
+
+@app.post("/api/ollama/tasks/{task_id}/cancel")
+async def cancel_ollama_task(task_id: str, _: None = Depends(require_admin)) -> dict[str, str]:
+    handle = OLLAMA_HANDLES.get(task_id)
+    if not handle or handle.done():
+        raise HTTPException(status_code=409, detail="任务已结束或不存在")
+    handle.cancel()
+    return {"message": "取消请求已发送"}
+
+
+@app.post("/api/ollama/tasks/{task_id}/retry")
+async def retry_ollama_task(task_id: str, _: None = Depends(require_admin)) -> dict[str, Any]:
+    old = OLLAMA_TASKS.get(task_id)
+    if not old or old["status"] not in {"failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail="只有失败或取消的任务可以重试")
+    return await create_ollama_task(OllamaModelRequest(model=old["model"]), None)
+
+
+@app.get("/api/ollama/models/{model:path}")
+async def show_ollama_model(model: str, _: None = Depends(require_admin)) -> dict[str, Any]:
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(f"{ollama_base_url(load_settings())}/api/show", json={"name": model}, timeout=20.0)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail=f"获取模型详情失败：{exc}") from exc
+
+
+@app.post("/api/ollama/copy")
+async def copy_ollama_model(update: OllamaCopyRequest, _: None = Depends(require_admin)) -> dict[str, str]:
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(f"{ollama_base_url(load_settings())}/api/copy", json={"source": update.source, "destination": update.destination}, timeout=30.0)
+            response.raise_for_status()
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            raise HTTPException(status_code=502, detail=f"复制模型失败：{exc}") from exc
+    return {"message": f"已复制为 {update.destination}"}
+
+
+@app.post("/api/ollama/keep-alive")
+async def keep_alive_ollama_model(update: OllamaKeepAliveRequest, _: None = Depends(require_admin)) -> dict[str, str]:
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.post(f"{ollama_base_url(load_settings())}/api/generate", json={"model": update.model, "keep_alive": update.keep_alive, "stream": False}, timeout=30.0)
+            response.raise_for_status()
+        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            raise HTTPException(status_code=502, detail=f"模型加载状态修改失败：{exc}") from exc
+    return {"message": "模型已卸载" if update.keep_alive == "0" else "模型已加载"}
+
+
 @app.delete("/api/ollama/models")
 async def delete_ollama_model(
     update: OllamaModelRequest, _: None = Depends(require_admin)
@@ -536,7 +751,7 @@ async def get_logs(
 
 
 @app.post("/v1/chat/completions")
-async def proxy_api(request: Request) -> JSONResponse:
+async def proxy_api(request: Request) -> Response:
     try:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError) as exc:
@@ -544,28 +759,53 @@ async def proxy_api(request: Request) -> JSONResponse:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
     settings = load_settings()
-    payload["stream"] = False
-    headers = {"Content-Type": "application/json"}
-    if settings["api_key"]:
-        headers["Authorization"] = f"Bearer {settings['api_key']}"
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                settings["target_api_url"],
-                json=payload,
-                headers=headers,
-                timeout=float(settings["timeout_seconds"]),
-            )
-    except httpx.RequestError as exc:
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": {
-                    "message": f"无法连接上游服务：{exc}",
-                    "type": "upstream_error",
-                }
-            },
-        )
+    streaming = payload.get("stream") is True
+    failures = []
+    response = None
+    selected = None
+    client = None
+    for upstream in route_upstreams(settings, str(payload.get("model") or "")):
+        headers = {"Content-Type": "application/json"}
+        if upstream["api_key"]:
+            headers["Authorization"] = f"Bearer {upstream['api_key']}"
+        try:
+            if streaming:
+                candidate_client = httpx.AsyncClient(timeout=None)
+                candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=payload, headers=headers), stream=True)
+                if candidate.status_code >= 500:
+                    failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
+                    await candidate.aclose()
+                    await candidate_client.aclose()
+                    continue
+                client, response, selected = candidate_client, candidate, upstream
+            else:
+                async with httpx.AsyncClient() as candidate_client:
+                    candidate = await candidate_client.post(upstream["url"], json=payload, headers=headers, timeout=float(upstream["timeout"]))
+                if candidate.status_code >= 500:
+                    failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
+                    continue
+                response, selected = candidate, upstream
+            break
+        except httpx.RequestError as exc:
+            failures.append(f"{upstream['name']}: {exc}")
+    if response is None:
+        return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
+    logger.info("Model %s routed to %s", payload.get("model", ""), selected["name"])
+    if streaming:
+        async def stream_response():
+            buffer = ""
+            try:
+                async for text in response.aiter_text():
+                    buffer += text
+                    while "\n" in buffer:
+                        line, buffer = buffer.split("\n", 1)
+                        yield (clean_stream_line(line, settings) + "\n").encode("utf-8")
+                if buffer:
+                    yield clean_stream_line(buffer, settings).encode("utf-8")
+            finally:
+                await response.aclose()
+                await client.aclose()
+        return StreamingResponse(stream_response(), status_code=response.status_code, media_type=response.headers.get("content-type", "text/event-stream"))
     try:
         data = response.json()
     except ValueError:
