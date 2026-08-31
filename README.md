@@ -67,6 +67,10 @@ docker compose down
 docker compose up -d --build
 ```
 
+## Ollama 模型管理
+
+进入 Web 管理中心的“模型列表”，可查看 Ollama 状态、拉取模型并查看实时进度，也可删除已安装模型。`OLLAMA_API_URL` 留空时，CleanLLM 会从 `TARGET_API_URL` 自动提取地址；例如 `http://host.docker.internal:11434/v1/chat/completions` 会使用 `http://host.docker.internal:11434`。如果上游不是 Ollama，OpenAI 兼容模型列表仍可正常使用，管理区会提示 Ollama 不可用。
+
 ## 自动发布到 Docker Hub
 
 项目包含 GitHub Actions 自动发布流程。请在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 中添加：

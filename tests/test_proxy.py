@@ -162,6 +162,12 @@ def test_models_url_is_derived_and_can_be_overridden() -> None:
 
 
 def test_log_api_reads_tail_and_reports_five_mb_limit(tmp_path: Path) -> None:
+    assert proxy.ollama_base_url(
+        {"target_api_url": "http://ollama:11434/v1/chat/completions", "ollama_api_url": ""}
+    ) == "http://ollama:11434"
+    assert proxy.ollama_base_url(
+        {"target_api_url": "http://other/v1/chat/completions", "ollama_api_url": "http://ollama:11434/"}
+    ) == "http://ollama:11434"
     client = client_for(tmp_path)
     proxy.LOG_FILE = tmp_path / "cleanllm.log"
     proxy.LOG_FILE.write_text("one\ntwo\nthree\n", encoding="utf-8")
@@ -169,6 +175,46 @@ def test_log_api_reads_tail_and_reports_five_mb_limit(tmp_path: Path) -> None:
     result = client.get("/api/logs?limit=2").json()
     assert result["lines"] == ["two", "three"]
     assert result["max_bytes"] == 5 * 1024 * 1024
+
+
+def test_ollama_models_and_delete(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"models": [{"name": "qwen3:8b", "size": 100, "modified_at": "2026-01-02T03:04:05Z"}]}
+
+    class FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append(("GET", url, None))
+            return FakeResponse()
+
+        async def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs.get("json")))
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    result = client.get("/api/ollama/models")
+    assert result.status_code == 200
+    assert result.json()["data"][0]["id"] == "qwen3:8b"
+    deleted = client.request("DELETE", "/api/ollama/models", json={"model": "qwen3:8b"})
+    assert deleted.status_code == 200
+    assert (
+        "DELETE",
+        "http://host.docker.internal:11434/api/delete",
+        {"name": "qwen3:8b"},
+    ) in calls
 
 
 def test_model_discovery_normalizes_openai_response(tmp_path: Path, monkeypatch) -> None:

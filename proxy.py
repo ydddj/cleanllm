@@ -14,7 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -40,6 +40,7 @@ DEFAULT_SETTINGS = {
     "api_key": os.getenv("UPSTREAM_API_KEY", ""),
     "timeout_seconds": int(os.getenv("REQUEST_TIMEOUT", "120")),
     "models_api_url": os.getenv("MODELS_API_URL", ""),
+    "ollama_api_url": os.getenv("OLLAMA_API_URL", ""),
     "clean_patterns": DEFAULT_PATTERNS,
 }
 
@@ -57,16 +58,17 @@ class SettingsUpdate(BaseModel):
     api_key: str = ""
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
     models_api_url: str = ""
+    ollama_api_url: str = ""
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
 
-    @field_validator("models_api_url")
+    @field_validator("models_api_url", "ollama_api_url")
     @classmethod
     def validate_models_url(cls, value: str) -> str:
         value = value.strip()
         if value:
             parsed = urlsplit(value)
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ValueError("模型列表地址必须是有效的 HTTP/HTTPS URL")
+                raise ValueError("接口地址必须是有效的 HTTP/HTTPS URL")
         return value
 
     @field_validator("clean_patterns")
@@ -91,6 +93,10 @@ class AccountUpdate(BaseModel):
     current_password: str
     username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     new_password: str = Field(min_length=8, max_length=128)
+
+
+class OllamaModelRequest(BaseModel):
+    model: str = Field(min_length=1, max_length=200)
 
 
 class CappedFileHandler(logging.FileHandler):
@@ -269,6 +275,14 @@ def models_url(settings: dict[str, Any]) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
+def ollama_base_url(settings: dict[str, Any]) -> str:
+    override = str(settings.get("ollama_api_url") or "").strip()
+    if override:
+        return override.rstrip("/")
+    parsed = urlsplit(str(settings["target_api_url"]))
+    return urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
+
+
 def tail_log(limit: int) -> list[str]:
     try:
         if not LOG_FILE.exists():
@@ -425,6 +439,84 @@ async def get_models(_: None = Depends(require_admin)) -> dict[str, Any]:
     models.sort(key=lambda item: item["id"].lower())
     logger.info("Discovered %d upstream models from %s", len(models), url)
     return {"source": url, "count": len(models), "data": models}
+
+
+@app.get("/api/ollama/status")
+async def get_ollama_status(_: None = Depends(require_admin)) -> dict[str, Any]:
+    base_url = ollama_base_url(load_settings())
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{base_url}/api/version", timeout=5.0)
+            response.raise_for_status()
+            payload = response.json()
+        return {"available": True, "version": payload.get("version", "未知"), "base_url": base_url}
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+        logger.info("Ollama is unavailable at %s: %s", base_url, exc)
+        return {"available": False, "version": None, "base_url": base_url}
+
+
+@app.get("/api/ollama/models")
+async def get_ollama_models(_: None = Depends(require_admin)) -> dict[str, Any]:
+    base_url = ollama_base_url(load_settings())
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{base_url}/api/tags", timeout=15.0)
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"无法获取 Ollama 模型：{exc}") from exc
+    data = []
+    for item in payload.get("models", []) if isinstance(payload, dict) else []:
+        if isinstance(item, dict) and (item.get("name") or item.get("model")):
+            data.append({
+                "id": str(item.get("name") or item.get("model")),
+                "size": item.get("size"),
+                "digest": item.get("digest"),
+                "modified_at": item.get("modified_at"),
+                "details": item.get("details") or {},
+            })
+    data.sort(key=lambda item: item["id"].lower())
+    return {"source": base_url, "count": len(data), "data": data}
+
+
+@app.post("/api/ollama/pull")
+async def pull_ollama_model(
+    update: OllamaModelRequest, _: None = Depends(require_admin)
+) -> StreamingResponse:
+    base_url = ollama_base_url(load_settings())
+    logger.info("Pulling Ollama model %s", update.model)
+
+    async def stream():
+        try:
+            async with httpx.AsyncClient(timeout=None) as client:
+                async with client.stream(
+                    "POST", f"{base_url}/api/pull", json={"name": update.model, "stream": True}
+                ) as response:
+                    response.raise_for_status()
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+        except Exception as exc:
+            logger.warning("Ollama pull failed for %s: %s", update.model, exc)
+            yield (json.dumps({"error": f"拉取失败：{exc}"}, ensure_ascii=False) + "\n").encode()
+
+    return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.delete("/api/ollama/models")
+async def delete_ollama_model(
+    update: OllamaModelRequest, _: None = Depends(require_admin)
+) -> dict[str, str]:
+    base_url = ollama_base_url(load_settings())
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.request(
+                "DELETE", f"{base_url}/api/delete", json={"name": update.model}, timeout=30.0
+            )
+            response.raise_for_status()
+    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+        raise HTTPException(status_code=502, detail=f"删除 Ollama 模型失败：{exc}") from exc
+    logger.info("Deleted Ollama model %s", update.model)
+    return {"message": f"模型 {update.model} 已删除"}
 
 
 @app.get("/api/logs")
