@@ -11,6 +11,7 @@ import secrets
 import time
 import uuid
 import signal
+import socket
 import tarfile
 import tempfile
 import io
@@ -61,7 +62,7 @@ DEFAULT_SETTINGS = {
     "api_usage": [],
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.19")
+app = FastAPI(title="CleanLLM", version="1.0.20")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -975,8 +976,25 @@ async def get_changelog(_: None = Depends(require_admin)) -> dict[str, str]:
 @app.post("/api/system/restart")
 async def restart_container(_: None = Depends(require_admin)) -> dict[str, str]:
     logger.warning("Container restart requested from Web UI")
+    docker_socket = Path("/var/run/docker.sock")
+    if docker_socket.exists():
+        container_id = socket.gethostname()
+        async def restart_with_docker() -> None:
+            def call_engine() -> None:
+                client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    client.settimeout(5)
+                    client.connect(str(docker_socket))
+                    request = f"POST /containers/{container_id}/restart?t=10 HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                    client.sendall(request.encode("ascii"))
+                    client.recv(4096)
+                finally:
+                    client.close()
+            await asyncio.to_thread(call_engine)
+        asyncio.create_task(restart_with_docker())
+        return {"message": "Docker 已收到重启请求，页面将在数秒后恢复"}
     asyncio.get_running_loop().call_later(0.4, lambda: os.kill(os.getpid(), signal.SIGTERM))
-    return {"message": "容器正在重启，请稍候刷新页面"}
+    return {"message": "正在退出当前进程，请由容器重启策略自动拉起"}
 
 
 @app.delete("/api/ollama/models")

@@ -1,5 +1,10 @@
 # CleanLLM 更新日志
 
+## 1.0.20 · 2026-09-01
+
+- 使用 Docker Engine API 重启容器，避免直接终止 Uvicorn 后容器无法恢复。
+- Compose 增加 Docker Socket、日志级别和模型缓存环境变量。
+
 ## 1.0.19 · 2026-09-01
 
 - 新增系统日志清除按钮。
