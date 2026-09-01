@@ -91,4 +91,4 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-推送到 `main` 后会发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.10`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+推送到 `main` 后会发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.11`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。

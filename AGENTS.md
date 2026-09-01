@@ -32,6 +32,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Keep navigation state in the URL hash so refresh and direct links restore the same page; release notes are a separate page from runtime logs.
 - The UI provides approximately ten persisted Morandi color palettes; new palette changes must remain CSS-variable based and work in light/dark mode.
 - Keep hover hints limited to important icon-only controls; do not add redundant tooltips to ordinary labeled buttons.
+- Default both login and admin pages to dark mode before application scripts run, avoiding a light-theme flash; log level colors must use theme variables.
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
 
 ## Configuration rules
