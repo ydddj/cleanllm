@@ -29,6 +29,8 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Keep the log file capped at 5 MB and preserve `/data` volume compatibility.
 - Ollama model definition exports should remain compatible with Open WebUI metadata; full weight exports use `.ollama.tar.gz` archives from the mounted models directory.
 - Keep the admin layout fluid on wide screens and horizontally scrollable for dense tables on narrow screens.
+- Keep navigation state in the URL hash so refresh and direct links restore the same page; release notes are a separate page from runtime logs.
+- The UI provides approximately ten persisted Morandi color palettes; new palette changes must remain CSS-variable based and work in light/dark mode.
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
 
 ## Configuration rules
