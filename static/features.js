@@ -4,7 +4,7 @@
   if (typeof loadModels === "function") loadModels(); document.documentElement.classList.add("js-ready");
   const sprite=document.querySelector('.icon-sprite'); if(sprite&&!document.getElementById('i-palette')) sprite.insertAdjacentHTML('beforeend','<symbol id="i-palette" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="9" cy="9" r="1"/><circle cx="15" cy="8" r="1"/><circle cx="16" cy="14" r="1"/><path d="M8 16h2a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-chevron" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5"/></symbol><symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2"/></symbol>');
   if (typeof pages === "object") pages["api-tokens"] = ["系统", "API 访问令牌", "管理访问令牌、用量和使用日志"];
-  if (typeof showPage === "function") showPage(); document.body.style.visibility="visible";
+  if (typeof showPage === "function") showPage(); if (typeof loadAccount === "function") loadAccount().finally(()=>{document.body.style.visibility="visible"});
   const savedTheme = localStorage.getItem("cleanllm-theme") || "dark";
   document.documentElement.dataset.theme = savedTheme === "light" ? "light" : "dark";
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
@@ -22,7 +22,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}html:not(.js-ready) .page[data-view=dashboard]{display:block}.panel{width:100%}.log-line .level{color:var(--primary)!important}.button{cursor:pointer!important}.stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}@media(max-width:980px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}@media(max-width:600px){.stats-grid{grid-template-columns:1fr!important}}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.24";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.25";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
