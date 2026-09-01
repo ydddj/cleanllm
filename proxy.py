@@ -285,6 +285,19 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def token_cipher(token: str, token_id: str) -> str:
+    key = hashlib.sha256(session_secret() + token_id.encode()).digest()
+    raw = token.encode()
+    encrypted = bytes(value ^ key[index % len(key)] for index, value in enumerate(raw))
+    return base64.urlsafe_b64encode(encrypted).decode()
+
+
+def token_plain(cipher: str, token_id: str) -> str:
+    key = hashlib.sha256(session_secret() + token_id.encode()).digest()
+    encrypted = base64.urlsafe_b64decode(cipher.encode())
+    return bytes(value ^ key[index % len(key)] for index, value in enumerate(encrypted)).decode()
+
+
 def require_api_token(request: Request) -> None:
     settings = load_settings()
     configured = [item for item in settings.get("api_tokens", []) if isinstance(item, dict) and item.get("hash")]
@@ -616,14 +629,25 @@ async def update_account(
 @app.get("/api/tokens")
 async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
     items = load_settings().get("api_tokens", [])
-    return {"data": [{"id": str(i.get("id")), "name": str(i.get("name")), "created_at": i.get("created_at"), "last_used_at": i.get("last_used_at")} for i in items if isinstance(i, dict)]}
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        token = ""
+        try:
+            token = token_plain(str(item.get("cipher") or ""), str(item.get("id"))) if item.get("cipher") else ""
+        except (ValueError, UnicodeDecodeError):
+            pass
+        result.append({"id": str(item.get("id")), "name": str(item.get("name")), "token": token, "created_at": item.get("created_at"), "last_used_at": item.get("last_used_at")})
+    return {"data": result}
 
 
 @app.post("/api/tokens")
 async def create_api_token(update: ApiTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
     raw = "cln_" + secrets.token_urlsafe(24)
     settings = load_settings()
-    item = {"id": uuid.uuid4().hex, "name": update.name.strip(), "hash": token_digest(raw), "created_at": int(time.time()), "last_used_at": None}
+    token_id = uuid.uuid4().hex
+    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None}
     settings.setdefault("api_tokens", []).append(item)
     save_settings(settings)
     return {"id": item["id"], "name": item["name"], "token": raw, "created_at": item["created_at"]}
