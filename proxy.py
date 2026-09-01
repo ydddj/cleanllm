@@ -61,7 +61,7 @@ DEFAULT_SETTINGS = {
     "api_usage": [],
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.18")
+app = FastAPI(title="CleanLLM", version="1.0.19")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -1010,6 +1010,16 @@ async def get_logs(
         "size_bytes": size,
         "max_bytes": int(load_settings().get("log_max_bytes", MAX_LOG_BYTES)),
     }
+
+
+@app.delete("/api/logs")
+async def clear_logs(_: None = Depends(require_admin)) -> dict[str, str]:
+    try:
+        LOG_FILE.write_text("", encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"清除日志失败：{exc}") from exc
+    logger.info("System log cleared from Web UI")
+    return {"message": "系统日志已清除"}
 
 
 @app.post("/v1/chat/completions")
