@@ -49,15 +49,16 @@
   const logsDescription = document.querySelector('[data-view="logs"] .panel-header p'); if (logsDescription) logsDescription.textContent = "仅记录请求状态与系统事件，大小上限可在此调整";
   const logPage = document.querySelector('[data-view="logs"] .panel-header');
   if (logPage) logPage.insertAdjacentHTML("beforeend", '<label style="display:flex;align-items:center;gap:7px;font-size:12px">日志上限 <input id="log-max-mb" type="number" min="1" max="50" step="1" style="width:68px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft)"> MB <button id="save-log-limit" class="button">保存</button></label>');
-  request("/api/settings").then((data) => { if ($("#log-max-mb")) $("#log-max-mb").value = Math.round((data.log_max_bytes || 5242880) / 1048576); }).catch(() => {});
-  $("#save-log-limit")?.addEventListener("click", async () => { try { const current=await request("/api/settings"), mb=Number($("#log-max-mb").value); current.log_max_bytes=mb*1048576; await request("/api/settings", {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(current)}); notify(`日志上限已设置为 ${mb} MB`); } catch(error) { notify(error.message,true); } });
+  if (logPage) logPage.insertAdjacentHTML("beforeend", '<label style="display:flex;align-items:center;gap:7px;font-size:12px">日志级别 <select id="log-level" style="height:32px;border:1px solid var(--border);border-radius:8px;background:var(--soft)"><option value="WARNING">WARN</option><option value="INFO">INFO</option><option value="ERROR">ERROR</option><option value="DEBUG">DEBUG</option></select></label>');
+  request("/api/settings").then((data) => { if ($("#log-max-mb")) $("#log-max-mb").value = Math.round((data.log_max_bytes || 5242880) / 1048576); if ($("#log-level")) $("#log-level").value = data.log_level || "WARNING"; }).catch(() => {});
+  $("#save-log-limit")?.addEventListener("click", async () => { try { const current=await request("/api/settings"), mb=Number($("#log-max-mb").value); current.log_max_bytes=mb*1048576; current.log_level=$("#log-level")?.value||"WARNING"; await request("/api/settings", {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(current)}); notify(`日志设置已保存：${current.log_level}`); } catch(error) { notify(error.message,true); } });
   if (patterns) {
     patterns.insertAdjacentHTML("beforebegin", `<label class="field wide"><span>备用上游（JSON）</span><textarea id="upstreams" rows="6" spellcheck="false" placeholder='[{"name":"备用","url":"http://server/v1/chat/completions","api_key":""}]'></textarea><small>默认上游失败后按顺序切换。</small></label><label class="field wide"><span>模型路由（JSON）</span><textarea id="model_routes" rows="5" spellcheck="false" placeholder='[{"pattern":"qwen*","upstreams":["默认上游","备用"]}]'></textarea><small>支持 * 和 ? 通配符。</small></label>`);
     const footer = $("#settings-form .form-footer");
     footer.insertAdjacentHTML("beforebegin", `<div class="wide" style="display:flex;gap:9px;flex-wrap:wrap"><button id="test-connections" class="button" type="button">测试全部连接</button><button id="export-settings" class="button" type="button">导出脱敏配置</button><label class="button" style="display:inline-flex;align-items:center">导入配置<input id="import-settings" type="file" accept="application/json" hidden></label><button id="reset-settings" class="button" type="button" style="color:var(--red)">恢复默认值</button></div><div id="connection-results" class="wide"></div>`);
     request("/api/settings").then((data) => {
-      $("#upstreams").value = JSON.stringify(data.upstreams || [], null, 2);
-      $("#model_routes").value = JSON.stringify(data.model_routes || [], null, 2);
+      $("#upstreams").value = data.upstreams?.length ? JSON.stringify(data.upstreams, null, 2) : "";
+      $("#model_routes").value = data.model_routes?.length ? JSON.stringify(data.model_routes, null, 2) : "";
     }).catch(() => {});
   }
 

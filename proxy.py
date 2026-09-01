@@ -54,6 +54,7 @@ DEFAULT_SETTINGS = {
     "upstreams": [],
     "model_routes": [],
     "log_max_bytes": int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),
+    "log_level": os.getenv("LOG_LEVEL", "WARNING").upper(),
     "model_cache_ttl": int(os.getenv("MODEL_CACHE_TTL", "60")),
     "api_tokens": [],
     "export_history": [],
@@ -84,6 +85,7 @@ class SettingsUpdate(BaseModel):
     upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     model_routes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     model_cache_ttl: int = Field(default=60, ge=0, le=86400)
+    log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
 
     @field_validator("models_api_url", "ollama_api_url")
     @classmethod
@@ -191,7 +193,7 @@ def configure_file_logging() -> None:
         handler = CappedFileHandler(LOG_FILE, MAX_LOG_BYTES)
         handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
         logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
+        logger.setLevel(getattr(logging, str(load_settings().get("log_level", "WARNING")).upper(), logging.WARNING))
         logger.propagate = True
     except OSError as exc:
         logging.getLogger("uvicorn.error").warning("File logging disabled: %s", exc)
@@ -340,6 +342,7 @@ def save_settings(settings: dict[str, Any]) -> None:
         for handler in logger.handlers:
             if isinstance(handler, CappedFileHandler):
                 handler.max_bytes = configured_limit
+            logger.setLevel(getattr(logging, str(settings.get("log_level", "WARNING")).upper(), logging.WARNING))
     except OSError as exc:
         logger.exception("Could not save settings")
         raise HTTPException(
