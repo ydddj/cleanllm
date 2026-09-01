@@ -62,7 +62,7 @@ DEFAULT_SETTINGS = {
     "api_usage": [],
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.20")
+app = FastAPI(title="CleanLLM", version="1.0.21")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -980,17 +980,28 @@ async def restart_container(_: None = Depends(require_admin)) -> dict[str, str]:
     if docker_socket.exists():
         container_id = socket.gethostname()
         async def restart_with_docker() -> None:
-            def call_engine() -> None:
+            def call_engine() -> bool:
                 client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
                 try:
                     client.settimeout(5)
                     client.connect(str(docker_socket))
-                    request = f"POST /containers/{container_id}/restart?t=10 HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-                    client.sendall(request.encode("ascii"))
-                    client.recv(4096)
+                    for target in (container_id, "cleanllm"):
+                        request = f"POST /v1.41/containers/{target}/restart?t=10 HTTP/1.1\r\nHost: docker\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        client.sendall(request.encode("ascii"))
+                        response = client.recv(4096)
+                        if b" 204 " in response or b" 200 " in response:
+                            return True
+                        client.close(); client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); client.settimeout(5); client.connect(str(docker_socket))
+                    return False
                 finally:
                     client.close()
-            await asyncio.to_thread(call_engine)
+            try:
+                restarted = await asyncio.to_thread(call_engine)
+            except OSError:
+                restarted = False
+            if not restarted:
+                logger.error("Docker Engine restart request failed; falling back to process restart")
+                os.kill(os.getpid(), signal.SIGTERM)
         asyncio.create_task(restart_with_docker())
         return {"message": "Docker 已收到重启请求，页面将在数秒后恢复"}
     asyncio.get_running_loop().call_later(0.4, lambda: os.kill(os.getpid(), signal.SIGTERM))
