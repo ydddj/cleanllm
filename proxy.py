@@ -193,7 +193,7 @@ def configure_file_logging() -> None:
         handler = CappedFileHandler(LOG_FILE, MAX_LOG_BYTES)
         handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
         logger.addHandler(handler)
-        logger.setLevel(getattr(logging, str(load_settings().get("log_level", "WARNING")).upper(), logging.WARNING))
+        logger.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING))
         logger.propagate = True
     except OSError as exc:
         logging.getLogger("uvicorn.error").warning("File logging disabled: %s", exc)
