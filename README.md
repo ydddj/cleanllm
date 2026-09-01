@@ -69,6 +69,8 @@ docker compose up -d --build
 
 ## Ollama 模型管理
 
+“导出压缩包”会把 Ollama manifest 与模型 blobs 打包为 `.ollama.tar.gz`。由于 Ollama HTTP API 不提供完整权重导出接口，Compose 需要将宿主机模型目录只读挂载到 `/ollama-models`；通过 `OLLAMA_MODELS_PATH` 指定宿主机路径（Linux 默认 `/root/.ollama/models`）。如果未挂载，仍可使用“导出定义”导出 JSON，但不能生成权重压缩包。
+
 进入 Web 管理中心的“模型列表”，可查看 Ollama 状态、拉取模型并查看实时进度，也可删除已安装模型。`OLLAMA_API_URL` 留空时，CleanLLM 会从 `TARGET_API_URL` 自动提取地址；例如 `http://host.docker.internal:11434/v1/chat/completions` 会使用 `http://host.docker.internal:11434`。如果上游不是 Ollama，OpenAI 兼容模型列表仍可正常使用，管理区会提示 Ollama 不可用。
 
 ## 自动发布到 Docker Hub

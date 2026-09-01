@@ -1,5 +1,5 @@
 (() => {
-  const polish = document.createElement("style"); polish.textContent = ".advanced-model-actions{display:inline-flex;flex-wrap:wrap;gap:6px;margin-right:8px}.advanced-model-actions .button{min-height:34px;padding:0 11px}.data-table td{vertical-align:middle}.data-table td:first-child code{overflow-wrap:anywhere}.log-view,.log-line{font-size:11px!important}.modal-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:20px}#cleanllm-modal dl{display:grid;grid-template-columns:90px 1fr;gap:10px;margin:18px 0}#cleanllm-modal dt{color:var(--muted)}#cleanllm-modal dd{margin:0;overflow-wrap:anywhere}"; document.head.append(polish);
+  const polish = document.createElement("style"); polish.textContent = ".advanced-model-actions{display:inline-flex;flex-wrap:wrap;gap:6px;margin-right:8px}.advanced-model-actions .button{min-height:34px;padding:0 11px}.data-table td{vertical-align:middle}.data-table td:first-child code{overflow-wrap:anywhere}.log-view,.log-line{font-size:11px!important}.cleanllm-modal{position:fixed;inset:0;z-index:200;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.62);backdrop-filter:blur(4px)}.cleanllm-modal-card{width:min(520px,100%);max-height:80vh;overflow:auto;padding:26px;border:1px solid var(--border);border-radius:18px;background:var(--surface);color:var(--text);box-shadow:var(--shadow)}.cleanllm-modal-card h3{margin:0 0 20px;font-size:20px}.cleanllm-modal-actions{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:24px}.cleanllm-modal-actions .button{min-width:82px}.cleanllm-modal-card .field input{margin-top:2px}#cleanllm-modal dl{display:grid;grid-template-columns:90px 1fr;gap:10px;margin:18px 0}#cleanllm-modal dt{color:var(--muted)}#cleanllm-modal dd{margin:0;overflow-wrap:anywhere}"; document.head.append(polish);
   const $ = (selector) => document.querySelector(selector);
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
   const request = async (url, options) => {
@@ -11,7 +11,7 @@
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.1";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.2";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const securityPage = document.querySelector('[data-view="security"] .panel-body');
   if (securityPage && !document.querySelector("#restart-container")) {
@@ -89,7 +89,7 @@
       const action = row.lastElementChild, model = row.querySelector("code")?.textContent;
       if (!action || !model || action.querySelector(".advanced-model-actions")) return;
       const controls = document.createElement("span"); controls.className = "advanced-model-actions";
-      controls.innerHTML = `<button class="button" data-model-action="detail">详情</button> <button class="button" data-model-action="duplicate">克隆模型</button> <button class="button" data-model-action="load">加载</button> <button class="button" data-model-action="unload">卸载</button> <button class="button" data-model-action="export">导出</button>`;
+      controls.innerHTML = `<button class="button" data-model-action="detail">详情</button> <button class="button" data-model-action="duplicate">克隆模型</button> <button class="button" data-model-action="load">加载</button> <button class="button" data-model-action="unload">卸载</button> <button class="button" data-model-action="archive">导出压缩包</button> <button class="button" data-model-action="export">导出定义</button>`;
       action.prepend(controls);
       controls.querySelectorAll("button").forEach((button) => button.onclick = (event) => { event.stopPropagation(); modelAction(model, button.dataset.modelAction); });
     });
@@ -105,6 +105,7 @@
       } else if (action === "duplicate") {
         const destination = await askModal("克隆模型", "克隆后的模型名称", `${model}-copy`); if (!destination) return;
         const result = await request("/api/ollama/copy", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({source:model,destination})}); notify(result.message); if(typeof loadOllama === "function") loadOllama();
+      } else if (action === "archive") { location.assign(`/api/ollama/archive?model=${encodeURIComponent(model)}`);
       } else if (action === "export") { location.assign(`/api/ollama/export?model=${encodeURIComponent(model)}`);
       } else {
         const result = await request("/api/ollama/keep-alive", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({model,keep_alive:action==='unload'?'0':'5m'})}); notify(result.message);
@@ -112,8 +113,9 @@
     } catch (error) { notify(error.message, true); }
   }
 
-  function showModal(content) { let modal=$("#cleanllm-modal"); if(!modal){document.body.insertAdjacentHTML("beforeend",'<div id="cleanllm-modal" style="position:fixed;inset:0;background:#0008;z-index:200;display:grid;place-items:center"><div style="background:var(--surface);color:var(--text);padding:24px;border-radius:16px;width:min(520px,92vw);max-height:80vh;overflow:auto"><div id="cleanllm-modal-body"></div><button class="button primary" id="close-cleanllm-modal">关闭</button></div></div>');modal=$("#cleanllm-modal");$("#close-cleanllm-modal").onclick=()=>modal.remove();} $("#cleanllm-modal-body").innerHTML=content; }
-  function askModal(title,label,value){ return new Promise((resolve)=>{showModal(`<h3>${title}</h3><label class="field"><span>${label}</span><input id="modal-input" value="${escape(value)}"></label><button class="button primary" id="modal-ok">确定</button>`);$("#modal-ok").onclick=()=>{const result=$("#modal-input").value;$("#cleanllm-modal").remove();resolve(result);};}); }
+  function createModal(content, actions) { $("#cleanllm-modal")?.remove(); document.body.insertAdjacentHTML("beforeend",`<div id="cleanllm-modal" class="cleanllm-modal"><div class="cleanllm-modal-card"><div id="cleanllm-modal-body">${content}</div><div class="cleanllm-modal-actions">${actions}</div></div></div>`); return $("#cleanllm-modal"); }
+  function showModal(content) { const modal=createModal(content,'<button class="button primary" id="close-cleanllm-modal">关闭</button>'); $("#close-cleanllm-modal").onclick=()=>modal.remove(); }
+  function askModal(title,label,value){ return new Promise((resolve)=>{const modal=createModal(`<h3>${title}</h3><label class="field"><span>${label}</span><input id="modal-input" value="${escape(value)}"></label>`,'<button class="button" id="modal-cancel">取消</button><button class="button primary" id="modal-ok">确定</button>');$("#modal-cancel").onclick=()=>{modal.remove();resolve(null)};$("#modal-ok").onclick=()=>{const result=$("#modal-input").value.trim();modal.remove();resolve(result)};$("#modal-input").focus();}); }
 
   const ollamaPanel = $("#ollama-panel .panel-body");
   if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", `<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><strong>后台拉取任务</strong><button id="background-pull" class="button">后台拉取当前模型</button></div><div id="ollama-tasks" style="margin-top:10px"></div></div>`);

@@ -11,6 +11,8 @@ import secrets
 import time
 import uuid
 import signal
+import tarfile
+import tempfile
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -19,6 +21,7 @@ import httpx
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
+from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
@@ -29,6 +32,7 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 LOG_FILE = DATA_DIR / "cleanllm.log"
 MAX_LOG_BYTES = 5 * 1024 * 1024
 STATIC_DIR = BASE_DIR / "static"
+OLLAMA_MODELS_DIR = Path(os.getenv("OLLAMA_MODELS_DIR", "/ollama-models"))
 SESSION_COOKIE = "cleanllm_session"
 SESSION_MAX_AGE = 12 * 60 * 60
 
@@ -51,7 +55,7 @@ DEFAULT_SETTINGS = {
     "log_max_bytes": int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.1")
+app = FastAPI(title="CleanLLM", version="1.0.2")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -316,6 +320,26 @@ def ollama_base_url(settings: dict[str, Any]) -> str:
         return override.rstrip("/")
     parsed = urlsplit(str(settings["target_api_url"]))
     return urlunsplit((parsed.scheme, parsed.netloc, "", "", "")).rstrip("/")
+
+
+def ollama_manifest_path(model: str) -> Path:
+    reference, separator, tag = model.rpartition(":")
+    if not separator or "/" in tag:
+        reference, tag = model, "latest"
+    parts = [part for part in reference.split("/") if part]
+    if not parts or any(part in {".", ".."} for part in parts):
+        raise HTTPException(status_code=400, detail="模型名称无效")
+    if "." in parts[0] or ":" in parts[0] or parts[0] == "localhost":
+        registry, parts = parts[0], parts[1:]
+    else:
+        registry = "registry.ollama.ai"
+    if len(parts) == 1:
+        namespace, repository = "library", parts[0]
+    elif len(parts) == 2:
+        namespace, repository = parts
+    else:
+        raise HTTPException(status_code=400, detail="暂不支持该模型名称结构")
+    return OLLAMA_MODELS_DIR / "manifests" / registry / namespace / repository / tag
 
 
 def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
@@ -699,6 +723,51 @@ async def retry_ollama_task(task_id: str, _: None = Depends(require_admin)) -> d
 @app.get("/api/ollama/export")
 async def export_ollama_model_safe(model: str, _: None = Depends(require_admin)) -> Response:
     return await export_ollama_model(model, None)
+
+
+@app.get("/api/ollama/archive")
+async def export_ollama_archive(model: str, _: None = Depends(require_admin)) -> FileResponse:
+    manifest = ollama_manifest_path(model)
+    try:
+        manifest = manifest.resolve(strict=True)
+        root = OLLAMA_MODELS_DIR.resolve(strict=True)
+        manifest.relative_to(root)
+        manifest_data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail=f"无法读取模型文件。请将 Ollama models 目录只读挂载到 /ollama-models：{exc}") from exc
+    digests = []
+    config = manifest_data.get("config", {})
+    if isinstance(config, dict) and config.get("digest"):
+        digests.append(str(config["digest"]))
+    for layer in manifest_data.get("layers", []):
+        if isinstance(layer, dict) and layer.get("digest"):
+            digests.append(str(layer["digest"]))
+    blobs = []
+    for digest in dict.fromkeys(digests):
+        if not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+            raise HTTPException(status_code=400, detail="模型 manifest 包含无效 blob 摘要")
+        blob = root / "blobs" / digest.replace(":", "-")
+        if not blob.is_file():
+            raise HTTPException(status_code=404, detail=f"模型 blob 不完整：{digest}")
+        blobs.append(blob)
+    temporary = tempfile.NamedTemporaryFile(prefix="cleanllm-model-", suffix=".tar.gz", delete=False, dir=DATA_DIR)
+    temporary.close()
+    archive_path = Path(temporary.name)
+    try:
+        with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
+            archive.add(manifest, arcname=str(manifest.relative_to(root)))
+            for blob in blobs:
+                archive.add(blob, arcname=str(blob.relative_to(root)))
+            metadata = json.dumps({"format": "cleanllm-ollama-archive-v1", "model": model}, ensure_ascii=False).encode()
+            info = tarfile.TarInfo("cleanllm-model.json")
+            info.size = len(metadata)
+            import io
+            archive.addfile(info, io.BytesIO(metadata))
+    except Exception:
+        archive_path.unlink(missing_ok=True)
+        raise
+    filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", model) + ".ollama.tar.gz"
+    return FileResponse(archive_path, filename=filename, media_type="application/gzip", background=BackgroundTask(archive_path.unlink, missing_ok=True))
 
 
 @app.get("/api/ollama/models/{model:path}")

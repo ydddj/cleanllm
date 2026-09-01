@@ -15,8 +15,10 @@ services:
       OLLAMA_API_URL: ${OLLAMA_API_URL:-}
       UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
+      OLLAMA_MODELS_DIR: /ollama-models
     volumes:
       - cleanllm-data:/data
+      - ${OLLAMA_MODELS_PATH:-/root/.ollama/models}:/ollama-models:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
