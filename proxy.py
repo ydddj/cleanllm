@@ -58,6 +58,7 @@ DEFAULT_SETTINGS = {
     "model_cache_ttl": int(os.getenv("MODEL_CACHE_TTL", "60")),
     "api_tokens": [],
     "export_history": [],
+    "api_usage": [],
 }
 
 app = FastAPI(title="CleanLLM", version="1.0.18")
@@ -314,8 +315,9 @@ def require_api_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
     matched["last_used_at"] = int(time.time())
     save_settings(settings)
-    API_USAGE.append({"token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method})
-    del API_USAGE[:-500]
+    usage_item = {"token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method}
+    API_USAGE.append(usage_item); del API_USAGE[:-500]
+    settings.setdefault("api_usage", []).append(usage_item); settings["api_usage"] = settings["api_usage"][-1000:]; save_settings(settings)
 
 
 def load_settings() -> dict[str, Any]:
@@ -537,7 +539,7 @@ async def health() -> dict[str, str]:
 @app.get("/api/settings")
 async def get_settings(_: None = Depends(require_admin)) -> dict[str, Any]:
     settings = load_settings()
-    return {key: settings[key] for key in DEFAULT_SETTINGS if key not in {"api_tokens", "export_history"}}
+    return {key: settings[key] for key in DEFAULT_SETTINGS if key not in {"api_tokens", "export_history", "api_usage"}}
 
 
 @app.put("/api/settings")
@@ -579,7 +581,7 @@ async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
 @app.get("/api/settings/export")
 async def export_settings(_: None = Depends(require_admin)) -> Response:
     settings = load_settings()
-    safe = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS and key not in {"api_tokens", "export_history"}}
+    safe = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS and key not in {"api_tokens", "export_history", "api_usage"}}
     safe["api_key"] = ""
     for upstream in safe.get("upstreams", []):
         if isinstance(upstream, dict):
@@ -669,7 +671,7 @@ async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> d
 
 @app.get("/api/usage")
 async def api_usage(_: None = Depends(require_admin)) -> dict[str, Any]:
-    now = int(time.time()); recent = [item for item in API_USAGE if now - int(item.get("at", 0)) < 30 * 86400]
+    now = int(time.time()); recent = [item for item in load_settings().get("api_usage", API_USAGE) if now - int(item.get("at", 0)) < 30 * 86400]
     by_token: dict[str, int] = {}
     for item in recent:
         key = str(item.get("token_name") or "未命名"); by_token[key] = by_token.get(key, 0) + 1
