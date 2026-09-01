@@ -17,8 +17,19 @@ services:
       ADMIN_USERNAME: "admin"
       ADMIN_PASSWORD: "请改成强密码"
       SESSION_SECRET: "请改成另一段足够长的随机字符串"
+      COOKIE_SECURE: "false"
+      TARGET_API_URL: "http://host.docker.internal:11434/v1/chat/completions"
+      MODELS_API_URL: ""
+      OLLAMA_API_URL: ""
+      OLLAMA_MODELS_DIR: "/ollama-models"
+      PUID: "10001"
+      PGID: "10001"
+      UPSTREAM_API_KEY: ""
+      REQUEST_TIMEOUT: "120"
     volumes:
       - cleanllm-data:/data
+      # 用于“导出压缩包”；请改成宿主机实际 Ollama models 目录
+      - /root/.ollama/models:/ollama-models:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
@@ -80,4 +91,4 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-推送到 `main` 后会发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.6`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+推送到 `main` 后会发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.7`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。

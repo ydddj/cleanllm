@@ -10,13 +10,13 @@
   };
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
   const palettes = [
-    ["薰衣草", "#8b78a8", "#756193"], ["灰蓝", "#6f8fa8", "#58758e"], ["豆沙", "#b98282", "#9f6868"], ["鼠尾草", "#7f9a87", "#657f6d"], ["杏仁", "#b59f86", "#987f64"], ["雾紫", "#9a8fa8", "#7e718e"], ["陶土", "#b47f6e", "#956351"], ["海盐", "#79a6a5", "#5d8988"], ["奶茶", "#ad967e", "#8e765e"], ["烟粉", "#b18b9c", "#966f82"]
+    ["靛蓝", "#4f46e5", "#3730a3"], ["海蓝", "#2563eb", "#1d4ed8"], ["青色", "#0891b2", "#0e7490"], ["翡翠", "#059669", "#047857"], ["青柠", "#65a30d", "#4d7c0f"], ["琥珀", "#d97706", "#b45309"], ["珊瑚", "#ea580c", "#c2410c"], ["玫红", "#e11d48", "#be123c"], ["紫罗兰", "#7c3aed", "#6d28d9"], ["洋红", "#c026d3", "#a21caf"]
   ];
   const paletteStyle = document.createElement("style"); paletteStyle.textContent = ".palette-menu{position:fixed;right:18px;top:62px;z-index:120;display:grid;grid-template-columns:repeat(2,1fr);gap:7px;padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--surface);box-shadow:var(--shadow)}.palette-item{display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid transparent;border-radius:8px;background:var(--soft);color:var(--text);font-size:11px}.palette-item:hover{border-color:var(--primary)}.palette-dot{width:16px;height:16px;border-radius:50%}"; document.head.append(paletteStyle);
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.page{width:100%}.panel{width:100%}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.6";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.7";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if (topActions && !document.querySelector("#palette-toggle")) { topActions.insertAdjacentHTML("afterbegin", '<button id="palette-toggle" class="icon-button" title="切换配色" aria-label="切换配色">◉</button>'); $("#palette-toggle").onclick=()=>{let menu=$("#palette-menu");if(menu){menu.remove();return}document.body.insertAdjacentHTML("beforeend",'<div id="palette-menu" class="palette-menu">'+palettes.map((item,index)=>`<button class="palette-item" data-palette="${index}"><i class="palette-dot" style="background:${item[1]}"></i>${item[0]}</button>`).join("")+"</div>");document.querySelectorAll("[data-palette]").forEach((button)=>button.onclick=()=>{const item=palettes[button.dataset.palette];document.documentElement.style.setProperty("--primary",item[1]);document.documentElement.style.setProperty("--primary2",item[2]);document.documentElement.style.setProperty("--primary-soft",item[1]+"26");localStorage.setItem("cleanllm-palette",button.dataset.palette);$("#palette-menu").remove()})};const saved=Number(localStorage.getItem("cleanllm-palette"));if(Number.isInteger(saved)&&palettes[saved]){const item=palettes[saved];document.documentElement.style.setProperty("--primary",item[1]);document.documentElement.style.setProperty("--primary2",item[2]);document.documentElement.style.setProperty("--primary-soft",item[1]+"26")}}
@@ -36,6 +36,7 @@
     if (location.hash === "#changelog") setTimeout(activateChangelog, 0);
   }
 
+  if (location.hash === "#changelog") setInterval(() => { const page=document.querySelector('[data-view="changelog"]'); if(page && !page.classList.contains("active")){document.querySelectorAll(".page").forEach((view)=>view.classList.toggle("active",view===page));document.querySelectorAll(".nav a").forEach((link)=>link.classList.toggle("active",link.dataset.page==="changelog"));$("#page-eyebrow").textContent="系统";$("#page-title").textContent="更新日志";$("#page-description").textContent="查看 CleanLLM 的功能更新与修复记录";} },100);
   const patterns = $("#clean_patterns")?.closest(".field");
   const logPage = document.querySelector('[data-view="logs"] .panel-header');
   if (logPage) logPage.insertAdjacentHTML("beforeend", '<label style="display:flex;align-items:center;gap:7px;font-size:12px">日志上限 <input id="log-max-mb" type="number" min="1" max="50" step="1" style="width:68px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft)"> MB <button id="save-log-limit" class="button">保存</button></label>');
@@ -100,7 +101,9 @@
       controls.querySelectorAll("button").forEach((button) => button.onclick = (event) => { event.stopPropagation(); modelAction(model, button.dataset.modelAction); });
     });
   };
-  new MutationObserver(copyButtons).observe(document.body, {childList:true, subtree:true});
+  const addTooltips = () => document.querySelectorAll("button, a").forEach((node) => { if (!node.title && node.textContent.trim()) node.title = node.textContent.trim().replace(/\s+/g, " "); });
+  new MutationObserver(() => { copyButtons(); addTooltips(); }).observe(document.body, {childList:true, subtree:true});
+  addTooltips();
   copyButtons();
 
   async function modelAction(model, action) {
