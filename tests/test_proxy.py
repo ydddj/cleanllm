@@ -1,5 +1,6 @@
 import os
 import logging
+import json
 from pathlib import Path
 
 os.environ["ADMIN_PASSWORD"] = "test-password"
@@ -215,6 +216,27 @@ def test_ollama_models_and_delete(tmp_path: Path, monkeypatch) -> None:
         "http://host.docker.internal:11434/api/delete",
         {"name": "qwen3:8b"},
     ) in calls
+
+
+def test_ollama_archive_export_reads_manifest_and_blobs(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    root = tmp_path / "models"
+    manifest = root / "manifests" / "registry.ollama.ai" / "library" / "demo" / "latest"
+    blob = root / "blobs" / ("sha256-" + "a" * 64)
+    manifest.parent.mkdir(parents=True)
+    blob.parent.mkdir(parents=True)
+    blob.write_bytes(b"model-data")
+    manifest.write_text(json.dumps({"config": {"digest": "sha256:" + "a" * 64}}), encoding="utf-8")
+    original = proxy.OLLAMA_MODELS_DIR
+    proxy.OLLAMA_MODELS_DIR = root
+    try:
+        response = client.get("/api/ollama/archive?model=demo:latest")
+    finally:
+        proxy.OLLAMA_MODELS_DIR = original
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/gzip")
+    assert len(response.content) > 50
 
 
 def test_model_discovery_normalizes_openai_response(tmp_path: Path, monkeypatch) -> None:

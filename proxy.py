@@ -13,6 +13,7 @@ import uuid
 import signal
 import tarfile
 import tempfile
+import io
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -753,7 +754,7 @@ async def export_ollama_archive(model: str, _: None = Depends(require_admin)) ->
     temporary = tempfile.NamedTemporaryFile(prefix="cleanllm-model-", suffix=".tar.gz", delete=False, dir=DATA_DIR)
     temporary.close()
     archive_path = Path(temporary.name)
-    try:
+    def build_archive() -> None:
         with tarfile.open(archive_path, "w:gz", compresslevel=1) as archive:
             archive.add(manifest, arcname=str(manifest.relative_to(root)))
             for blob in blobs:
@@ -761,8 +762,10 @@ async def export_ollama_archive(model: str, _: None = Depends(require_admin)) ->
             metadata = json.dumps({"format": "cleanllm-ollama-archive-v1", "model": model}, ensure_ascii=False).encode()
             info = tarfile.TarInfo("cleanllm-model.json")
             info.size = len(metadata)
-            import io
             archive.addfile(info, io.BytesIO(metadata))
+    try:
+        # Tar/gzip of multi-gigabyte blobs must not block FastAPI's event loop.
+        await asyncio.to_thread(build_archive)
     except Exception:
         archive_path.unlink(missing_ok=True)
         raise
