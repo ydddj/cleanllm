@@ -11,12 +11,12 @@
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.2";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.3";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
-  const securityPage = document.querySelector('[data-view="security"] .panel-body');
-  if (securityPage && !document.querySelector("#restart-container")) {
-    securityPage.insertAdjacentHTML("beforeend", '<div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)"><button id="restart-container" class="button" style="color:var(--red)">重启容器</button><p class="form-note">仅重启 CleanLLM 容器，不会删除设置或模型。</p></div>');
-    $("#restart-container").onclick = async () => { if (!confirm("确定重启 CleanLLM 容器？")) return; try { const result=await request("/api/system/restart", {method:"POST"}); notify(result.message); } catch(error) { notify(error.message, true); } };
+  const topActions = document.querySelector(".topbar-actions");
+  if (topActions && !document.querySelector("#restart-container")) {
+    topActions.insertAdjacentHTML("afterbegin", '<button id="restart-container" class="icon-button" title="重启容器" aria-label="重启容器">↻</button>');
+    $("#restart-container").onclick = () => new Promise((resolve) => { const modal=createModal('<h3>重启容器</h3><p>重启只会重新启动 CleanLLM，不会删除设置或模型。</p>','<button class="button" id="restart-cancel">取消</button><button class="button primary" id="restart-ok">确认重启</button>'); $("#restart-cancel").onclick=()=>{modal.remove();resolve()}; $("#restart-ok").onclick=async()=>{try{const result=await request("/api/system/restart",{method:"POST"});modal.remove();notify(result.message);resolve()}catch(error){notify(error.message,true)}}; });
   }
   if (nav && !document.querySelector('[data-page="changelog"]')) {
     nav.insertAdjacentHTML("beforeend", '<a href="#changelog" data-page="changelog"><span>▤</span><span>更新日志</span></a>');

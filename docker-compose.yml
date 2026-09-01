@@ -16,6 +16,8 @@ services:
       UPSTREAM_API_KEY: ${UPSTREAM_API_KEY:-}
       REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-120}
       OLLAMA_MODELS_DIR: /ollama-models
+      PUID: ${PUID:-10001}
+      PGID: ${PGID:-10001}
     volumes:
       - cleanllm-data:/data
       - ${OLLAMA_MODELS_PATH:-/root/.ollama/models}:/ollama-models:ro

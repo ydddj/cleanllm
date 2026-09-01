@@ -2,5 +2,7 @@
 set -eu
 
 mkdir -p /data
-chown -R 10001:10001 /data
-exec gosu 10001:10001 "$@"
+PUID="${PUID:-10001}"
+PGID="${PGID:-10001}"
+chown -R "${PUID}:${PGID}" /data
+exec gosu "${PUID}:${PGID}" "$@"
