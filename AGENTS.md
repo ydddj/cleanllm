@@ -27,6 +27,8 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Long-running Ollama pulls must remain streamed. Do not replace them with a short fixed timeout.
 - Format Unix timestamps in the browser as local date/time and support both seconds and milliseconds.
 - Keep the log file capped at 5 MB and preserve `/data` volume compatibility.
+- Ollama model definition exports should remain compatible with Open WebUI metadata; full weight exports use `.ollama.tar.gz` archives from the mounted models directory.
+- Keep the admin layout fluid on wide screens and horizontally scrollable for dense tables on narrow screens.
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
 
 ## Configuration rules
@@ -72,7 +74,8 @@ Add regression tests for changed authentication, settings persistence, response 
 ## Release workflow
 
 - The primary branch is `main`.
-- Pushes to `main` run tests and publish `ydddj/cleanllm:latest` plus a `sha-*` tag for `linux/amd64` and `linux/arm64`.
+- Pushes to `main` run tests and publish `ydddj/cleanllm:latest` plus the current semantic version tag for `linux/amd64` and `linux/arm64`; do not add commit-based `sha-*` tags.
 - Tags matching `v*.*.*` also publish semantic-version tags.
+- Every user-visible release change must update the API/UI version, `CHANGELOG.md`, and the README's current version reference together.
 - Never place Docker Hub credentials in source files. Publishing uses the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
 - After publishing, verify the GitHub Actions job before reporting the Docker image as available.

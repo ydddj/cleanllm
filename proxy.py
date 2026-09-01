@@ -56,7 +56,7 @@ DEFAULT_SETTINGS = {
     "log_max_bytes": int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.3")
+app = FastAPI(title="CleanLLM", version="1.0.4")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -132,7 +132,7 @@ class OllamaKeepAliveRequest(BaseModel):
 
 class OllamaImportRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    modelfile: str = Field(min_length=1, max_length=2_000_000)
+    modelfile: str = Field(default="", max_length=2_000_000)
 
 
 class CappedFileHandler(logging.FileHandler):
@@ -811,7 +811,12 @@ async def export_ollama_model(model: str, _: None = Depends(require_admin)) -> R
     # /api/show is optional in Ollama-compatible servers; export a portable
     # definition directly so export never fails because of a 400 response.
     detail = {"modelfile": f"FROM {model}\n"}
-    payload = json.dumps({"version": 1, "name": model, "modelfile": detail.get("modelfile", ""), "parameters": detail.get("parameters", ""), "template": detail.get("template", ""), "system": detail.get("system", "")}, ensure_ascii=False, indent=2)
+    payload = json.dumps({
+        "id": model, "name": model, "object": "model", "created": 0, "owned_by": "ollama",
+        "ollama": {"name": model, "model": model, "modified_at": None, "size": None, "digest": None, "details": {}, "connection_type": "local", "urls": []},
+        "loaded": False, "connection_type": "local", "tags": [], "actions": [], "filters": [], "is_active": True,
+        "cleanllm": {"format": "ollama-metadata-v1", "modelfile": detail.get("modelfile", ""), "parameters": detail.get("parameters", ""), "template": detail.get("template", ""), "system": detail.get("system", "")}
+    }, ensure_ascii=False, indent=2)
     filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", model) + ".cleanllm-model.json"
     return Response(payload, media_type="application/json", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -820,7 +825,8 @@ async def export_ollama_model(model: str, _: None = Depends(require_admin)) -> R
 async def import_ollama_model(update: OllamaImportRequest, _: None = Depends(require_admin)) -> dict[str, str]:
     try:
         async with httpx.AsyncClient(timeout=None) as client:
-            response = await client.post(f"{ollama_base_url(load_settings())}/api/create", json={"model": update.name, "modelfile": update.modelfile, "stream": False})
+            modelfile = update.modelfile.strip() or f"FROM {update.name}\n"
+            response = await client.post(f"{ollama_base_url(load_settings())}/api/create", json={"model": update.name, "modelfile": modelfile, "stream": False})
             response.raise_for_status()
     except (httpx.RequestError, httpx.HTTPStatusError) as exc:
         raise HTTPException(status_code=502, detail=f"导入模型定义失败：{exc}") from exc
