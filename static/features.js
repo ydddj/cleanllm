@@ -10,15 +10,15 @@
     if (!response.ok) throw new Error(data.detail || "请求失败");
     return data;
   };
-  const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
+  const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : console.log(message);
   const palettes = [
     ["靛蓝", "#4f46e5", "#3730a3"], ["海蓝", "#2563eb", "#1d4ed8"], ["青色", "#0891b2", "#0e7490"], ["翡翠", "#059669", "#047857"], ["青柠", "#65a30d", "#4d7c0f"], ["琥珀", "#d97706", "#b45309"], ["珊瑚", "#ea580c", "#c2410c"], ["玫红", "#e11d48", "#be123c"], ["紫罗兰", "#7c3aed", "#6d28d9"], ["洋红", "#c026d3", "#a21caf"]
   ];
-  const paletteStyle = document.createElement("style"); paletteStyle.textContent = ".palette-menu{position:fixed;z-index:120;display:grid;grid-template-columns:repeat(2,1fr);gap:7px;padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--surface);box-shadow:var(--shadow)}.palette-item{display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid transparent;border-radius:8px;background:var(--soft);color:var(--text);font-size:11px}.palette-item:hover{border-color:var(--primary)}.palette-dot{width:16px;height:16px;border-radius:50%}.brand-mark{background:linear-gradient(145deg,var(--primary),var(--primary2))!important}.button.primary{background:linear-gradient(180deg,var(--primary),var(--primary2))!important}.palette-item[data-selected=true]{border-color:var(--primary)}"; document.head.append(paletteStyle);
+  const paletteStyle = document.createElement("style"); paletteStyle.textContent = ".palette-menu{position:fixed;z-index:120;display:grid;grid-template-columns:repeat(2,1fr);gap:7px;padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--surface);box-shadow:var(--shadow)}.palette-item{display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid transparent;border-radius:8px;background:var(--soft);color:var(--text);font-size:11px}.palette-item:hover{border-color:var(--primary)}.palette-dot{width:16px;height:16px;border-radius:50%}.brand-mark{background:linear-gradient(145deg,var(--primary),var(--primary2))!important}.button.primary{background:linear-gradient(180deg,var(--primary),var(--primary2))!important}.palette-item[data-selected=true]{border-color:var(--primary)}.service-pill,.status-badge.active{color:var(--primary)!important;background:var(--primary-soft)!important}.data-table button[style*='var(--red)'],#reset-settings{color:var(--primary)!important}"; document.head.append(paletteStyle);
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.page{width:100%}.panel{width:100%}.log-line .level{color:var(--primary)!important}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.12";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.13";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -85,7 +85,7 @@
     } catch (error) { notify(`导入失败：${error.message}`, true); }
   });
   $("#reset-settings")?.addEventListener("click", async () => {
-    if (!confirm("恢复代理默认设置？账户信息不会改变。")) return;
+    if (!(await (window.cleanllmConfirm ? window.cleanllmConfirm("恢复代理默认设置？账户信息不会改变。") : Promise.resolve(true)))) return;
     try { await request("/api/settings/reset", {method:"POST"}); location.reload(); } catch (error) { notify(error.message, true); }
   });
 
@@ -134,6 +134,7 @@
 
   const ollamaPanel = $("#ollama-panel .panel-body");
   if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", `<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><strong>后台拉取任务</strong><button id="background-pull" class="button">后台拉取当前模型</button></div><div id="ollama-tasks" style="margin-top:10px"></div></div>`);
+  if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", '<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><strong>导出任务历史</strong><button id="refresh-export-history" class="button">刷新</button></div><div id="export-history" style="margin-top:10px"></div></div>');
   if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", '<div style="margin-top:12px"><label class="button">导入模型定义<input id="import-model" type="file" accept=".json,application/json" hidden></label></div>');
   $("#import-model")?.addEventListener("change", async (event) => { try { const data=JSON.parse(await event.target.files[0].text()); const result=await request("/api/ollama/models/import", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:data.name,modelfile:data.modelfile || data.template || ""})}); notify(result.message); if(typeof loadOllama === "function") loadOllama(); } catch(error) { notify(`导入失败：${error.message}`,true); } });
   $("#background-pull")?.addEventListener("click", async () => {
@@ -152,6 +153,29 @@
   }
   async function taskAction(id, action) { try { await request(`/api/ollama/tasks/${id}/${action}`, {method:"POST"}); refreshTasks(); } catch(error) { notify(error.message,true); } }
   refreshTasks(); setInterval(refreshTasks, 2000);
+  async function refreshExportHistory(){const box=$("#export-history");if(!box)return;try{const data=await request("/api/ollama/export-history");box.innerHTML=data.data.length?data.data.map(item=>`<div style="display:grid;grid-template-columns:1fr auto auto;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)"><code>${escape(item.model)}</code><span>${escape(item.size?`${(item.size/1048576).toFixed(2)} MB`:'—')}</span><small>${new Date(Number(item.created_at)*1000).toLocaleString()}</small></div>`).join(""):"<small class=\"form-note\">暂无导出记录</small>"}catch(e){box.textContent=e.message}}
+  $("#refresh-export-history")?.addEventListener("click",refreshExportHistory); refreshExportHistory();
+
+  window.cleanllmConfirm = (message) => new Promise((resolve) => {
+    const modal = createModal(`<h3>请确认</h3><p>${escape(message)}</p>`, '<button class="button" id="modal-confirm-no">取消</button><button class="button primary" id="modal-confirm-yes">确认</button>');
+    $("#modal-confirm-no").onclick = () => { modal.remove(); resolve(false); };
+    $("#modal-confirm-yes").onclick = () => { modal.remove(); resolve(true); };
+  });
+
+  // Lightweight real-time status stream and token/export management panels.
+  const securityPanel = document.querySelector('[data-view="security"] .settings-grid');
+  if (securityPanel && !document.querySelector("#token-panel")) {
+    securityPanel.insertAdjacentHTML("beforeend", '<section id="token-panel" class="panel"><header class="panel-header"><div><h2>API 访问令牌</h2><p>用于客户端调用 /v1/chat/completions，令牌只在创建时显示一次</p></div><button id="new-api-token" class="button primary">创建令牌</button></header><div class="panel-body"><div id="token-list" class="info-list"></div></div></section>');
+  }
+  async function loadTokens(){const box=$("#token-list");if(!box)return;try{const data=await request("/api/tokens");box.innerHTML=data.data.length?data.data.map(t=>`<div><span>${escape(t.name)}<small class="form-note">创建于 ${new Date(Number(t.created_at)*1000).toLocaleString()}</small></span><button class="button" data-revoke-token="${escape(t.id)}" style="color:var(--red)">撤销</button></div>`).join(""):"<p class=\"form-note\">尚未创建令牌</p>";box.querySelectorAll("[data-revoke-token]").forEach(b=>b.onclick=async()=>{if(await window.cleanllmConfirm("撤销此令牌？")){await request(`/api/tokens/${b.dataset.revokeToken}`,{method:"DELETE"});loadTokens();}})}catch(e){notify(e.message,true)}}
+  $("#new-api-token")?.addEventListener("click",async()=>{const name=await askModal("创建 API 令牌","令牌名称","我的客户端");if(!name)return;try{const t=await request("/api/tokens",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});showModal(`<h3>令牌创建成功</h3><p>请立即复制并妥善保存，之后无法再次查看：</p><code class="endpoint-code">${escape(t.token)}</code>`);loadTokens()}catch(e){notify(e.message,true)}});
+  loadTokens();
+  const eventSource = new EventSource("/api/system/events"); const markOnline=()=>document.querySelectorAll(".service-pill,.status-badge.active").forEach((el)=>{el.style.color="var(--primary)";}); eventSource.addEventListener("connected",markOnline); eventSource.addEventListener("request",markOnline); eventSource.onerror = () => document.querySelectorAll(".service-pill,.status-badge.active").forEach((el)=>{el.style.opacity=".6";}); eventSource.onopen=()=>document.querySelectorAll(".service-pill,.status-badge.active").forEach((el)=>{el.style.opacity="1";});
+  const modelsHeader = document.querySelector('[data-view="models"] .panel-header');
+  if (modelsHeader && !document.querySelector("#model-cache-settings")) { modelsHeader.insertAdjacentHTML("beforeend", '<label id="model-cache-settings" style="display:flex;align-items:center;gap:7px;font-size:12px">缓存 <input id="model-cache-ttl" type="number" min="0" max="86400" style="width:68px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft)"> 秒 <button id="save-model-cache" class="button">保存</button></label>'); request("/api/settings").then(s=>{ $("#model-cache-ttl").value=s.model_cache_ttl ?? 60; }); $("#save-model-cache").onclick=async()=>{try{const s=await request("/api/settings"),ttl=Number($("#model-cache-ttl").value);s.model_cache_ttl=ttl;await request("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(s)});notify("模型缓存策略已保存")}catch(e){notify(e.message,true)}}; }
+  const originalLoadModels = window.loadModels;
+  if (typeof originalLoadModels === "function") window.loadModels = () => originalLoadModels();
+  document.addEventListener("click", async (event) => { if (!event.target.closest("#refresh-models")) return; event.preventDefault(); event.stopImmediatePropagation(); const button=event.target.closest("#refresh-models"); button.disabled=true; try { await request("/api/models?refresh=true"); if(typeof loadModels==="function") await loadModels(); } catch(e){ notify(e.message,true); } finally { button.disabled=false; } }, true);
 
   document.addEventListener("click", async (event) => {
     const row = event.target.closest("#ollama-models tbody tr");
@@ -161,7 +185,7 @@
     try {
       const detail = await request(`/api/ollama/models/${encodeURIComponent(model)}`);
       const info = detail.details || {};
-      alert(`模型：${model}\n系列：${info.family || '—'}\n参数：${info.parameter_size || '—'}\n量化：${info.quantization_level || '—'}\n格式：${info.format || '—'}\n\n点击确定后可使用行内删除操作；加载/卸载 API 已开放。`);
+      showModal(`<h3>模型详情</h3><p><strong>${escape(model)}</strong></p><dl><dt>系列</dt><dd>${escape(info.family || '—')}</dd><dt>参数</dt><dd>${escape(info.parameter_size || '—')}</dd><dt>量化</dt><dd>${escape(info.quantization_level || '—')}</dd><dt>格式</dt><dd>${escape(info.format || '—')}</dd></dl>`);
     } catch (error) { notify(error.message, true); }
   });
 })();

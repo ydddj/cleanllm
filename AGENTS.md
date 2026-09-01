@@ -82,5 +82,6 @@ Add regression tests for changed authentication, settings persistence, response 
 - Pushes to `main` run tests and publish `ydddj/cleanllm:latest` plus the current semantic version tag for `linux/amd64` and `linux/arm64`; do not add commit-based `sha-*` tags.
 - Tags matching `v*.*.*` also publish semantic-version tags.
 - Every user-visible release change must update the API/UI version, `CHANGELOG.md`, and the README's current version reference together.
+- Model discovery may use the persistent `model_cache_ttl` setting (seconds; 0 disables caching). API tokens are stored only as SHA-256 digests and are never returned after creation; status streaming uses the authenticated SSE endpoint `/api/system/events`.
 - Never place Docker Hub credentials in source files. Publishing uses the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
 - After publishing, verify the GitHub Actions job before reporting the Docker image as available.

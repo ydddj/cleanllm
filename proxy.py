@@ -54,12 +54,17 @@ DEFAULT_SETTINGS = {
     "upstreams": [],
     "model_routes": [],
     "log_max_bytes": int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),
+    "model_cache_ttl": int(os.getenv("MODEL_CACHE_TTL", "60")),
+    "api_tokens": [],
+    "export_history": [],
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.12")
+app = FastAPI(title="CleanLLM", version="1.0.13")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
+MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
+STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
 
 
 class LoginRequest(BaseModel):
@@ -77,6 +82,7 @@ class SettingsUpdate(BaseModel):
     log_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1 * 1024 * 1024, le=50 * 1024 * 1024)
     upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     model_routes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
+    model_cache_ttl: int = Field(default=60, ge=0, le=86400)
 
     @field_validator("models_api_url", "ollama_api_url")
     @classmethod
@@ -133,6 +139,21 @@ class OllamaKeepAliveRequest(BaseModel):
 class OllamaImportRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     modelfile: str = Field(default="", max_length=2_000_000)
+
+
+class ApiTokenRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+def publish_status(event: str, data: dict[str, Any]) -> None:
+    try:
+        STATUS_EVENTS.put_nowait({"event": event, "data": data, "id": int(time.time() * 1000)})
+    except asyncio.QueueFull:
+        try:
+            STATUS_EVENTS.get_nowait()
+            STATUS_EVENTS.put_nowait({"event": event, "data": data, "id": int(time.time() * 1000)})
+        except asyncio.QueueEmpty:
+            pass
 
 
 class CappedFileHandler(logging.FileHandler):
@@ -258,6 +279,25 @@ def valid_session(token: str | None) -> bool:
 def require_admin(request: Request) -> None:
     if not valid_session(request.cookies.get(SESSION_COOKIE)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="请先登录")
+
+
+def token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def require_api_token(request: Request) -> None:
+    settings = load_settings()
+    configured = [item for item in settings.get("api_tokens", []) if isinstance(item, dict) and item.get("hash")]
+    if not configured:
+        return
+    header = request.headers.get("authorization", "")
+    supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    digest = token_digest(supplied) if supplied else ""
+    matched = next((item for item in configured if secrets.compare_digest(digest, str(item.get("hash")))), None)
+    if not matched:
+        raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
+    matched["last_used_at"] = int(time.time())
+    save_settings(settings)
 
 
 def load_settings() -> dict[str, Any]:
@@ -425,6 +465,7 @@ async def request_log_middleware(request: Request, call_next):
     if request.url.path != "/health":
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info("%s %s -> %s (%.1f ms)", request.method, request.url.path, response.status_code, elapsed_ms)
+        publish_status("request", {"path": request.url.path, "status": response.status_code, "latency_ms": round(elapsed_ms)})
     return response
 
 
@@ -477,7 +518,7 @@ async def health() -> dict[str, str]:
 @app.get("/api/settings")
 async def get_settings(_: None = Depends(require_admin)) -> dict[str, Any]:
     settings = load_settings()
-    return {key: settings[key] for key in DEFAULT_SETTINGS}
+    return {key: settings[key] for key in DEFAULT_SETTINGS if key not in {"api_tokens", "export_history"}}
 
 
 @app.put("/api/settings")
@@ -519,7 +560,7 @@ async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
 @app.get("/api/settings/export")
 async def export_settings(_: None = Depends(require_admin)) -> Response:
     settings = load_settings()
-    safe = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS}
+    safe = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS and key not in {"api_tokens", "export_history"}}
     safe["api_key"] = ""
     for upstream in safe.get("upstreams", []):
         if isinstance(upstream, dict):
@@ -572,10 +613,50 @@ async def update_account(
     return response
 
 
+@app.get("/api/tokens")
+async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
+    items = load_settings().get("api_tokens", [])
+    return {"data": [{"id": str(i.get("id")), "name": str(i.get("name")), "created_at": i.get("created_at"), "last_used_at": i.get("last_used_at")} for i in items if isinstance(i, dict)]}
+
+
+@app.post("/api/tokens")
+async def create_api_token(update: ApiTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
+    raw = "cln_" + secrets.token_urlsafe(24)
+    settings = load_settings()
+    item = {"id": uuid.uuid4().hex, "name": update.name.strip(), "hash": token_digest(raw), "created_at": int(time.time()), "last_used_at": None}
+    settings.setdefault("api_tokens", []).append(item)
+    save_settings(settings)
+    return {"id": item["id"], "name": item["name"], "token": raw, "created_at": item["created_at"]}
+
+
+@app.delete("/api/tokens/{token_id}")
+async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> dict[str, str]:
+    settings = load_settings(); before = len(settings.get("api_tokens", []))
+    settings["api_tokens"] = [i for i in settings.get("api_tokens", []) if not (isinstance(i, dict) and str(i.get("id")) == token_id)]
+    if len(settings["api_tokens"]) == before: raise HTTPException(status_code=404, detail="令牌不存在")
+    save_settings(settings); return {"message": "令牌已撤销"}
+
+
+@app.get("/api/system/events")
+async def system_events(_: None = Depends(require_admin)) -> StreamingResponse:
+    async def stream():
+        yield "event: connected\ndata: {\"status\":\"ok\"}\n\n"
+        while True:
+            try:
+                item = await asyncio.wait_for(STATUS_EVENTS.get(), timeout=25)
+                yield f"id: {item['id']}\nevent: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
+
+
 @app.get("/api/models")
-async def get_models(_: None = Depends(require_admin)) -> dict[str, Any]:
+async def get_models(refresh: bool = False, _: None = Depends(require_admin)) -> dict[str, Any]:
     settings = load_settings()
     url = models_url(settings)
+    ttl = max(0, int(settings.get("model_cache_ttl", 60)))
+    if not refresh and MODEL_CACHE.get("data") is not None and time.time() - float(MODEL_CACHE.get("at", 0)) < ttl and MODEL_CACHE.get("source") == url:
+        return {"source": url, "count": len(MODEL_CACHE["data"]), "cached": True, "data": MODEL_CACHE["data"]}
     headers: dict[str, str] = {"Accept": "application/json"}
     if settings.get("api_key"):
         headers["Authorization"] = f"Bearer {settings['api_key']}"
@@ -607,8 +688,9 @@ async def get_models(_: None = Depends(require_admin)) -> dict[str, Any]:
                     }
                 )
     models.sort(key=lambda item: item["id"].lower())
+    MODEL_CACHE.update({"at": time.time(), "data": models, "source": url})
     logger.info("Discovered %d upstream models from %s", len(models), url)
-    return {"source": url, "count": len(models), "data": models}
+    return {"source": url, "count": len(models), "cached": False, "data": models}
 
 
 @app.get("/api/ollama/status")
@@ -770,7 +852,17 @@ async def export_ollama_archive(model: str, _: None = Depends(require_admin)) ->
         archive_path.unlink(missing_ok=True)
         raise
     filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", model) + ".ollama.tar.gz"
+    settings = load_settings()
+    history = settings.setdefault("export_history", [])
+    history.insert(0, {"id": uuid.uuid4().hex, "model": model, "filename": filename, "created_at": int(time.time()), "size": archive_path.stat().st_size})
+    settings["export_history"] = history[:100]
+    save_settings(settings)
     return FileResponse(archive_path, filename=filename, media_type="application/gzip", background=BackgroundTask(archive_path.unlink, missing_ok=True))
+
+
+@app.get("/api/ollama/export-history")
+async def export_history(_: None = Depends(require_admin)) -> dict[str, Any]:
+    return {"data": load_settings().get("export_history", [])}
 
 
 @app.get("/api/ollama/models/{model:path}")
@@ -880,7 +972,7 @@ async def get_logs(
 
 
 @app.post("/v1/chat/completions")
-async def proxy_api(request: Request) -> Response:
+async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> Response:
     try:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError) as exc:

@@ -14,6 +14,7 @@ import proxy
 def client_for(tmp_path: Path) -> TestClient:
     proxy.DATA_DIR = tmp_path
     proxy.SETTINGS_FILE = tmp_path / "settings.json"
+    proxy.MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
     return TestClient(proxy.app, raise_server_exceptions=False)
 
 
@@ -148,6 +149,20 @@ def test_health_and_proxy_json_validation_are_public(tmp_path: Path) -> None:
     )
     assert response.status_code == 400
     assert response.headers["content-type"].startswith("application/json")
+
+
+def test_api_tokens_are_hashed_and_protect_proxy(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    created = client.post("/api/tokens", json={"name": "测试客户端"})
+    assert created.status_code == 200
+    token = created.json()["token"]
+    saved = proxy.load_settings()["api_tokens"][0]
+    assert token not in proxy.SETTINGS_FILE.read_text(encoding="utf-8")
+    assert saved["hash"] == proxy.token_digest(token)
+    assert "hash" not in client.get("/api/tokens").text
+    assert client.post("/v1/chat/completions", json={}).status_code == 401
+    assert client.post("/v1/chat/completions", content="not-json", headers={"Authorization": f"Bearer {token}", "content-type": "application/json"}).status_code == 400
 
 
 def test_models_url_is_derived_and_can_be_overridden() -> None:
