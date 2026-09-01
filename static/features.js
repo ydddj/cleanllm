@@ -9,12 +9,17 @@
     return data;
   };
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : alert(message);
+  const palettes = [
+    ["薰衣草", "#8b78a8", "#756193"], ["灰蓝", "#6f8fa8", "#58758e"], ["豆沙", "#b98282", "#9f6868"], ["鼠尾草", "#7f9a87", "#657f6d"], ["杏仁", "#b59f86", "#987f64"], ["雾紫", "#9a8fa8", "#7e718e"], ["陶土", "#b47f6e", "#956351"], ["海盐", "#79a6a5", "#5d8988"], ["奶茶", "#ad967e", "#8e765e"], ["烟粉", "#b18b9c", "#966f82"]
+  ];
+  const paletteStyle = document.createElement("style"); paletteStyle.textContent = ".palette-menu{position:fixed;right:18px;top:62px;z-index:120;display:grid;grid-template-columns:repeat(2,1fr);gap:7px;padding:12px;border:1px solid var(--border);border-radius:14px;background:var(--surface);box-shadow:var(--shadow)}.palette-item{display:flex;align-items:center;gap:7px;padding:7px 9px;border:1px solid transparent;border-radius:8px;background:var(--soft);color:var(--text);font-size:11px}.palette-item:hover{border-color:var(--primary)}.palette-dot{width:16px;height:16px;border-radius:50%}"; document.head.append(paletteStyle);
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.page{width:100%}.panel{width:100%}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.4";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.5";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
+  if (topActions && !document.querySelector("#palette-toggle")) { topActions.insertAdjacentHTML("afterbegin", '<button id="palette-toggle" class="icon-button" title="切换配色" aria-label="切换配色">◉</button>'); $("#palette-toggle").onclick=()=>{let menu=$("#palette-menu");if(menu){menu.remove();return}document.body.insertAdjacentHTML("beforeend",'<div id="palette-menu" class="palette-menu">'+palettes.map((item,index)=>`<button class="palette-item" data-palette="${index}"><i class="palette-dot" style="background:${item[1]}"></i>${item[0]}</button>`).join("")+"</div>");document.querySelectorAll("[data-palette]").forEach((button)=>button.onclick=()=>{const item=palettes[button.dataset.palette];document.documentElement.style.setProperty("--primary",item[1]);document.documentElement.style.setProperty("--primary2",item[2]);document.documentElement.style.setProperty("--primary-soft",item[1]+"26");localStorage.setItem("cleanllm-palette",button.dataset.palette);$("#palette-menu").remove()})};const saved=Number(localStorage.getItem("cleanllm-palette"));if(Number.isInteger(saved)&&palettes[saved]){const item=palettes[saved];document.documentElement.style.setProperty("--primary",item[1]);document.documentElement.style.setProperty("--primary2",item[2]);document.documentElement.style.setProperty("--primary-soft",item[1]+"26")}}
   if (topActions && !document.querySelector("#restart-container")) {
     topActions.insertAdjacentHTML("afterbegin", '<button id="restart-container" class="icon-button" title="重启容器" aria-label="重启容器">↻</button>');
     $("#restart-container").onclick = () => new Promise((resolve) => { const modal=createModal('<h3>重启容器</h3><p>重启只会重新启动 CleanLLM，不会删除设置或模型。</p>','<button class="button" id="restart-cancel">取消</button><button class="button primary" id="restart-ok">确认重启</button>'); $("#restart-cancel").onclick=()=>{modal.remove();resolve()}; $("#restart-ok").onclick=async()=>{try{const result=await request("/api/system/restart",{method:"POST"});modal.remove();notify(result.message);resolve()}catch(error){notify(error.message,true)}}; });
@@ -23,12 +28,12 @@
     nav.insertAdjacentHTML("beforeend", '<a href="#changelog" data-page="changelog"><span>▤</span><span>更新日志</span></a>');
     document.querySelector(".content-wrap")?.insertAdjacentHTML("beforeend", '<section class="page" data-view="changelog"><section class="panel"><div id="changelog-content" class="panel-body">正在读取更新日志…</div></section></section>');
     request("/api/changelog").then((data) => { $("#changelog-content").innerHTML = `<pre style="white-space:pre-wrap;font:13px/1.7 inherit">${escape(data.content)}</pre>`; }).catch((error) => { $("#changelog-content").textContent = error.message; });
-    nav.querySelector('[data-page="changelog"]').addEventListener("click", (event) => {
-      event.preventDefault();
+    const activateChangelog = () => {
       document.querySelectorAll(".nav a").forEach((link) => link.classList.toggle("active", link.dataset.page === "changelog"));
       document.querySelectorAll(".page").forEach((view) => view.classList.toggle("active", view.dataset.view === "changelog"));
       $("#page-eyebrow").textContent = "系统"; $("#page-title").textContent = "更新日志"; $("#page-description").textContent = "查看 CleanLLM 的功能更新与修复记录"; $("#page-actions").innerHTML = "";
-    });
+    }; nav.querySelector('[data-page="changelog"]').addEventListener("click", () => { location.hash="changelog"; setTimeout(activateChangelog, 0); });
+    if (location.hash === "#changelog") setTimeout(activateChangelog, 0);
   }
 
   const patterns = $("#clean_patterns")?.closest(".field");
