@@ -62,7 +62,7 @@ DEFAULT_SETTINGS = {
     "api_usage": [],
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.23")
+app = FastAPI(title="CleanLLM", version="1.0.24")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -493,16 +493,16 @@ async def request_log_middleware(request: Request, call_next):
 
 @app.get("/", include_in_schema=False)
 async def index(request: Request):
-    if not valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse("/login", status_code=303)
-    return FileResponse(STATIC_DIR / "index.html")
+    # Always serve the shell first; protected API calls perform the session check.
+    # This prevents browsers from flashing the legacy login document during refresh.
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/login", include_in_schema=False)
 async def login_page(request: Request):
     if valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse("/", status_code=303)
-    return FileResponse(STATIC_DIR / "login.html")
+    return FileResponse(STATIC_DIR / "login.html", headers={"Cache-Control": "no-store"})
 
 
 @app.post("/api/login")
