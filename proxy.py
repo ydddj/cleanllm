@@ -56,7 +56,7 @@ DEFAULT_SETTINGS = {
     "log_max_bytes": int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.7")
+app = FastAPI(title="CleanLLM", version="1.0.8")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}

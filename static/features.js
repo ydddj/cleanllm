@@ -16,7 +16,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.page{width:100%}.panel{width:100%}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.7";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.8";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if (topActions && !document.querySelector("#palette-toggle")) { topActions.insertAdjacentHTML("afterbegin", '<button id="palette-toggle" class="icon-button" title="切换配色" aria-label="切换配色">◉</button>'); $("#palette-toggle").onclick=()=>{let menu=$("#palette-menu");if(menu){menu.remove();return}document.body.insertAdjacentHTML("beforeend",'<div id="palette-menu" class="palette-menu">'+palettes.map((item,index)=>`<button class="palette-item" data-palette="${index}"><i class="palette-dot" style="background:${item[1]}"></i>${item[0]}</button>`).join("")+"</div>");document.querySelectorAll("[data-palette]").forEach((button)=>button.onclick=()=>{const item=palettes[button.dataset.palette];document.documentElement.style.setProperty("--primary",item[1]);document.documentElement.style.setProperty("--primary2",item[2]);document.documentElement.style.setProperty("--primary-soft",item[1]+"26");localStorage.setItem("cleanllm-palette",button.dataset.palette);$("#palette-menu").remove()})};const saved=Number(localStorage.getItem("cleanllm-palette"));if(Number.isInteger(saved)&&palettes[saved]){const item=palettes[saved];document.documentElement.style.setProperty("--primary",item[1]);document.documentElement.style.setProperty("--primary2",item[2]);document.documentElement.style.setProperty("--primary-soft",item[1]+"26")}}
@@ -38,6 +38,8 @@
 
   if (location.hash === "#changelog") setInterval(() => { const page=document.querySelector('[data-view="changelog"]'); if(page && !page.classList.contains("active")){document.querySelectorAll(".page").forEach((view)=>view.classList.toggle("active",view===page));document.querySelectorAll(".nav a").forEach((link)=>link.classList.toggle("active",link.dataset.page==="changelog"));$("#page-eyebrow").textContent="系统";$("#page-title").textContent="更新日志";$("#page-description").textContent="查看 CleanLLM 的功能更新与修复记录";} },100);
   const patterns = $("#clean_patterns")?.closest(".field");
+  const logNote = document.querySelector('[data-view="dashboard"] .stat-card.orange small'); if (logNote) logNote.textContent = "当前日志上限";
+  const logsDescription = document.querySelector('[data-view="logs"] .panel-header p'); if (logsDescription) logsDescription.textContent = "仅记录请求状态与系统事件，大小上限可在此调整";
   const logPage = document.querySelector('[data-view="logs"] .panel-header');
   if (logPage) logPage.insertAdjacentHTML("beforeend", '<label style="display:flex;align-items:center;gap:7px;font-size:12px">日志上限 <input id="log-max-mb" type="number" min="1" max="50" step="1" style="width:68px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft)"> MB <button id="save-log-limit" class="button">保存</button></label>');
   request("/api/settings").then((data) => { if ($("#log-max-mb")) $("#log-max-mb").value = Math.round((data.log_max_bytes || 5242880) / 1048576); }).catch(() => {});
@@ -101,9 +103,7 @@
       controls.querySelectorAll("button").forEach((button) => button.onclick = (event) => { event.stopPropagation(); modelAction(model, button.dataset.modelAction); });
     });
   };
-  const addTooltips = () => document.querySelectorAll("button, a").forEach((node) => { if (!node.title && node.textContent.trim()) node.title = node.textContent.trim().replace(/\s+/g, " "); });
-  new MutationObserver(() => { copyButtons(); addTooltips(); }).observe(document.body, {childList:true, subtree:true});
-  addTooltips();
+  new MutationObserver(copyButtons).observe(document.body, {childList:true, subtree:true});
   copyButtons();
 
   async function modelAction(model, action) {
