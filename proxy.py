@@ -65,6 +65,7 @@ OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
 MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
 STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
+API_USAGE: list[dict[str, Any]] = []
 
 
 class LoginRequest(BaseModel):
@@ -311,6 +312,8 @@ def require_api_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
     matched["last_used_at"] = int(time.time())
     save_settings(settings)
+    API_USAGE.append({"token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method})
+    del API_USAGE[:-500]
 
 
 def load_settings() -> dict[str, Any]:
@@ -659,6 +662,15 @@ async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> d
     settings["api_tokens"] = [i for i in settings.get("api_tokens", []) if not (isinstance(i, dict) and str(i.get("id")) == token_id)]
     if len(settings["api_tokens"]) == before: raise HTTPException(status_code=404, detail="令牌不存在")
     save_settings(settings); return {"message": "令牌已撤销"}
+
+
+@app.get("/api/usage")
+async def api_usage(_: None = Depends(require_admin)) -> dict[str, Any]:
+    now = int(time.time()); recent = [item for item in API_USAGE if now - int(item.get("at", 0)) < 30 * 86400]
+    by_token: dict[str, int] = {}
+    for item in recent:
+        key = str(item.get("token_name") or "未命名"); by_token[key] = by_token.get(key, 0) + 1
+    return {"total": len(recent), "today": sum(1 for item in recent if now - int(item.get("at", 0)) < 86400), "by_token": by_token, "logs": list(reversed(recent[-100:]))}
 
 
 @app.get("/api/system/events")
