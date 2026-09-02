@@ -62,9 +62,13 @@ DEFAULT_SETTINGS = {
     "api_usage": [],
     "appearance_background": "",
     "appearance_backgrounds": [],
+    "appearance_glass_opacity": 49,
+    "appearance_glass_brightness": 32,
+    "appearance_glass_blur": 13,
+    "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.41")
+app = FastAPI(title="CleanLLM", version="1.0.42")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -92,6 +96,10 @@ class SettingsUpdate(BaseModel):
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
     appearance_background: str = Field(default="", max_length=7_000_000)
     appearance_backgrounds: list[str] = Field(default_factory=list, max_length=20)
+    appearance_glass_opacity: int = Field(default=49, ge=0, le=100)
+    appearance_glass_brightness: int = Field(default=32, ge=0, le=100)
+    appearance_glass_blur: int = Field(default=13, ge=0, le=100)
+    appearance_mask_opacity: int = Field(default=69, ge=0, le=100)
 
     @field_validator("models_api_url", "ollama_api_url")
     @classmethod
