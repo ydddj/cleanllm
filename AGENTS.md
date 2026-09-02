@@ -35,6 +35,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Default both login and admin pages to dark mode before application scripts run, avoiding a light-theme flash; log level colors must use theme variables.
 - Theme selection must persist both `dark` and `light` values across refreshes; never treat a saved light choice as missing.
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
+- 多上游设置使用有序选项卡数组，数组首项始终是默认上游；默认上游名称可编辑，拖拽排序后保存顺序必须保持。
 
 ## Configuration rules
 

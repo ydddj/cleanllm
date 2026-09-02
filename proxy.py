@@ -48,6 +48,7 @@ DEFAULT_SETTINGS = {
     "target_api_url": os.getenv(
         "TARGET_API_URL", "http://host.docker.internal:11434/v1/chat/completions"
     ),
+    "default_upstream_name": "默认上游",
     "api_key": os.getenv("UPSTREAM_API_KEY", ""),
     "timeout_seconds": int(os.getenv("REQUEST_TIMEOUT", "120")),
     "models_api_url": os.getenv("MODELS_API_URL", ""),
@@ -85,6 +86,7 @@ class LoginRequest(BaseModel):
 
 class SettingsUpdate(BaseModel):
     target_api_url: HttpUrl
+    default_upstream_name: str = Field(default="默认上游", min_length=1, max_length=80)
     api_key: str = ""
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
     models_api_url: str = ""
@@ -424,7 +426,7 @@ def ollama_manifest_path(model: str) -> Path:
 
 def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
     primary = {
-        "name": "默认上游",
+        "name": str(settings.get("default_upstream_name") or "默认上游"),
         "url": str(settings["target_api_url"]),
         "api_key": str(settings.get("api_key") or ""),
         "timeout": int(settings.get("timeout_seconds") or 120),

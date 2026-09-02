@@ -42,6 +42,7 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     login(client)
     settings = {
         "target_api_url": "http://ollama:11434/v1/chat/completions",
+        "default_upstream_name": "本地 Ollama",
         "api_key": "secret",
         "timeout_seconds": 42,
         "clean_patterns": [r"(?is)<think>.*?</think>", r"<tag>"],
@@ -49,6 +50,7 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     response = client.put("/api/settings", json=settings)
     assert response.status_code == 200, response.text
     loaded = client.get("/api/settings").json()
+    assert loaded["default_upstream_name"] == settings["default_upstream_name"]
     assert loaded["clean_patterns"] == settings["clean_patterns"]
     assert proxy.clean_content("A<think>hidden</think>B<tag>", loaded) == "AB"
 
