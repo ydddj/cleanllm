@@ -62,7 +62,7 @@ DEFAULT_SETTINGS = {
     "api_usage": [],
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.28")
+app = FastAPI(title="CleanLLM", version="1.0.29")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
