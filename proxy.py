@@ -60,9 +60,10 @@ DEFAULT_SETTINGS = {
     "api_tokens": [],
     "export_history": [],
     "api_usage": [],
+    "appearance_background": "",
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.30")
+app = FastAPI(title="CleanLLM", version="1.0.31")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -88,6 +89,7 @@ class SettingsUpdate(BaseModel):
     model_routes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     model_cache_ttl: int = Field(default=60, ge=0, le=86400)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
+    appearance_background: str = Field(default="", max_length=7_000_000)
 
     @field_validator("models_api_url", "ollama_api_url")
     @classmethod
@@ -503,6 +505,11 @@ async def login_page(request: Request):
     if valid_session(request.cookies.get(SESSION_COOKIE)):
         return RedirectResponse("/", status_code=303)
     return FileResponse(STATIC_DIR / "login.html", headers={"Cache-Control": "no-store"})
+
+@app.get("/api/appearance", include_in_schema=False)
+async def public_appearance() -> dict[str, str]:
+    """Expose only the selected background so the login page can match the instance theme."""
+    return {"background": str(load_settings().get("appearance_background") or "")}
 
 
 @app.post("/api/login")

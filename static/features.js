@@ -22,7 +22,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.panel{width:100%}.log-line .level{color:var(--primary)!important}.button{cursor:pointer!important}.stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}@media(max-width:980px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}@media(max-width:600px){.stats-grid{grid-template-columns:1fr!important}}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.30";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.31";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -204,4 +204,10 @@
       showModal(`<h3>模型详情</h3><p><strong>${escape(model)}</strong></p><dl><dt>系列</dt><dd>${escape(info.family || '—')}</dd><dt>参数</dt><dd>${escape(info.parameter_size || '—')}</dd><dt>量化</dt><dd>${escape(info.quantization_level || '—')}</dd><dt>格式</dt><dd>${escape(info.format || '—')}</dd></dl>`);
     } catch (error) { notify(error.message, true); }
   });
-})();
+  const settingsPanel = document.querySelector('[data-view="upstream"] .form-footer');
+  if (settingsPanel && !document.querySelector('#appearance-settings')) {
+    settingsPanel.insertAdjacentHTML('beforebegin','<section id="appearance-settings" class="wide appearance-settings"><h3>外观</h3><p class="form-note">上传背景图后，液态玻璃效果会随背景变化，并保存在当前实例。</p><input id="appearance-background" type="file" accept="image/*"><button id="clear-appearance" class="button" type="button">清除背景图</button></section>');
+    request('/api/settings').then(data=>{ if(data.appearance_background){ document.body.style.backgroundImage=`linear-gradient(rgba(11,13,18,.58),rgba(11,13,18,.7)),url("${data.appearance_background}")`; } });
+    document.querySelector('#appearance-background').addEventListener('change', async event=>{ const file=event.target.files?.[0]; if(!file)return; if(file.size>5*1024*1024){notify('背景图不能超过 5 MB',true);return} const reader=new FileReader(); reader.onload=async()=>{ try{const current=await request('/api/settings'); current.appearance_background=reader.result; await request('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(current)}); document.body.style.backgroundImage=`linear-gradient(rgba(11,13,18,.58),rgba(11,13,18,.7)),url("${reader.result}")`; notify('背景图已保存');}catch(error){notify(error.message,true)} }; reader.readAsDataURL(file); });
+    document.querySelector('#clear-appearance').onclick=async()=>{try{const current=await request('/api/settings');current.appearance_background='';await request('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(current)});document.body.style.backgroundImage='';document.querySelector('#appearance-background').value='';notify('背景图已清除')}catch(error){notify(error.message,true)}};
+  }})();
