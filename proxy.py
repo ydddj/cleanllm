@@ -69,7 +69,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.62")
+app = FastAPI(title="CleanLLM", version="1.0.64")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -375,11 +375,11 @@ def clean_content(text: str, settings: dict[str, Any]) -> str:
     return text.strip()
 
 
-def models_url(settings: dict[str, Any]) -> str:
-    override = str(settings.get("models_api_url") or "").strip()
+def models_url_for_target(target_url: str, override: str = "") -> str:
+    override = str(override or "").strip()
     if override:
         return override
-    parsed = urlsplit(str(settings["target_api_url"]))
+    parsed = urlsplit(str(target_url))
     path = parsed.path.rstrip("/")
     for suffix in ("/chat/completions", "/responses"):
         if path.endswith(suffix):
@@ -388,6 +388,10 @@ def models_url(settings: dict[str, Any]) -> str:
     else:
         path = path.rsplit("/", 1)[0] + "/models"
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+
+def models_url(settings: dict[str, Any]) -> str:
+    return models_url_for_target(str(settings["target_api_url"]), str(settings.get("models_api_url") or ""))
 
 
 def ollama_base_url(settings: dict[str, Any]) -> str:
@@ -424,6 +428,8 @@ def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
         "url": str(settings["target_api_url"]),
         "api_key": str(settings.get("api_key") or ""),
         "timeout": int(settings.get("timeout_seconds") or 120),
+        "models_url": models_url(settings),
+        "clean_patterns": list(settings.get("clean_patterns") or []),
     }
     result = [primary]
     for item in settings.get("upstreams", []):
@@ -437,6 +443,8 @@ def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
             "url": str(item["url"]),
             "api_key": str(item.get("api_key") or ""),
             "timeout": max(1, min(int(item.get("timeout") or 120), 3600)),
+            "models_url": models_url_for_target(str(item["url"]), str(item.get("models_url") or "")),
+            "clean_patterns": list(item.get("clean_patterns") or settings.get("clean_patterns") or []),
         })
     return result
 
@@ -731,44 +739,35 @@ async def system_events(_: None = Depends(require_admin)) -> StreamingResponse:
 @app.get("/api/models")
 async def get_models(refresh: bool = False, _: None = Depends(require_admin)) -> dict[str, Any]:
     settings = load_settings()
-    url = models_url(settings)
+    upstreams = configured_upstreams(settings)
+    sources = "|".join(f"{item['name']}:{item['models_url']}" for item in upstreams)
     ttl = max(0, int(settings.get("model_cache_ttl", 60)))
-    if not refresh and MODEL_CACHE.get("data") is not None and time.time() - float(MODEL_CACHE.get("at", 0)) < ttl and MODEL_CACHE.get("source") == url:
-        return {"source": url, "count": len(MODEL_CACHE["data"]), "cached": True, "data": MODEL_CACHE["data"]}
-    headers: dict[str, str] = {"Accept": "application/json"}
-    if settings.get("api_key"):
-        headers["Authorization"] = f"Bearer {settings['api_key']}"
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url, headers=headers, timeout=min(float(settings["timeout_seconds"]), 30.0)
-            )
-            response.raise_for_status()
-            payload = response.json()
-    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
-        logger.warning("Model discovery failed for %s: %s", url, exc)
-        raise HTTPException(status_code=502, detail=f"获取上游模型失败：{exc}") from exc
-    raw_models = payload.get("data", []) if isinstance(payload, dict) else []
-    if not raw_models and isinstance(payload, dict):
-        raw_models = payload.get("models", [])
+    if not refresh and MODEL_CACHE.get("data") is not None and time.time() - float(MODEL_CACHE.get("at", 0)) < ttl and MODEL_CACHE.get("source") == sources:
+        return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(MODEL_CACHE["data"]), "cached": True, "data": MODEL_CACHE["data"]}
     models: list[dict[str, Any]] = []
-    for item in raw_models if isinstance(raw_models, list) else []:
-        if isinstance(item, str):
-            models.append({"id": item, "owned_by": "upstream", "created": None})
-        elif isinstance(item, dict):
-            model_id = item.get("id") or item.get("name") or item.get("model")
-            if model_id:
-                models.append(
-                    {
-                        "id": str(model_id),
-                        "owned_by": str(item.get("owned_by") or item.get("owner") or "upstream"),
-                        "created": item.get("created") or item.get("modified_at"),
-                    }
-                )
-    models.sort(key=lambda item: item["id"].lower())
-    MODEL_CACHE.update({"at": time.time(), "data": models, "source": url})
-    logger.info("Discovered %d upstream models from %s", len(models), url)
-    return {"source": url, "count": len(models), "cached": False, "data": models}
+    failures: list[str] = []
+    async with httpx.AsyncClient() as client:
+        for upstream in upstreams:
+            headers = {"Accept": "application/json"}
+            if upstream["api_key"]:
+                headers["Authorization"] = f"Bearer {upstream['api_key']}"
+            try:
+                response = await client.get(upstream["models_url"], headers=headers, timeout=min(float(upstream["timeout"]), 30.0))
+                response.raise_for_status(); payload = response.json()
+            except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+                failures.append(f"{upstream['name']}: {exc}"); continue
+            raw_models = payload.get("data", []) if isinstance(payload, dict) else []
+            if not raw_models and isinstance(payload, dict): raw_models = payload.get("models", [])
+            for item in raw_models if isinstance(raw_models, list) else []:
+                model_id = item if isinstance(item, str) else item.get("id") or item.get("name") or item.get("model") if isinstance(item, dict) else None
+                if model_id:
+                    models.append({"id": str(model_id), "owned_by": str(item.get("owned_by") or item.get("owner") or "upstream") if isinstance(item, dict) else "upstream", "created": item.get("created") or item.get("modified_at") if isinstance(item, dict) else None, "upstream": upstream["name"]})
+    if not models and failures:
+        raise HTTPException(status_code=502, detail="获取上游模型失败：" + "；".join(failures))
+    models.sort(key=lambda item: (item["id"].lower(), item["upstream"].lower()))
+    MODEL_CACHE.update({"at": time.time(), "data": models, "source": sources})
+    logger.info("Discovered %d models from %d upstreams", len(models), len(upstreams))
+    return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(models), "cached": False, "data": models, "failures": failures}
 
 
 @app.get("/api/ollama/status")
@@ -1128,6 +1127,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     if response is None:
         return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
     logger.info("Model %s routed to %s", payload.get("model", ""), selected["name"])
+    response_settings = {**settings, "clean_patterns": selected.get("clean_patterns", settings.get("clean_patterns", []))}
     if streaming:
         async def stream_response():
             buffer = ""
@@ -1136,9 +1136,9 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                     buffer += text
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
-                        yield (clean_stream_line(line, settings) + "\n").encode("utf-8")
+                        yield (clean_stream_line(line, response_settings) + "\n").encode("utf-8")
                 if buffer:
-                    yield clean_stream_line(buffer, settings).encode("utf-8")
+                    yield clean_stream_line(buffer, response_settings).encode("utf-8")
             finally:
                 await response.aclose()
                 await client.aclose()
@@ -1157,7 +1157,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         message = choices[0].get("message", {})
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, str):
-            message["content"] = clean_content(content, settings)
+            message["content"] = clean_content(content, response_settings)
     return JSONResponse(status_code=response.status_code, content=data)
 
 

@@ -286,6 +286,36 @@ def test_model_discovery_normalizes_openai_response(tmp_path: Path, monkeypatch)
     assert [item["id"] for item in result.json()["data"]] == ["deepseek-r1", "qwen3"]
 
 
+def test_model_discovery_aggregates_upstreams(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = client.get("/api/settings").json()
+    settings["upstreams"] = [{
+        "name": "备用",
+        "url": "http://backup:8000/v1/chat/completions",
+        "models_url": "http://backup:8000/v1/models",
+    }]
+    assert client.put("/api/settings", json=settings).status_code == 200
+
+    class FakeResponse:
+        def __init__(self, url): self.url = url
+        def raise_for_status(self): return None
+        def json(self):
+            return {"data": [{"id": "shared" if "backup" in self.url else "primary"}]}
+
+    class FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def get(self, url, **kwargs): return FakeResponse(url)
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    result = client.get("/api/models?refresh=true")
+    assert result.status_code == 200, result.text
+    assert [(item["id"], item["upstream"]) for item in result.json()["data"]] == [
+        ("primary", "默认上游"), ("shared", "备用")
+    ]
+
+
 def test_capped_log_handler_never_keeps_an_oversized_file(tmp_path: Path) -> None:
     path = tmp_path / "capped.log"
     handler = proxy.CappedFileHandler(path, max_bytes=512)
