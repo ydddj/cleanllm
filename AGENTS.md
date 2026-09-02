@@ -85,3 +85,6 @@ Add regression tests for changed authentication, settings persistence, response 
 - Model discovery may use the persistent `model_cache_ttl` setting (seconds; 0 disables caching). API tokens retain a SHA-256 digest for authentication and an instance-key-encrypted copy for administrator re-copy; never log tokens or expose them outside authenticated management APIs. Status streaming uses the authenticated SSE endpoint `/api/system/events`.
 - Never place Docker Hub credentials in source files. Publishing uses the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
 - After publishing, verify the GitHub Actions job before reporting the Docker image as available.
+
+## UI color rule
+- 新增界面功能（包括外观、上传、提示和操作按钮）必须使用 CSS 配色变量，切换配色后同步生效。
