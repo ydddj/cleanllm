@@ -204,7 +204,7 @@
       showModal(`<h3>模型详情</h3><p><strong>${escape(model)}</strong></p><dl><dt>系列</dt><dd>${escape(info.family || '—')}</dd><dt>参数</dt><dd>${escape(info.parameter_size || '—')}</dd><dt>量化</dt><dd>${escape(info.quantization_level || '—')}</dd><dt>格式</dt><dd>${escape(info.format || '—')}</dd></dl>`);
     } catch (error) { notify(error.message, true); }
   });
-  const settingsPanel = document.querySelector('[data-view="security"] .panel-body');
+  const settingsPanel = document.querySelector(' [data-view="security"] .settings-grid');
   if (settingsPanel && !document.querySelector('#appearance-settings')) {
     settingsPanel.insertAdjacentHTML('beforeend','<section id="appearance-settings" class="wide appearance-settings"><h3>外观</h3><p class="form-note">上传背景图后，液态玻璃效果会随背景变化，并保存在当前实例。</p><label class="button file-button">选择背景图<input id="appearance-background" type="file" accept="image/*" hidden></label><button id="clear-appearance" class="button" type="button">清除背景图</button><div id="appearance-gallery" class="appearance-gallery"></div></section>');
     request('/api/settings').then(data=>{ if(data.appearance_background){ document.body.style.backgroundImage=`linear-gradient(rgba(11,13,18,.58),rgba(11,13,18,.7)),url("${data.appearance_background}")`; } });
