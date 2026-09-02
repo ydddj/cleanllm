@@ -15,6 +15,7 @@ import socket
 import tarfile
 import tempfile
 import io
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -68,7 +69,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.57")
+app = FastAPI(title="CleanLLM", version="1.0.58")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -690,10 +691,26 @@ async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> d
 @app.get("/api/usage")
 async def api_usage(_: None = Depends(require_admin)) -> dict[str, Any]:
     now = int(time.time()); recent = [item for item in load_settings().get("api_usage", API_USAGE) if now - int(item.get("at", 0)) < 30 * 86400]
+    local_now = datetime.now().astimezone()
+    today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    week_start = today_start - timedelta(days=today_start.weekday())
+    month_start = today_start.replace(day=1)
+    def in_period(item: dict[str, Any], start: datetime, end: datetime | None = None) -> bool:
+        at = datetime.fromtimestamp(int(item.get("at", 0)), local_now.tzinfo)
+        return at >= start and (end is None or at < end)
     by_token: dict[str, int] = {}
     for item in recent:
         key = str(item.get("token_name") or "未命名"); by_token[key] = by_token.get(key, 0) + 1
-    return {"total": len(recent), "today": sum(1 for item in recent if now - int(item.get("at", 0)) < 86400), "by_token": by_token, "logs": list(reversed(recent[-100:]))}
+    return {
+        "total": len(recent),
+        "today": sum(1 for item in recent if in_period(item, today_start)),
+        "yesterday": sum(1 for item in recent if in_period(item, yesterday_start, today_start)),
+        "week": sum(1 for item in recent if in_period(item, week_start)),
+        "month": sum(1 for item in recent if in_period(item, month_start)),
+        "by_token": by_token,
+        "logs": list(reversed(recent[-100:])),
+    }
 
 
 @app.get("/api/system/events")
