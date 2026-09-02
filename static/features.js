@@ -4,7 +4,7 @@
   if (typeof loadModels === "function") loadModels(); document.documentElement.classList.add("js-ready");
   const sprite=document.querySelector('.icon-sprite'); if(sprite&&!document.getElementById('i-palette')) sprite.insertAdjacentHTML('beforeend','<symbol id="i-palette" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="9" cy="9" r="1"/><circle cx="15" cy="8" r="1"/><circle cx="16" cy="14" r="1"/><path d="M8 16h2a2 2 0 0 1 2 2v2"/></symbol><symbol id="i-chevron" viewBox="0 0 24 24"><path d="m7 9 5 5 5-5"/></symbol><symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2"/></symbol>');
   if (typeof pages === "object") pages["api-tokens"] = ["系统", "API 访问令牌", "管理访问令牌、用量和使用日志"];
-  if (typeof showPage === "function") showPage(); if (typeof loadAccount === "function") loadAccount().finally(()=>{document.body.style.visibility="visible"});
+  if (typeof showPage === "function") showPage(); if (typeof loadAccount === "function") loadAccount();
   const savedTheme = localStorage.getItem("cleanllm-theme") || "dark";
   document.documentElement.dataset.theme = savedTheme === "light" ? "light" : "dark";
   const escape = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[char]));
@@ -22,7 +22,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.panel{width:100%}.log-line .level{color:var(--primary)!important}.button{cursor:pointer!important}.stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}@media(max-width:980px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}@media(max-width:600px){.stats-grid{grid-template-columns:1fr!important}}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.32";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.34";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -51,7 +51,7 @@
   if (themeButton) { const syncThemeIcon=()=>themeButton.querySelector("use")?.setAttribute("href",document.documentElement.dataset.theme === "dark" ? "#i-sun" : "#i-moon"); syncThemeIcon(); themeButton.onclick = () => { const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark"; document.documentElement.dataset.theme = next; localStorage.setItem("cleanllm-theme", next); syncThemeIcon(); }; }
   const patterns = $("#clean_patterns")?.closest(".field");
   const logNote = document.querySelector('[data-view="dashboard"] .stat-card.orange small');
-  request("/api/settings").then((data) => { if (logNote) logNote.textContent = `当前日志上限 ${Math.round((data.log_max_bytes || 5242880) / 1048576)} MB`; }).catch(() => {});
+  request("/api/settings").then((data) => { if (logNote) logNote.textContent = `当前日志上限 ${Math.round((data.log_max_bytes || 5242880) / 1048576)} MB`; if ($("#dash-log-limit")) $("#dash-log-limit").textContent = `${Math.round((data.log_max_bytes || 5242880) / 1048576)} MB`; }).catch(() => {});
   const logsDescription = document.querySelector('[data-view="logs"] .panel-header p'); if (logsDescription) logsDescription.textContent = "仅记录请求状态与系统事件，大小上限可在此调整";
   const logPage = document.querySelector('[data-view="logs"] .panel-header');
   if (logPage) logPage.insertAdjacentHTML("beforeend", '<label style="display:flex;align-items:center;gap:7px;font-size:12px">日志上限 <input id="log-max-mb" type="number" min="1" max="50" step="1" style="width:68px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft)"> MB <button id="save-log-limit" class="button">保存</button></label>');
@@ -206,8 +206,9 @@
   });
   const settingsPanel = document.querySelector('[data-view="security"] .panel-body');
   if (settingsPanel && !document.querySelector('#appearance-settings')) {
-    settingsPanel.insertAdjacentHTML('beforeend','<section id="appearance-settings" class="wide appearance-settings"><h3>外观</h3><p class="form-note">上传背景图后，液态玻璃效果会随背景变化，并保存在当前实例。</p><input id="appearance-background" type="file" accept="image/*"><button id="clear-appearance" class="button" type="button">清除背景图</button></section>');
+    settingsPanel.insertAdjacentHTML('beforeend','<section id="appearance-settings" class="wide appearance-settings"><h3>外观</h3><p class="form-note">上传背景图后，液态玻璃效果会随背景变化，并保存在当前实例。</p><label class="button file-button">选择背景图<input id="appearance-background" type="file" accept="image/*" hidden></label><button id="clear-appearance" class="button" type="button">清除背景图</button></section>');
     request('/api/settings').then(data=>{ if(data.appearance_background){ document.body.style.backgroundImage=`linear-gradient(rgba(11,13,18,.58),rgba(11,13,18,.7)),url("${data.appearance_background}")`; } });
     document.querySelector('#appearance-background').addEventListener('change', async event=>{ const file=event.target.files?.[0]; if(!file)return; if(file.size>5*1024*1024){notify('背景图不能超过 5 MB',true);return} const reader=new FileReader(); reader.onload=async()=>{ try{const current=await request('/api/settings'); current.appearance_background=reader.result; await request('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(current)}); document.body.style.backgroundImage=`linear-gradient(rgba(11,13,18,.58),rgba(11,13,18,.7)),url("${reader.result}")`; notify('背景图已保存');}catch(error){notify(error.message,true)} }; reader.readAsDataURL(file); });
     document.querySelector('#clear-appearance').onclick=async()=>{try{const current=await request('/api/settings');current.appearance_background='';await request('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(current)});document.body.style.backgroundImage='';document.querySelector('#appearance-background').value='';notify('背景图已清除')}catch(error){notify(error.message,true)}};
-  }})();
+  }document.body.style.visibility="visible";
+})();
