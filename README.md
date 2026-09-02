@@ -91,7 +91,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-推送到 `main` 后会发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.51`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+推送到 `main` 后会发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.52`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。账户安全页支持创建、复制和撤销 API 访问令牌，令牌以实例密钥加密保存，创建令牌后代理接口要求 `Authorization: Bearer <token>`。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 Web 重启依赖 Compose 的 `restart: unless-stopped`，不需要挂载 Docker Socket。查看 Docker 日志时可使用 `docker compose logs -t` 显示时间戳。
