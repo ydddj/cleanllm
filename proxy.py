@@ -69,7 +69,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.58")
+app = FastAPI(title="CleanLLM", version="1.0.59")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -696,6 +696,7 @@ async def api_usage(_: None = Depends(require_admin)) -> dict[str, Any]:
     yesterday_start = today_start - timedelta(days=1)
     week_start = today_start - timedelta(days=today_start.weekday())
     month_start = today_start.replace(day=1)
+    year_start = today_start.replace(month=1, day=1)
     def in_period(item: dict[str, Any], start: datetime, end: datetime | None = None) -> bool:
         at = datetime.fromtimestamp(int(item.get("at", 0)), local_now.tzinfo)
         return at >= start and (end is None or at < end)
@@ -708,6 +709,7 @@ async def api_usage(_: None = Depends(require_admin)) -> dict[str, Any]:
         "yesterday": sum(1 for item in recent if in_period(item, yesterday_start, today_start)),
         "week": sum(1 for item in recent if in_period(item, week_start)),
         "month": sum(1 for item in recent if in_period(item, month_start)),
+        "year": sum(1 for item in recent if in_period(item, year_start)),
         "by_token": by_token,
         "logs": list(reversed(recent[-100:])),
     }
