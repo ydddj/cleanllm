@@ -5,5 +5,6 @@ __pycache__/
 venv/
 .testdata*/
 .pytest-tmp*/
+.pytest-audit*/
 .tmp-local-*/
 .button-test-data/

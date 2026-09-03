@@ -22,3 +22,7 @@
   html.sidebar-collapsed .nav a svg{width:20px;height:20px}
   html.sidebar-collapsed .sidebar-status{justify-content:center;padding:15px 0}
 }
+
+.button[hidden] {
+  display: none !important;
+}

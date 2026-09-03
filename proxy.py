@@ -116,7 +116,7 @@ CONNECTIVITY_STATE: dict[str, Any] = {"checked_at": None, "results": [], "availa
 CONNECTIVITY_LOCK = asyncio.Lock()
 CONNECTIVITY_TASK: asyncio.Task | None = None
 CONNECTIVITY_WAKEUP = asyncio.Event()
-STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
+STATUS_SUBSCRIBERS: set[asyncio.Queue] = set()
 ROUTE_AFFINITY: dict[str, tuple[str, float]] = {}
 UPSTREAM_CIRCUITS: dict[str, dict[str, Any]] = {}
 ALERT_COOLDOWNS: dict[str, float] = {}
@@ -257,11 +257,44 @@ class SettingsUpdate(BaseModel):
                 raise ValueError(f"虚拟模型别名不能重复：{alias}")
             if not isinstance(upstreams, list) or not all(isinstance(name, str) and name.strip() for name in upstreams):
                 raise ValueError(f"虚拟模型 {alias} 的 upstreams 必须是名称数组")
+            routes = item.get("routes") or []
+            if not isinstance(routes, list):
+                raise ValueError(f"虚拟模型 {alias} 的 routes 必须是数组")
+            cleaned_routes: list[dict[str, Any]] = []
+            for route_index, route in enumerate(routes, start=1):
+                if not isinstance(route, dict):
+                    raise ValueError(f"虚拟模型 {alias} 的路由 {route_index} 必须是对象")
+                upstream = str(route.get("upstream") or "").strip()
+                if not upstream:
+                    raise ValueError(f"虚拟模型 {alias} 的路由 {route_index} 缺少上游")
+                token_patterns = route.get("token_patterns") or []
+                path_patterns = route.get("path_patterns") or []
+                if not isinstance(token_patterns, list) or not all(isinstance(value, str) for value in token_patterns):
+                    raise ValueError(f"虚拟模型 {alias} 的令牌规则必须是字符串数组")
+                if not isinstance(path_patterns, list) or not all(isinstance(value, str) for value in path_patterns):
+                    raise ValueError(f"虚拟模型 {alias} 的路径规则必须是字符串数组")
+                start_time = str(route.get("start_time") or "").strip()
+                end_time = str(route.get("end_time") or "").strip()
+                if bool(start_time) != bool(end_time):
+                    raise ValueError(f"虚拟模型 {alias} 的开始和结束时间必须同时填写")
+                for value in (start_time, end_time):
+                    if value and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", value):
+                        raise ValueError(f"虚拟模型 {alias} 的时间必须使用 HH:MM")
+                cleaned_routes.append({
+                    "upstream": upstream,
+                    "priority": max(0, min(int(route.get("priority") or 0), 1000)),
+                    "weight": max(1, min(int(route.get("weight") or 1), 1000)),
+                    "token_patterns": [value.strip() for value in token_patterns if value.strip()],
+                    "path_patterns": [value.strip() for value in path_patterns if value.strip()],
+                    "start_time": start_time,
+                    "end_time": end_time,
+                })
             aliases.add(alias)
             cleaned.append({
                 "alias": alias,
                 "target": target,
                 "upstreams": list(dict.fromkeys(name.strip() for name in upstreams)),
+                "routes": cleaned_routes,
             })
         return cleaned
 
@@ -326,7 +359,8 @@ class SettingsUpdate(BaseModel):
             if unknown:
                 raise ValueError(f"模型路由引用了不存在的上游：{', '.join(unknown)}")
         for item in self.virtual_models:
-            unknown = [name for name in item["upstreams"] if name not in known]
+            referenced = [*item["upstreams"], *(route["upstream"] for route in item.get("routes", []))]
+            unknown = [name for name in referenced if name not in known]
             if unknown:
                 raise ValueError(f"虚拟模型 {item['alias']} 引用了不存在的上游：{', '.join(unknown)}")
         self.default_upstream_name = names[0]
@@ -470,14 +504,16 @@ class WebhookTestRequest(BaseModel):
 
 
 def publish_status(event: str, data: dict[str, Any]) -> None:
-    try:
-        STATUS_EVENTS.put_nowait({"event": event, "data": data, "id": int(time.time() * 1000)})
-    except asyncio.QueueFull:
+    item = {"event": event, "data": data, "id": int(time.time() * 1000)}
+    for queue in tuple(STATUS_SUBSCRIBERS):
         try:
-            STATUS_EVENTS.get_nowait()
-            STATUS_EVENTS.put_nowait({"event": event, "data": data, "id": int(time.time() * 1000)})
-        except asyncio.QueueEmpty:
-            pass
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+                queue.put_nowait(item)
+            except asyncio.QueueEmpty:
+                pass
 
 
 class CappedFileHandler(logging.FileHandler):
@@ -679,6 +715,7 @@ def database_connection() -> sqlite3.Connection:
             error TEXT NOT NULL DEFAULT '',
             cached_tokens INTEGER NOT NULL DEFAULT 0,
             first_byte_ms REAL,
+            termination_reason TEXT NOT NULL DEFAULT '',
             cost_usd REAL NOT NULL DEFAULT 0,
             FOREIGN KEY(token_id) REFERENCES api_tokens(id) ON DELETE SET NULL
         );
@@ -741,6 +778,7 @@ def database_connection() -> sqlite3.Connection:
             "error": "TEXT NOT NULL DEFAULT ''",
             "cached_tokens": "INTEGER NOT NULL DEFAULT 0",
             "first_byte_ms": "REAL",
+            "termination_reason": "TEXT NOT NULL DEFAULT ''",
             "cost_usd": "REAL NOT NULL DEFAULT 0",
         }
         for column, definition in usage_additions.items():
@@ -1012,7 +1050,7 @@ async def require_api_token(request: Request) -> None:
 def update_usage_record(usage_id: str | None, **values: Any) -> None:
     if not usage_id or not values:
         return
-    allowed = {"latency_ms", "first_byte_ms", "input_tokens", "output_tokens", "cached_tokens", "total_tokens", "resolved_model", "upstream", "status_code", "attempts", "error"}
+    allowed = {"latency_ms", "first_byte_ms", "input_tokens", "output_tokens", "cached_tokens", "total_tokens", "resolved_model", "upstream", "status_code", "attempts", "error", "termination_reason"}
     changes = {key: value for key, value in values.items() if key in allowed}
     if "error" in changes:
         changes["error"] = str(changes["error"] or "")[:500]
@@ -1351,29 +1389,120 @@ def record_upstream_success(name: str) -> None:
         UPSTREAM_CIRCUITS.pop(name, None)
 
 
+def release_upstream_probe(name: str) -> None:
+    """Release a half-open lease after a non-circuit compatibility response."""
+    state = UPSTREAM_CIRCUITS.get(name)
+    if state and state.get("phase") == "half_open":
+        state["probe_in_flight"] = False
+
+
+def acquire_upstream(name: str, now: float | None = None) -> bool:
+    """Return whether a request may use an upstream, allowing one half-open probe."""
+    state = UPSTREAM_CIRCUITS.get(name)
+    if not state:
+        return True
+    current = time.time() if now is None else now
+    if float(state.get("open_until") or 0) > current:
+        state["phase"] = "open"
+        return False
+    if int(state.get("failures") or 0) <= 0 or state.get("phase", "closed") == "closed":
+        return True
+    state["phase"] = "half_open"
+    state["open_until"] = 0.0
+    if state.get("probe_in_flight"):
+        return False
+    state["probe_in_flight"] = True
+    state["probe_started_at"] = current
+    return True
+
+
+def upstream_is_routable(name: str, now: float | None = None) -> bool:
+    state = UPSTREAM_CIRCUITS.get(name) or {}
+    return float(state.get("open_until") or 0) <= (time.time() if now is None else now)
+
+
 def record_upstream_failure(settings: dict[str, Any], name: str, error: str) -> None:
     if not name:
         return
     threshold = max(1, int(settings.get("circuit_breaker_failures", 3)))
     cooldown = max(5, int(settings.get("circuit_breaker_cooldown_seconds", 60)))
-    state = UPSTREAM_CIRCUITS.setdefault(name, {"failures": 0, "open_until": 0.0, "last_error": ""})
+    state = UPSTREAM_CIRCUITS.setdefault(name, {"failures": 0, "open_until": 0.0, "last_error": "", "phase": "closed", "probe_in_flight": False})
     state["failures"] = int(state.get("failures") or 0) + 1
     state["last_error"] = str(error or "上游请求失败")[:500]
     state["last_failure_at"] = time.time()
     if state["failures"] >= threshold:
         state["open_until"] = time.time() + cooldown
+        state["phase"] = "open"
+        state["probe_in_flight"] = False
         logger.warning("Upstream circuit opened: %s (%s)", name, state["last_error"])
         if state["failures"] >= int(settings.get("alert_upstream_failures", threshold)):
             schedule_alert("upstream_offline", f"上游已熔断：{name}", f"连续失败 {state['failures']} 次，冷却 {cooldown} 秒；{state['last_error']}")
 
 
-def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]]:
+def record_upstream_http_result(settings: dict[str, Any], name: str, status_code: int) -> None:
+    if status_code == 429 or status_code >= 500:
+        record_upstream_failure(settings, name, f"HTTP {status_code}")
+    else:
+        release_upstream_probe(name)
+
+
+def virtual_route_matches(route: dict[str, Any], token_name: str, token_id: str, path: str, at: datetime) -> bool:
+    token_patterns = route.get("token_patterns") or []
+    path_patterns = route.get("path_patterns") or []
+    if token_patterns and not any(
+        fnmatch.fnmatchcase(value, pattern)
+        for pattern in token_patterns
+        for value in (token_name, token_id)
+        if value
+    ):
+        return False
+    if path_patterns and not any(fnmatch.fnmatchcase(path, pattern) for pattern in path_patterns):
+        return False
+    start, end = str(route.get("start_time") or ""), str(route.get("end_time") or "")
+    if start and end:
+        current = at.strftime("%H:%M")
+        if start <= end:
+            return start <= current <= end
+        return current >= start or current <= end
+    return True
+
+
+def weighted_virtual_upstreams(routes: list[dict[str, Any]], seed: str) -> list[str]:
+    ordered: list[str] = []
+    priorities = sorted({int(route.get("priority") or 0) for route in routes})
+    for priority in priorities:
+        group = [route for route in routes if int(route.get("priority") or 0) == priority]
+        while group:
+            digest = hashlib.sha256(f"{seed}:{len(ordered)}".encode()).digest()
+            point = int.from_bytes(digest[:8], "big") % sum(max(1, int(item.get("weight") or 1)) for item in group)
+            total = 0
+            selected = group[-1]
+            for item in group:
+                total += max(1, int(item.get("weight") or 1))
+                if point < total:
+                    selected = item
+                    break
+            name = str(selected.get("upstream") or "")
+            if name and name not in ordered:
+                ordered.append(name)
+            group.remove(selected)
+    return ordered
+
+
+def route_upstreams(settings: dict[str, Any], model: str, request: Request | None = None) -> list[dict[str, Any]]:
     upstreams = configured_upstreams(settings)
     names = {item["name"]: item for item in upstreams}
     preferred: list[dict[str, Any]] = []
     virtual = virtual_model(settings, model)
     if virtual:
-        for name in virtual.get("upstreams", []):
+        token = getattr(request.state, "api_token", None) if request else None
+        token_name = str((token or {}).get("name") or "")
+        token_id = str((token or {}).get("id") or "")
+        path = request.url.path if request else ""
+        routes = [route for route in virtual.get("routes", []) if virtual_route_matches(route, token_name, token_id, path, datetime.now().astimezone())]
+        seed = str(getattr(request.state, "usage_id", "") if request else model)
+        route_names = weighted_virtual_upstreams(routes, seed) if routes else []
+        for name in [*route_names, *virtual.get("upstreams", [])]:
             if name in names and names[name] not in preferred:
                 preferred.append(names[name])
     for route in settings.get("model_routes", []):
@@ -1396,7 +1525,7 @@ def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]
         if available:
             preferred = [item for name in available for item in upstreams if item["name"] == name]
     ordered = preferred + [item for item in upstreams if item not in preferred]
-    available = [item for item in ordered if not circuit_is_open(item["name"])]
+    available = [item for item in ordered if upstream_is_routable(item["name"])]
     return available
 
 
@@ -1618,13 +1747,17 @@ async def prometheus_metrics() -> Response:
         "# TYPE cleanllm_estimated_cost_usd_total counter",
         f"cleanllm_estimated_cost_usd_total {float(total['cost'] or 0):.8f}",
     ]
-    for row in upstreams:
-        label = prometheus_label(str(row["upstream"]))
+    usage_by_upstream = {str(row["upstream"]): row for row in upstreams}
+    configured_names = [item["name"] for item in configured_upstreams(load_settings())]
+    metric_names = list(dict.fromkeys([*configured_names, *(name for name in usage_by_upstream if name != "unassigned")]))
+    for upstream_name in metric_names:
+        row = usage_by_upstream.get(upstream_name)
+        label = prometheus_label(upstream_name)
         lines.extend([
-            f'cleanllm_upstream_requests_total{{upstream="{label}"}} {int(row["calls"] or 0)}',
-            f'cleanllm_upstream_errors_total{{upstream="{label}"}} {int(row["errors"] or 0)}',
-            f'cleanllm_upstream_latency_milliseconds{{upstream="{label}"}} {float(row["latency"] or 0):.3f}',
-            f'cleanllm_upstream_circuit_open{{upstream="{label}"}} {1 if circuit_is_open(str(row["upstream"])) else 0}',
+            f'cleanllm_upstream_requests_total{{upstream="{label}"}} {int(row["calls"] or 0) if row else 0}',
+            f'cleanllm_upstream_errors_total{{upstream="{label}"}} {int(row["errors"] or 0) if row else 0}',
+            f'cleanllm_upstream_latency_milliseconds{{upstream="{label}"}} {float(row["latency"] or 0) if row else 0:.3f}',
+            f'cleanllm_upstream_circuit_open{{upstream="{label}"}} {1 if circuit_is_open(upstream_name) else 0}',
         ])
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
@@ -1679,9 +1812,20 @@ def create_config_snapshot_safely(reason: str, settings: dict[str, Any] | None =
 async def list_config_snapshots(_: None = Depends(require_admin)) -> dict[str, Any]:
     with database_connection() as database:
         rows = database.execute(
-            "SELECT id, created_at, reason FROM config_snapshots ORDER BY created_at DESC LIMIT 30"
+            "SELECT id, created_at, reason, settings_json FROM config_snapshots ORDER BY created_at DESC LIMIT 30"
         ).fetchall()
-    return {"data": [row_dict(row) for row in rows]}
+    current = load_settings()
+    data = []
+    for row in rows:
+        item = row_dict(row)
+        try:
+            snapshot = json.loads(item.pop("settings_json"))
+            item["changed_keys"] = sorted(key for key in set(current) | set(snapshot) if current.get(key) != snapshot.get(key))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item.pop("settings_json", None)
+            item["changed_keys"] = ["快照数据损坏"]
+        data.append(item)
+    return {"data": data}
 
 
 @app.post("/api/settings/snapshots")
@@ -1788,13 +1932,13 @@ async def run_connectivity_test(settings: dict[str, Any] | None = None) -> dict[
                 headers = {"Authorization": f"Bearer {upstream['api_key']}"} if upstream["api_key"] else {}
                 started = time.perf_counter()
                 try:
-                    # Probe the actual proxy endpoint first. Model discovery is an
-                    # optional capability and must not make a usable upstream fail.
-                    probe = await client.options(upstream["url"], headers=headers, timeout=8.0)
-                    if probe.status_code >= 500:
-                        probe.raise_for_status()
-                    detail = "上游代理端点可达"
+                    probe = await client.get(upstream["models_url"], headers=headers, timeout=8.0)
+                    probe.raise_for_status()
+                    detail = "模型列表接口可达（不代表流式生成兼容）"
                     results.append({"name": upstream["name"], "ok": True, "latency_ms": round((time.perf_counter()-started)*1000), "detail": detail})
+                    state = UPSTREAM_CIRCUITS.get(upstream["name"]) or {}
+                    if state.get("failures") and float(state.get("open_until") or 0) <= time.time():
+                        record_upstream_success(upstream["name"])
                 except Exception as exc:
                     results.append({"name": upstream["name"], "ok": False, "latency_ms": round((time.perf_counter()-started)*1000), "detail": str(exc)})
         checked = len(results)
@@ -2202,7 +2346,7 @@ def percentile(values: list[float], percent: float) -> float:
     return round(ordered[index], 1)
 
 
-def analytics_data(days: int, group_by: str) -> dict[str, Any]:
+def analytics_data(days: int, group_by: str, interval: str = "day") -> dict[str, Any]:
     since = int(time.time()) - days * 86400
     group_column = {"model": "model", "upstream": "upstream", "token": "token_name"}[group_by]
     with database_connection() as database:
@@ -2225,11 +2369,16 @@ def analytics_data(days: int, group_by: str) -> dict[str, Any]:
             f"SELECT COALESCE(NULLIF({group_column}, ''), '未记录') name, latency_ms FROM api_usage WHERE at >= ? AND latency_ms IS NOT NULL",
             (since,),
         ).fetchall()
+        bucket_sql = {
+            "day": "date(at, 'unixepoch', 'localtime')",
+            "week": "strftime('%Y-W%W', at, 'unixepoch', 'localtime')",
+            "month": "strftime('%Y-%m', at, 'unixepoch', 'localtime')",
+        }[interval]
         trend_rows = database.execute(
-            """SELECT date(at, 'unixepoch', 'localtime') day, COUNT(*) calls,
+            f"""SELECT {bucket_sql} bucket, COUNT(*) calls,
                       COALESCE(SUM(total_tokens),0) tokens, COALESCE(SUM(cost_usd),0) cost,
                       SUM(CASE WHEN status_code >= 400 OR error <> '' THEN 1 ELSE 0 END) errors
-               FROM api_usage WHERE at >= ? GROUP BY day ORDER BY day""", (since,),
+               FROM api_usage WHERE at >= ? GROUP BY bucket ORDER BY bucket""", (since,),
         ).fetchall()
     latencies: dict[str, list[float]] = {}
     all_latencies: list[float] = []
@@ -2252,7 +2401,7 @@ def analytics_data(days: int, group_by: str) -> dict[str, Any]:
     calls = int(overview["calls"] or 0)
     errors = int(overview["errors"] or 0)
     return {
-        "days": days, "group_by": group_by,
+        "days": days, "group_by": group_by, "interval": interval,
         "overview": {"calls": calls, "tokens": int(overview["tokens"] or 0), "cost": round(float(overview["cost"] or 0), 6), "errors": errors, "error_rate": round(errors / calls * 100, 1) if calls else 0, "average_latency": round(float(overview["average_latency"] or 0), 1), "p50_latency": percentile(all_latencies, .5), "p95_latency": percentile(all_latencies, .95)},
         "groups": group_items,
         "trend": [row_dict(row) for row in trend_rows],
@@ -2260,19 +2409,21 @@ def analytics_data(days: int, group_by: str) -> dict[str, Any]:
 
 
 @app.get("/api/analytics")
-async def usage_analytics(days: int = 30, group_by: str = "upstream", _: None = Depends(require_admin)) -> dict[str, Any]:
+async def usage_analytics(days: int = 30, group_by: str = "upstream", interval: str = "day", _: None = Depends(require_admin)) -> dict[str, Any]:
     if days not in {1, 7, 30, 90, 365}:
         raise HTTPException(status_code=400, detail="统计周期只支持 1、7、30、90 或 365 天")
     if group_by not in {"model", "upstream", "token"}:
         raise HTTPException(status_code=400, detail="分组只支持 model、upstream 或 token")
-    return analytics_data(days, group_by)
+    if interval not in {"day", "week", "month"}:
+        raise HTTPException(status_code=400, detail="趋势粒度只支持 day、week 或 month")
+    return analytics_data(days, group_by, interval)
 
 
 @app.get("/api/analytics/export")
-async def export_usage_analytics(days: int = 30, group_by: str = "upstream", _: None = Depends(require_admin)) -> Response:
-    if days not in {1, 7, 30, 90, 365} or group_by not in {"model", "upstream", "token"}:
+async def export_usage_analytics(days: int = 30, group_by: str = "upstream", interval: str = "day", _: None = Depends(require_admin)) -> Response:
+    if days not in {1, 7, 30, 90, 365} or group_by not in {"model", "upstream", "token"} or interval not in {"day", "week", "month"}:
         raise HTTPException(status_code=400, detail="统计参数无效")
-    data = analytics_data(days, group_by)
+    data = analytics_data(days, group_by, interval)
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["名称", "请求数", "Token", "错误数", "错误率(%)", "平均延迟(ms)", "P50(ms)", "P95(ms)", "费用(USD)"])
@@ -2298,16 +2449,37 @@ async def test_webhook(update: WebhookTestRequest, _: None = Depends(require_adm
 
 
 @app.get("/api/traces")
-async def request_traces(limit: int = 100, _: None = Depends(require_admin)) -> dict[str, Any]:
+async def request_traces(
+    limit: int = 100,
+    offset: int = 0,
+    request_id: str = "",
+    model: str = "",
+    token: str = "",
+    upstream: str = "",
+    _: None = Depends(require_admin),
+) -> dict[str, Any]:
     limit = max(1, min(limit, 500))
+    offset = max(0, offset)
+    where = ["visible = 1"]
+    parameters: list[Any] = []
+    for column, value in (("id", request_id), ("token_name", token), ("upstream", upstream)):
+        value = value.strip()
+        if value:
+            where.append(f"{column} LIKE ?")
+            parameters.append(f"%{value}%")
+    if model.strip():
+        where.append("(model LIKE ? OR resolved_model LIKE ?)")
+        parameters.extend([f"%{model.strip()}%", f"%{model.strip()}%"])
+    clause = " AND ".join(where)
     with database_connection() as database:
+        total = int(database.execute(f"SELECT COUNT(*) FROM api_usage WHERE {clause}", parameters).fetchone()[0])
         rows = database.execute(
             """SELECT id, token_name, at, path, method, model, resolved_model, upstream,
-                      status_code, latency_ms, attempts, error
-               FROM api_usage WHERE visible = 1 ORDER BY at DESC LIMIT ?""",
-            (limit,),
+                      status_code, latency_ms, first_byte_ms, attempts, error, termination_reason
+               FROM api_usage WHERE """ + clause + " ORDER BY at DESC, rowid DESC LIMIT ? OFFSET ?",
+            (*parameters, limit, offset),
         ).fetchall()
-    return {"data": [row_dict(row) for row in rows]}
+    return {"data": [row_dict(row) for row in rows], "total": total, "has_more": offset + len(rows) < total}
 
 
 @app.get("/api/audit/logs")
@@ -2329,11 +2501,18 @@ async def routing_status(_: None = Depends(require_admin)) -> dict[str, Any]:
     for upstream in configured_upstreams(settings):
         state = UPSTREAM_CIRCUITS.get(upstream["name"]) or {}
         open_until = float(state.get("open_until") or 0)
+        if open_until > now:
+            circuit_state = "open"
+        elif state.get("phase") == "half_open" or state.get("failures"):
+            circuit_state = "half_open"
+        else:
+            circuit_state = "closed"
         data.append({
             "name": upstream["name"],
-            "state": "open" if open_until > now else ("degraded" if state.get("failures") else "closed"),
+            "state": circuit_state,
             "failures": int(state.get("failures") or 0),
-            "open_until": open_until or None,
+            "open_until": open_until if open_until > now else None,
+            "probe_in_flight": bool(state.get("probe_in_flight")),
             "last_error": str(state.get("last_error") or ""),
         })
     return {
@@ -2365,6 +2544,7 @@ async def compatibility_test(
         ("模型列表", "GET", upstream["models_url"], None),
         ("Chat Completions", "POST", upstream["url"], {"model": test_model, "messages": [{"role": "user", "content": "Reply with OK."}], "stream": False, "max_tokens": 8}),
         ("Responses", "POST", endpoint_url_for_target(upstream["url"], "responses"), {"model": test_model, "input": "Reply with OK.", "stream": False, "max_output_tokens": 8}),
+        ("Embeddings", "POST", endpoint_url_for_target(upstream["url"], "embeddings"), {"model": test_model, "input": "compatibility check"}),
     ]
     results = []
     timeout = min(float(upstream["timeout"]), 30.0)
@@ -2383,19 +2563,56 @@ async def compatibility_test(
                 })
             except httpx.RequestError as exc:
                 results.append({"name": name, "ok": False, "status_code": None, "latency_ms": round((time.perf_counter() - started) * 1000, 1), "detail": str(exc)[:300]})
+        stream_tests = [
+            ("Chat Completions 流式", upstream["url"], {"model": test_model, "messages": [{"role": "user", "content": "Reply with OK."}], "stream": True, "max_tokens": 8}, {"[DONE]"}),
+            ("Responses 流式", endpoint_url_for_target(upstream["url"], "responses"), {"model": test_model, "input": "Reply with OK.", "stream": True, "max_output_tokens": 8}, {"response.completed", "response.incomplete"}),
+        ]
+        for name, url, payload, terminal_markers in stream_tests:
+            started = time.perf_counter()
+            status_code = None
+            terminal = False
+            try:
+                async with client.stream("POST", url, headers={**headers, "Accept": "text/event-stream"}, json=payload) as response:
+                    status_code = response.status_code
+                    if status_code < 400:
+                        async for line in response.aiter_lines():
+                            if line.startswith("event: ") and line[7:].strip() in terminal_markers:
+                                terminal = True
+                            if line.startswith("data: "):
+                                data = line[6:].strip()
+                                if data in terminal_markers:
+                                    terminal = True
+                                try:
+                                    event = json.loads(data)
+                                    if str(event.get("type") or "") in terminal_markers:
+                                        terminal = True
+                                except (ValueError, AttributeError):
+                                    pass
+                            if terminal:
+                                break
+                ok = bool(status_code is not None and status_code < 400 and terminal)
+                detail = "兼容，收到标准终止事件" if ok else (f"HTTP {status_code}" if status_code and status_code >= 400 else "流已结束，但未收到标准终止事件")
+                results.append({"name": name, "ok": ok, "status_code": status_code, "latency_ms": round((time.perf_counter() - started) * 1000, 1), "detail": detail})
+            except httpx.RequestError as exc:
+                results.append({"name": name, "ok": False, "status_code": status_code, "latency_ms": round((time.perf_counter() - started) * 1000, 1), "detail": str(exc)[:300]})
     return {"upstream": upstream["name"], "model": update.model, "results": results}
 
 
 @app.get("/api/system/events")
 async def system_events(_: None = Depends(require_admin)) -> StreamingResponse:
     async def stream():
-        yield "event: connected\ndata: {\"status\":\"ok\"}\n\n"
-        while True:
-            try:
-                item = await asyncio.wait_for(STATUS_EVENTS.get(), timeout=25)
-                yield f"id: {item['id']}\nevent: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
-            except asyncio.TimeoutError:
-                yield ": heartbeat\n\n"
+        queue: asyncio.Queue = asyncio.Queue(maxsize=20)
+        STATUS_SUBSCRIBERS.add(queue)
+        try:
+            yield "event: connected\ndata: {\"status\":\"ok\"}\n\n"
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=25)
+                    yield f"id: {item['id']}\nevent: {item['event']}\ndata: {json.dumps(item['data'], ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": heartbeat\n\n"
+        finally:
+            STATUS_SUBSCRIBERS.discard(queue)
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
 
 
@@ -2826,7 +3043,9 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
     requested_model = str(payload.get("model") or "")
     target_model = resolved_model(settings, requested_model)
     attempts = 0
-    for upstream in route_upstreams(settings, requested_model):
+    for upstream in route_upstreams(settings, requested_model, request):
+        if not acquire_upstream(upstream["name"]):
+            continue
         attempts += 1
         update_usage_record_safely(getattr(request.state, "usage_id", None), resolved_model=target_model, upstream=upstream["name"], attempts=attempts)
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
@@ -2834,6 +3053,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
         client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
         responses_url = upstream["url"].replace("/chat/completions", "/responses")
+        started = time.perf_counter()
         try:
             logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
             response = await client.send(
@@ -2847,12 +3067,10 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             continue
         if response.status_code >= 400:
             failures.append(f"{upstream['name']}: HTTP {response.status_code}")
-            if response.status_code == 429 or response.status_code >= 500:
-                record_upstream_failure(settings, upstream["name"], f"HTTP {response.status_code}")
+            record_upstream_http_result(settings, upstream["name"], response.status_code)
             await response.aclose()
             await client.aclose()
             continue
-        started = time.perf_counter()
         response_settings = {
             **settings,
             "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", [])),
@@ -2908,6 +3126,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     state["terminal"] = True
                     update_usage_record_safely(
                         getattr(request.state, "usage_id", None),
+                        termination_reason="response.completed",
                         **usage_values(response_data.get("usage")),
                     )
                     remember_route(settings, str(payload.get("model") or ""), upstream["name"])
@@ -2918,6 +3137,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     state["terminal"] = True
                     update_usage_record_safely(
                         getattr(request.state, "usage_id", None),
+                        termination_reason="response.incomplete",
                         **usage_values(response_data.get("usage")),
                     )
                     remember_route(settings, str(payload.get("model") or ""), upstream["name"])
@@ -2925,6 +3145,8 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     isinstance(response_data, dict) and response_data.get("status") == "failed"
                 ):
                     state["terminal"] = True
+                    state["failed"] = True
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="response.failed")
                 return b"data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
             try:
@@ -2939,7 +3161,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             except httpx.RequestError as exc:
                 logger.warning("Responses stream from %s disconnected: %s", upstream["name"], exc)
                 record_upstream_failure(settings, upstream["name"], str(exc))
-                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流意外中断")
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流意外中断", termination_reason="stream_disconnected")
                 if not state["terminal"]:
                     failed = {
                         "type": "response.failed",
@@ -2970,7 +3192,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     }
                     logger.warning("Responses stream from %s ended without response.completed", upstream["name"])
                     record_upstream_failure(settings, upstream["name"], "响应流未收到 response.completed")
-                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束")
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束", termination_reason="missing_terminal_event")
                     yield f"\nevent: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
             finally:
                 await response.aclose()
@@ -2978,6 +3200,8 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                 if state["successful_terminal"]:
                     record_upstream_success(upstream["name"])
                     logger.info("Responses stream ended normally: %s", upstream["name"])
+                elif state.get("failed"):
+                    record_upstream_failure(settings, upstream["name"], "上游返回 response.failed")
                 update_usage_record_safely(
                     getattr(request.state, "usage_id", None),
                     latency_ms=round((time.perf_counter() - started) * 1000, 1),
@@ -2989,9 +3213,11 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
+    detail = "所有上游 Responses 接口均不可用：" + "；".join(failures)
+    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
     return JSONResponse(
         status_code=502,
-        content={"error": {"message": "所有上游 Responses 接口均不可用：" + "；".join(failures), "type": "upstream_error"}},
+        content={"error": {"message": detail, "type": "upstream_error"}},
     )
 
 
@@ -3021,7 +3247,9 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
     update_usage_record_safely(getattr(request.state, "usage_id", None), resolved_model=target_model)
     failures: list[str] = []
     attempts = 0
-    for upstream in route_upstreams(settings, requested_model):
+    for upstream in route_upstreams(settings, requested_model, request):
+        if not acquire_upstream(upstream["name"]):
+            continue
         attempts += 1
         update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
         url = endpoint_url_for_target(upstream["url"], endpoint)
@@ -3036,11 +3264,11 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
                 response = await client.post(url, content=outbound_body, headers=headers)
             if response.status_code >= 400:
                 failures.append(f"{upstream['name']}: HTTP {response.status_code}")
-                if response.status_code == 429 or response.status_code >= 500:
-                    record_upstream_failure(settings, upstream["name"], f"HTTP {response.status_code}")
+                record_upstream_http_result(settings, upstream["name"], response.status_code)
                 continue
             remember_route(settings, str(payload.get("model") or endpoint), upstream["name"])
             record_upstream_success(upstream["name"])
+            update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="http_completed")
             response_headers = {}
             if response.headers.get("content-disposition"):
                 response_headers["Content-Disposition"] = response.headers["content-disposition"]
@@ -3059,9 +3287,11 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
         except httpx.RequestError as exc:
             record_upstream_failure(settings, upstream["name"], str(exc))
             failures.append(f"{upstream['name']}: {exc}")
+    detail = "所有上游均不可用：" + "；".join(failures)
+    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
     return JSONResponse(
         status_code=502,
-        content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}},
+        content={"error": {"message": detail, "type": "upstream_error"}},
     )
 
 
@@ -3118,7 +3348,9 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             chat_done = False
             stream_payload = {**chat_payload, "stream": True}
             attempts = 0
-            for upstream in route_upstreams(settings, requested_model):
+            for upstream in route_upstreams(settings, requested_model, request):
+                if not acquire_upstream(upstream["name"]):
+                    continue
                 attempts += 1
                 update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
                 headers = {"Content-Type": "application/json"}
@@ -3130,8 +3362,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         async with client.stream("POST", responses_url, json=stream_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
-                                if upstream_response.status_code == 429 or upstream_response.status_code >= 500:
-                                    record_upstream_failure(settings, upstream["name"], f"HTTP {upstream_response.status_code}")
+                                record_upstream_http_result(settings, upstream["name"], upstream_response.status_code)
                                 continue
                             selected_name = upstream["name"]
                             emitted = False
@@ -3188,27 +3419,30 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 remember_route(settings, str(payload["model"]), str(selected_name or ""))
                 return
             if selected_name is None:
-                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="所有上游均不可用")
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="所有上游均不可用", termination_reason="no_upstream_available")
                 failed = {**base, "status": "failed", "error": {"message": "所有上游均不可用", "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
             if not chat_done:
                 record_upstream_failure(settings, str(selected_name), "响应流未正常结束")
-                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束")
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束", termination_reason="missing_terminal_event")
                 failed = {**base, "status": "failed", "error": {"message": "上游响应流未正常结束", "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
             remember_route(settings, str(payload["model"]), str(selected_name))
             record_upstream_success(str(selected_name))
+            update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="response.completed")
             completed = {**base, "status": "completed", "output": [{"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": complete_text}]}]}
             sequence_number += 1
             completed["sequence_number"] = sequence_number
             yield f"event: response.output_text.done\ndata: {json.dumps({'type':'response.output_text.done','item_id':item_id,'output_index':0,'content_index':0,'text':complete_text,'response_id':response_id,'sequence_number':sequence_number}, ensure_ascii=False)}\n\n"
             yield f"event: response.completed\ndata: {json.dumps({'type':'response.completed','response':completed}, ensure_ascii=False)}\n\n"
-        return StreamingResponse(response_events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
+        return StreamingResponse(response_events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache, no-transform", "X-Accel-Buffering":"no", "Connection":"keep-alive"})
     async with httpx.AsyncClient() as client:
         attempts = 0
-        for upstream in route_upstreams(settings, requested_model):
+        for upstream in route_upstreams(settings, requested_model, request):
+            if not acquire_upstream(upstream["name"]):
+                continue
             attempts += 1
             update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
             headers = {"Content-Type": "application/json"}
@@ -3221,8 +3455,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {response.status_code}")
-                    if response.status_code == 429 or response.status_code >= 500:
-                        record_upstream_failure(settings, upstream["name"], f"HTTP {response.status_code}")
+                    record_upstream_http_result(settings, upstream["name"], response.status_code)
                     continue
                 data = response.json(); text = data.get("output_text", "")
                 if not text:
@@ -3234,6 +3467,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 now = int(time.time())
                 result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
                 update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage")))
+                update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="response.completed")
                 remember_route(settings, str(payload["model"]), upstream["name"])
                 record_upstream_success(upstream["name"])
                 if payload.get("stream") is True:
@@ -3247,11 +3481,14 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 logger.warning("Responses upstream %s failed: %s", upstream["name"], exc)
                 record_upstream_failure(settings, upstream["name"], str(exc))
                 failures.append(f"{upstream['name']}: {exc}")
-    return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
+    detail = "所有上游均不可用：" + "；".join(failures)
+    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
+    return JSONResponse(status_code=502, content={"error": {"message": detail, "type": "upstream_error"}})
 
 
 @app.post("/v1/chat/completions")
 async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> Response:
+    proxy_started = time.perf_counter()
     try:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError) as exc:
@@ -3269,7 +3506,9 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     selected = None
     client = None
     attempts = 0
-    for upstream in route_upstreams(settings, requested_model):
+    for upstream in route_upstreams(settings, requested_model, request):
+        if not acquire_upstream(upstream["name"]):
+            continue
         attempts += 1
         update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
         headers = {"Content-Type": "application/json"}
@@ -3281,8 +3520,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=upstream_payload, headers=headers), stream=True)
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
-                    if candidate.status_code == 429 or candidate.status_code >= 500:
-                        record_upstream_failure(settings, upstream["name"], f"HTTP {candidate.status_code}")
+                    record_upstream_http_result(settings, upstream["name"], candidate.status_code)
                     await candidate.aclose()
                     await candidate_client.aclose()
                     continue
@@ -3292,8 +3530,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                     candidate = await candidate_client.post(upstream["url"], json=upstream_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
-                    if candidate.status_code == 429 or candidate.status_code >= 500:
-                        record_upstream_failure(settings, upstream["name"], f"HTTP {candidate.status_code}")
+                    record_upstream_http_result(settings, upstream["name"], candidate.status_code)
                     continue
                 response, selected = candidate, upstream
             break
@@ -3301,11 +3538,13 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
             record_upstream_failure(settings, upstream["name"], str(exc))
             failures.append(f"{upstream['name']}: {exc}")
     if response is None:
-        return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
+        detail = "所有上游均不可用：" + "；".join(failures)
+        update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
+        return JSONResponse(status_code=502, content={"error": {"message": detail, "type": "upstream_error"}})
     logger.info("Model %s routed to %s", payload.get("model", ""), selected["name"])
     response_settings = {**settings, "clean_patterns": selected.get("clean_patterns", settings.get("clean_patterns", []))}
     if streaming:
-        stream_started = time.perf_counter()
+        stream_started = proxy_started
         async def stream_response():
             buffer = ""
             completed = False
@@ -3339,14 +3578,17 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 if completed:
                     record_upstream_success(selected["name"])
                     remember_route(settings, requested_model, selected["name"])
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="stream_completed")
                 else:
                     record_upstream_failure(settings, selected["name"], "响应流未正常结束")
-                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束")
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束", termination_reason="missing_terminal_event")
                 update_usage_record_safely(getattr(request.state, "usage_id", None), latency_ms=round((time.perf_counter() - stream_started) * 1000, 1))
         return StreamingResponse(stream_response(), status_code=response.status_code, media_type=response.headers.get("content-type", "text/event-stream"))
     try:
         data = response.json()
     except ValueError:
+        record_upstream_failure(settings, selected["name"], "上游返回非 JSON 内容")
+        update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游返回了非 JSON 内容", termination_reason="invalid_upstream_response")
         return JSONResponse(
             status_code=502,
             content={
@@ -3362,6 +3604,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage") if isinstance(data, dict) else {}))
     record_upstream_success(selected["name"])
     remember_route(settings, requested_model, selected["name"])
+    update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="http_completed")
     return JSONResponse(status_code=response.status_code, content=data)
 
 

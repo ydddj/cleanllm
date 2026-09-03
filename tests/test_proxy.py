@@ -5,6 +5,8 @@ import sqlite3
 import time
 import io
 import zipfile
+import asyncio
+from types import SimpleNamespace
 from datetime import datetime
 from pathlib import Path
 
@@ -55,6 +57,33 @@ def test_circuit_breaker_skips_open_upstream_and_recovers() -> None:
     assert proxy.route_upstreams(settings, "model")[0]["name"] == "backup"
     proxy.record_upstream_success("primary")
     assert not proxy.circuit_is_open("primary")
+
+
+def test_circuit_breaker_allows_only_one_half_open_probe() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1", "default_upstream_name": "primary",
+        "circuit_breaker_failures": 1, "circuit_breaker_cooldown_seconds": 5,
+    }).model_dump(mode="json")
+    proxy.record_upstream_failure(settings, "primary", "timeout")
+    proxy.UPSTREAM_CIRCUITS["primary"]["open_until"] = time.time() - 1
+    assert [item["name"] for item in proxy.route_upstreams(settings, "model")] == ["primary"]
+    assert proxy.acquire_upstream("primary") is True
+    assert proxy.acquire_upstream("primary") is False
+    proxy.record_upstream_success("primary")
+    assert [item["name"] for item in proxy.route_upstreams(settings, "model")] == ["primary"]
+
+
+def test_virtual_model_conditional_route_uses_request_context() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1", "default_upstream_name": "primary",
+        "upstreams": [{"name": "backup", "url": "http://backup/v1"}],
+        "virtual_models": [{"alias": "coding-best", "target": "gpt-real", "routes": [{
+            "upstream": "backup", "priority": 0, "weight": 2,
+            "token_patterns": ["codex-*"], "path_patterns": ["/v1/responses"],
+        }]}],
+    }).model_dump(mode="json")
+    request = SimpleNamespace(state=SimpleNamespace(api_token={"name": "codex-main"}, usage_id="request-1"), url=SimpleNamespace(path="/v1/responses"))
+    assert proxy.route_upstreams(settings, "coding-best", request)[0]["name"] == "backup"
 
 
 def test_virtual_model_is_rewritten_before_chat_forwarding(tmp_path: Path, monkeypatch) -> None:
@@ -114,6 +143,9 @@ def test_api_token_rpm_limit_and_request_trace(tmp_path: Path) -> None:
     trace = client.get("/api/traces").json()["data"][0]
     assert trace["token_name"] == "limited"
     assert trace["status_code"] == 400
+    filtered = client.get("/api/traces", params={"request_id": trace["id"][:8], "token": "limited", "limit": 1}).json()
+    assert filtered["total"] == 1
+    assert filtered["has_more"] is False
 
 
 def test_token_policy_limits_are_persisted(tmp_path: Path) -> None:
@@ -405,16 +437,29 @@ def test_existing_usage_schema_adds_visible_column(tmp_path: Path) -> None:
     with proxy.database_connection() as database:
         columns = {row[1] for row in database.execute("PRAGMA table_info(api_usage)")}
     assert "visible" in columns
-    assert {"resolved_model", "upstream", "status_code", "attempts", "error"}.issubset(columns)
+    assert {"resolved_model", "upstream", "status_code", "attempts", "error", "termination_reason"}.issubset(columns)
 
 
-def test_compatibility_test_checks_three_upstream_endpoints(tmp_path: Path, monkeypatch) -> None:
+def test_compatibility_test_checks_all_upstream_endpoints(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     login(client)
     calls = []
 
     class FakeResponse:
         status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def aiter_lines(self):
+            if calls[-1][1].endswith("/responses"):
+                yield 'event: response.completed'
+                yield 'data: {"type":"response.completed"}'
+            else:
+                yield 'data: [DONE]'
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -430,14 +475,19 @@ def test_compatibility_test_checks_three_upstream_endpoints(tmp_path: Path, monk
             calls.append((method, url, kwargs.get("json")))
             return FakeResponse()
 
+        def stream(self, method, url, **kwargs):
+            calls.append((method, url, kwargs.get("json")))
+            return FakeResponse()
+
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
     response = client.post(
         "/api/compatibility/test",
         json={"upstream": "默认上游", "model": "test-model"},
     )
     assert response.status_code == 200
-    assert len(response.json()["results"]) == 3
-    assert [call[0] for call in calls] == ["GET", "POST", "POST"]
+    assert len(response.json()["results"]) == 6
+    assert [call[0] for call in calls] == ["GET", "POST", "POST", "POST", "POST", "POST"]
+    assert all(item["ok"] for item in response.json()["results"])
 
 
 def test_api_token_can_expire_and_be_disabled(tmp_path: Path) -> None:
@@ -894,6 +944,35 @@ def test_connectivity_lists_configured_upstreams_before_first_check(tmp_path: Pa
     assert result.json()["availability_percent"] is None
 
 
+def test_connectivity_uses_models_url_and_recovers_expired_circuit(tmp_path: Path, monkeypatch) -> None:
+    client_for(tmp_path)
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "primary",
+        "models_api_url": "http://primary/custom/models",
+        "circuit_breaker_failures": 1,
+    }).model_dump(mode="json")
+    proxy.record_upstream_failure(settings, "primary", "HTTP 503")
+    proxy.UPSTREAM_CIRCUITS["primary"]["open_until"] = time.time() - 1
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self): return None
+
+    class FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def get(self, url, **kwargs):
+            calls.append(url)
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(proxy.run_connectivity_test(settings))
+    assert calls == ["http://primary/custom/models"]
+    assert result["results"][0]["ok"] is True
+    assert "primary" not in proxy.UPSTREAM_CIRCUITS
+
+
 def test_capped_log_handler_never_keeps_an_oversized_file(tmp_path: Path) -> None:
     path = tmp_path / "capped.log"
     handler = proxy.CappedFileHandler(path, max_bytes=512)
@@ -934,6 +1013,10 @@ def test_pricing_and_analytics_are_persisted(tmp_path: Path) -> None:
     assert analytics.json()["overview"]["calls"] == 1
     assert analytics.json()["overview"]["p95_latency"] == 250
     assert analytics.json()["groups"][0]["cost"] == 0.0048
+    monthly = client.get("/api/analytics?days=30&group_by=model&interval=month")
+    assert monthly.status_code == 200
+    assert monthly.json()["interval"] == "month"
+    assert "bucket" in monthly.json()["trend"][0]
     exported = client.get("/api/analytics/export?days=1&group_by=model")
     assert exported.status_code == 200
     assert "text/csv" in exported.headers["content-type"]
@@ -964,6 +1047,9 @@ def test_config_snapshots_restore_and_backup(tmp_path: Path) -> None:
     changed = client.get("/api/settings").json()
     changed["default_upstream_name"] = "after"
     assert client.put("/api/settings", json=changed).status_code == 200
+    listed = client.get("/api/settings/snapshots").json()["data"]
+    known = next(item for item in listed if item["id"] == snapshot.json()["id"])
+    assert "default_upstream_name" in known["changed_keys"]
     restored = client.post(f"/api/settings/snapshots/{snapshot.json()['id']}/restore")
     assert restored.status_code == 200
     assert client.get("/api/settings").json()["default_upstream_name"] == "before"
@@ -982,6 +1068,18 @@ def test_health_and_prometheus_metrics(tmp_path: Path) -> None:
     assert metrics.status_code == 200
     assert "cleanllm_requests_total" in metrics.text
     assert "cleanllm_tokens_total" in metrics.text
+    assert 'cleanllm_upstream_requests_total{upstream="默认上游"} 0' in metrics.text
+
+
+def test_status_events_are_broadcast_to_all_subscribers() -> None:
+    first, second = asyncio.Queue(), asyncio.Queue()
+    proxy.STATUS_SUBSCRIBERS.update({first, second})
+    try:
+        proxy.publish_status("request", {"status": 200})
+        assert first.get_nowait()["data"]["status"] == 200
+        assert second.get_nowait()["data"]["status"] == 200
+    finally:
+        proxy.STATUS_SUBSCRIBERS.difference_update({first, second})
 
 
 def test_second_stage_management_apis_require_admin(tmp_path: Path) -> None:
