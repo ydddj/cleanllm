@@ -23,7 +23,113 @@ def client_for(tmp_path: Path) -> TestClient:
     proxy.DATA_DIR = tmp_path
     proxy.SETTINGS_FILE = tmp_path / "settings.json"
     proxy.MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+    proxy.ROUTE_AFFINITY.clear()
+    proxy.UPSTREAM_CIRCUITS.clear()
     return TestClient(proxy.app, raise_server_exceptions=False)
+
+
+def test_virtual_model_resolves_target_and_prioritizes_upstreams() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "primary",
+        "upstreams": [{"name": "backup", "url": "http://backup/v1"}],
+        "virtual_models": [{"alias": "coding-best", "target": "gpt-real", "upstreams": ["backup"]}],
+    }).model_dump(mode="json")
+    assert proxy.resolved_model(settings, "coding-best") == "gpt-real"
+    assert [item["name"] for item in proxy.route_upstreams(settings, "coding-best")][:2] == ["backup", "primary"]
+
+
+def test_circuit_breaker_skips_open_upstream_and_recovers() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "primary",
+        "upstreams": [{"name": "backup", "url": "http://backup/v1"}],
+        "circuit_breaker_failures": 2,
+        "circuit_breaker_cooldown_seconds": 60,
+    }).model_dump(mode="json")
+    proxy.record_upstream_failure(settings, "primary", "timeout")
+    proxy.record_upstream_failure(settings, "primary", "timeout")
+    assert proxy.circuit_is_open("primary")
+    assert proxy.route_upstreams(settings, "model")[0]["name"] == "backup"
+    proxy.record_upstream_success("primary")
+    assert not proxy.circuit_is_open("primary")
+
+
+def test_virtual_model_is_rewritten_before_chat_forwarding(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    saved = client.put("/api/settings", json={
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "primary",
+        "upstreams": [{"name": "backup", "url": "http://backup/v1"}],
+        "virtual_models": [{"alias": "coding-best", "target": "gpt-real", "upstreams": ["backup"]}],
+    })
+    assert saved.status_code == 200, saved.text
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}], "usage": {"total_tokens": 2}}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/chat/completions", json={"model": "coding-best", "messages": []})
+    assert response.status_code == 200
+    assert calls == [("http://backup/v1/chat/completions", {"model": "gpt-real", "messages": []})]
+    trace = client.get("/api/traces").json()["data"][0]
+    assert trace["model"] == "coding-best"
+    assert trace["resolved_model"] == "gpt-real"
+    assert trace["upstream"] == "backup"
+
+
+def test_api_token_rpm_limit_and_request_trace(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    created = client.post("/api/tokens", json={"name": "limited", "rpm_limit": 1})
+    assert created.status_code == 200
+    token = created.json()["token"]
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    assert client.post("/v1/chat/completions", content="not-json", headers=headers).status_code == 400
+    limited = client.post("/v1/chat/completions", json={"model": "test"}, headers=headers)
+    assert limited.status_code == 429
+    assert "每分钟请求数" in limited.json()["error"]["message"]
+    assert limited.json()["error"]["type"] == "rate_limit_error"
+    trace = client.get("/api/traces").json()["data"][0]
+    assert trace["token_name"] == "limited"
+    assert trace["status_code"] == 400
+
+
+def test_token_policy_limits_are_persisted(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    token_id = client.post("/api/tokens", json={"name": "policy"}).json()["id"]
+    response = client.patch(f"/api/tokens/{token_id}/policy", json={
+        "expires_at": None,
+        "allowed_models": ["coding-*"],
+        "rpm_limit": 20,
+        "tpm_limit": 30000,
+        "daily_token_limit": 500000,
+        "monthly_token_limit": 5000000,
+    })
+    assert response.status_code == 200
+    listed = client.get("/api/tokens").json()["data"][0]
+    assert listed["rpm_limit"] == 20
+    assert listed["monthly_token_limit"] == 5000000
 
 
 def login(client: TestClient) -> None:
@@ -297,6 +403,39 @@ def test_existing_usage_schema_adds_visible_column(tmp_path: Path) -> None:
     with proxy.database_connection() as database:
         columns = {row[1] for row in database.execute("PRAGMA table_info(api_usage)")}
     assert "visible" in columns
+    assert {"resolved_model", "upstream", "status_code", "attempts", "error"}.issubset(columns)
+
+
+def test_compatibility_test_checks_three_upstream_endpoints(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            calls.append((method, url, kwargs.get("json")))
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post(
+        "/api/compatibility/test",
+        json={"upstream": "默认上游", "model": "test-model"},
+    )
+    assert response.status_code == 200
+    assert len(response.json()["results"]) == 3
+    assert [call[0] for call in calls] == ["GET", "POST", "POST"]
 
 
 def test_api_token_can_expire_and_be_disabled(tmp_path: Path) -> None:
@@ -431,6 +570,42 @@ def test_native_responses_stream_reports_failure_when_upstream_omits_terminal_ev
     assert response.status_code == 200
     assert "event: response.completed" not in response.text
     assert response.text.count("event: response.failed") == 1
+
+
+def test_native_responses_stream_preserves_real_incomplete_terminal(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            yield (
+                b'event: response.incomplete\n'
+                b'data: {"type":"response.incomplete","response":{"id":"resp_partial",'
+                b'"status":"incomplete","usage":{"input_tokens":2,"output_tokens":3}}}\n\n'
+            )
+
+        async def aclose(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/responses", json={"model": "test", "input": "hello", "stream": True})
+    assert response.status_code == 200
+    assert response.text.count("event: response.incomplete") == 1
+    assert "event: response.failed" not in response.text
 
 
 def test_stream_cleaning_preserves_delta_whitespace() -> None:

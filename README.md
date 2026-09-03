@@ -27,6 +27,8 @@ services:
       UPSTREAM_API_KEY: ""
       REQUEST_TIMEOUT: "120"
       LOG_MAX_BYTES: "5242880"
+      CIRCUIT_BREAKER_FAILURES: "3"
+      CIRCUIT_BREAKER_COOLDOWN_SECONDS: "60"
     volumes:
       - cleanllm-data:/data
       # 用于“导出压缩包”；请改成宿主机实际 Ollama models 目录
@@ -63,7 +65,7 @@ docker compose down
 
 客户端主要请求地址为 `http://你的主机:11515/v1/chat/completions` 和 `/v1/responses`。此外支持 `/v1/models`、`/v1/embeddings`、`/v1/completions`、`/v1/images/generations`、`/v1/audio/transcriptions`、`/v1/audio/translations`、`/v1/audio/speech`、`/v1/moderations` 和 `/v1/rerank`，这些地址会从所选上游的 `/v1` 基础地址自动推导，无需逐项配置。设置保存在 Docker 数据卷中，升级容器不会丢失。
 
-常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT`、`LOG_MAX_BYTES` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
+常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT`、`LOG_MAX_BYTES`、`CIRCUIT_BREAKER_FAILURES`、`CIRCUIT_BREAKER_COOLDOWN_SECONDS` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
 
 `extra_hosts` 仅用于让 Linux 容器通过 `host.docker.internal` 访问宿主机。如果上游使用局域网 IP、公网地址或同一 Compose 中的服务名，可以删除这段配置；默认上游在宿主机时建议保留。
 
@@ -92,11 +94,13 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.106`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.1.0`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，并可随时修改到期时间及可用模型白名单。模型规则支持精确名称和 `*`、`?` 通配符，留空允许全部模型；受限令牌访问 `/v1/models` 时也只会看到允许的模型。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。使用日志明细保留 400 天，清除明细不会改变调用次数、周期 Token 统计或令牌累计用量。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 
 配置与运行数据均位于 `/data`：`settings.json` 只保存上游、清洗、外观等配置，`cleanllm.db` 使用 Python 内置 SQLite 保存 API令牌、调用用量、连通性采样和导出历史，上传的背景图保存在 `/data/backgrounds`。升级到 `1.0.98` 后不迁移旧运行历史，首次读取配置时会自动删除 `settings.json` 中旧的运行数组，并把已有 Base64 背景拆成图片文件，从而显著缩小配置文件。
 
 “上游与清洗”支持通过选项卡添加多个 OpenAI 兼容上游。常用连接项直接显示，模型列表地址、Ollama 地址、响应清洗规则、模型路由和备用上游 JSON 位于高级设置中；空配置保持留空，不显示无意义的 `[]`。模型列表会聚合所有可用上游，并标明每个模型的来源上游。连通性区域同时展示 24 小时、7 天可用率，以及按实例本地自然日计算的检测和失败次数。
+
+虚拟模型可将客户端使用的稳定别名映射到真实模型，并指定上游优先顺序。上游连续失败达到阈值后会自动熔断，冷却结束后重新参与路由；默认阈值为 3 次、冷却 60 秒，可通过诊断中心或 `CIRCUIT_BREAKER_FAILURES`、`CIRCUIT_BREAKER_COOLDOWN_SECONDS` 调整。API令牌支持 RPM、TPM、自然日及自然月 Token 限额，`0` 表示不限制。诊断中心可查看请求 ID、模型映射、实际上游、尝试次数、状态和耗时，并可手动测试模型列表、Chat Completions 与 Responses 兼容性；追踪不会保存提示词或模型响应。
 Web 重启依赖 Compose 的 `restart: unless-stopped`，不需要挂载 Docker Socket。查看 Docker 日志时可使用 `docker compose logs -t` 显示时间戳。

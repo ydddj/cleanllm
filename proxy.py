@@ -67,6 +67,9 @@ DEFAULT_SETTINGS = {
     "model_cache_ttl": int(os.getenv("MODEL_CACHE_TTL", "60")),
     "connectivity_interval_minutes": int(os.getenv("CONNECTIVITY_INTERVAL_MINUTES", "10")),
     "route_affinity_minutes": int(os.getenv("ROUTE_AFFINITY_MINUTES", "15")),
+    "circuit_breaker_failures": int(os.getenv("CIRCUIT_BREAKER_FAILURES", "3")),
+    "circuit_breaker_cooldown_seconds": int(os.getenv("CIRCUIT_BREAKER_COOLDOWN_SECONDS", "60")),
+    "virtual_models": [],
     "appearance_background": "",
     "appearance_backgrounds": [],
     "appearance_glass_opacity": 50,
@@ -106,6 +109,7 @@ CONNECTIVITY_TASK: asyncio.Task | None = None
 CONNECTIVITY_WAKEUP = asyncio.Event()
 STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
 ROUTE_AFFINITY: dict[str, tuple[str, float]] = {}
+UPSTREAM_CIRCUITS: dict[str, dict[str, Any]] = {}
 INITIALIZED_DATABASES: set[str] = set()
 DATABASE_INIT_LOCK = threading.Lock()
 
@@ -129,6 +133,9 @@ class SettingsUpdate(BaseModel):
     model_cache_ttl: int = Field(default=60, ge=0, le=86400)
     connectivity_interval_minutes: int = Field(default=10, ge=1, le=1440)
     route_affinity_minutes: int = Field(default=15, ge=0, le=1440)
+    circuit_breaker_failures: int = Field(default=3, ge=1, le=20)
+    circuit_breaker_cooldown_seconds: int = Field(default=60, ge=5, le=3600)
+    virtual_models: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
     appearance_background: str = Field(default="", max_length=7_000_000)
     appearance_backgrounds: list[str] = Field(default_factory=list, max_length=20)
@@ -216,6 +223,31 @@ class SettingsUpdate(BaseModel):
             cleaned.append({"pattern": pattern, "upstreams": list(dict.fromkeys(name.strip() for name in names))})
         return cleaned
 
+    @field_validator("virtual_models")
+    @classmethod
+    def validate_virtual_models(cls, models: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        aliases: set[str] = set()
+        for index, item in enumerate(models, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"虚拟模型 {index} 必须是对象")
+            alias = str(item.get("alias") or "").strip()
+            target = str(item.get("target") or "").strip()
+            upstreams = item.get("upstreams") or []
+            if not alias or len(alias) > 200 or not target or len(target) > 200:
+                raise ValueError(f"虚拟模型 {index} 必须包含有效的别名和目标模型")
+            if alias in aliases:
+                raise ValueError(f"虚拟模型别名不能重复：{alias}")
+            if not isinstance(upstreams, list) or not all(isinstance(name, str) and name.strip() for name in upstreams):
+                raise ValueError(f"虚拟模型 {alias} 的 upstreams 必须是名称数组")
+            aliases.add(alias)
+            cleaned.append({
+                "alias": alias,
+                "target": target,
+                "upstreams": list(dict.fromkeys(name.strip() for name in upstreams)),
+            })
+        return cleaned
+
     @field_validator("appearance_background")
     @classmethod
     def validate_background(cls, value: str) -> str:
@@ -236,6 +268,15 @@ class SettingsUpdate(BaseModel):
         names = [self.default_upstream_name.strip(), *(item["name"] for item in self.upstreams)]
         if len(names) != len(set(names)):
             raise ValueError("上游名称不能重复")
+        known = set(names)
+        for route in self.model_routes:
+            unknown = [name for name in route["upstreams"] if name not in known]
+            if unknown:
+                raise ValueError(f"模型路由引用了不存在的上游：{', '.join(unknown)}")
+        for item in self.virtual_models:
+            unknown = [name for name in item["upstreams"] if name not in known]
+            if unknown:
+                raise ValueError(f"虚拟模型 {item['alias']} 引用了不存在的上游：{', '.join(unknown)}")
         self.default_upstream_name = names[0]
         return self
 
@@ -273,6 +314,10 @@ class ApiTokenRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     expires_at: int | None = Field(default=None, ge=1)
     allowed_models: list[str] = Field(default_factory=list, max_length=100)
+    rpm_limit: int = Field(default=0, ge=0, le=1_000_000)
+    tpm_limit: int = Field(default=0, ge=0, le=1_000_000_000)
+    daily_token_limit: int = Field(default=0, ge=0, le=100_000_000_000)
+    monthly_token_limit: int = Field(default=0, ge=0, le=1_000_000_000_000)
 
     @field_validator("expires_at")
     @classmethod
@@ -297,6 +342,10 @@ class ApiTokenStatusUpdate(BaseModel):
 class ApiTokenPolicyUpdate(BaseModel):
     expires_at: int | None = Field(default=None, ge=1)
     allowed_models: list[str] = Field(default_factory=list, max_length=100)
+    rpm_limit: int = Field(default=0, ge=0, le=1_000_000)
+    tpm_limit: int = Field(default=0, ge=0, le=1_000_000_000)
+    daily_token_limit: int = Field(default=0, ge=0, le=100_000_000_000)
+    monthly_token_limit: int = Field(default=0, ge=0, le=1_000_000_000_000)
 
     @field_validator("expires_at")
     @classmethod
@@ -309,6 +358,11 @@ class ApiTokenPolicyUpdate(BaseModel):
     @classmethod
     def validate_allowed_models(cls, values: list[str]) -> list[str]:
         return ApiTokenRequest.validate_allowed_models(values)
+
+
+class CompatibilityTestRequest(BaseModel):
+    upstream: str = Field(min_length=1, max_length=80)
+    model: str = Field(min_length=1, max_length=200)
 
 
 def publish_status(event: str, data: dict[str, Any]) -> None:
@@ -491,7 +545,11 @@ def database_connection() -> sqlite3.Connection:
             expires_at INTEGER,
             enabled INTEGER NOT NULL DEFAULT 1,
             total_tokens INTEGER NOT NULL DEFAULT 0,
-            allowed_models TEXT NOT NULL DEFAULT '[]'
+            allowed_models TEXT NOT NULL DEFAULT '[]',
+            rpm_limit INTEGER NOT NULL DEFAULT 0,
+            tpm_limit INTEGER NOT NULL DEFAULT 0,
+            daily_token_limit INTEGER NOT NULL DEFAULT 0,
+            monthly_token_limit INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS api_usage (
             id TEXT PRIMARY KEY,
@@ -506,6 +564,11 @@ def database_connection() -> sqlite3.Connection:
             output_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
             visible INTEGER NOT NULL DEFAULT 1,
+            resolved_model TEXT NOT NULL DEFAULT '',
+            upstream TEXT NOT NULL DEFAULT '',
+            status_code INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            error TEXT NOT NULL DEFAULT '',
             FOREIGN KEY(token_id) REFERENCES api_tokens(id) ON DELETE SET NULL
         );
         CREATE INDEX IF NOT EXISTS idx_api_usage_at ON api_usage(at);
@@ -528,9 +591,22 @@ def database_connection() -> sqlite3.Connection:
         token_columns = {row[1] for row in connection.execute("PRAGMA table_info(api_tokens)")}
         if "allowed_models" not in token_columns:
             connection.execute("ALTER TABLE api_tokens ADD COLUMN allowed_models TEXT NOT NULL DEFAULT '[]'")
+        for column in ("rpm_limit", "tpm_limit", "daily_token_limit", "monthly_token_limit"):
+            if column not in token_columns:
+                connection.execute(f"ALTER TABLE api_tokens ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
         usage_columns = {row[1] for row in connection.execute("PRAGMA table_info(api_usage)")}
         if "visible" not in usage_columns:
             connection.execute("ALTER TABLE api_usage ADD COLUMN visible INTEGER NOT NULL DEFAULT 1")
+        usage_additions = {
+            "resolved_model": "TEXT NOT NULL DEFAULT ''",
+            "upstream": "TEXT NOT NULL DEFAULT ''",
+            "status_code": "INTEGER",
+            "attempts": "INTEGER NOT NULL DEFAULT 0",
+            "error": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in usage_additions.items():
+            if column not in usage_columns:
+                connection.execute(f"ALTER TABLE api_usage ADD COLUMN {column} {definition}")
         connection.execute("DELETE FROM api_usage WHERE at < ?", (int(time.time()) - 400 * 86400,))
         connection.execute("DELETE FROM connectivity_history WHERE checked_at < ?", (time.time() - 8 * 86400,))
         INITIALIZED_DATABASES.add(key)
@@ -618,25 +694,53 @@ def token_allows_model(item: dict[str, Any], model: str) -> bool:
     return not rules or (bool(model) and any(fnmatch.fnmatchcase(model, rule) for rule in rules))
 
 
+def token_limit_error(item: dict[str, Any], now: int, estimated_tokens: int) -> str:
+    token_id = str(item.get("id") or "")
+    local_now = datetime.fromtimestamp(now).astimezone()
+    day_start = int(local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    month_start = int(local_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp())
+    with database_connection() as database:
+        row = database.execute(
+            """SELECT
+               SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END) AS rpm,
+               SUM(CASE WHEN at >= ? THEN total_tokens ELSE 0 END) AS tpm,
+               SUM(CASE WHEN at >= ? THEN total_tokens ELSE 0 END) AS daily_tokens,
+               SUM(CASE WHEN at >= ? THEN total_tokens ELSE 0 END) AS monthly_tokens
+               FROM api_usage WHERE token_id = ?""",
+            (now - 60, now - 60, day_start, month_start, token_id),
+        ).fetchone()
+    checks = (
+        ("rpm_limit", int(row["rpm"] or 0) + 1, "每分钟请求数"),
+        ("tpm_limit", int(row["tpm"] or 0) + estimated_tokens, "每分钟 Token"),
+        ("daily_token_limit", int(row["daily_tokens"] or 0) + estimated_tokens, "每日 Token"),
+        ("monthly_token_limit", int(row["monthly_tokens"] or 0) + estimated_tokens, "每月 Token"),
+    )
+    for key, projected, label in checks:
+        limit = max(0, int(item.get(key, 0) or 0))
+        if limit and projected > limit:
+            return f"API令牌已达到{label}限额"
+    return ""
+
+
 async def require_api_token(request: Request) -> None:
     now = int(time.time())
     configured = database_tokens()
-    if not configured:
-        return
-    header = request.headers.get("authorization", "")
-    supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
-    digest = token_digest(supplied) if supplied else ""
-    matched = next(
-        (
-            item
-            for item in configured
-            if secrets.compare_digest(digest, str(item.get("hash")))
-            and token_is_active(item, now)
-        ),
-        None,
-    )
-    if not matched:
-        raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
+    matched = None
+    if configured:
+        header = request.headers.get("authorization", "")
+        supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+        digest = token_digest(supplied) if supplied else ""
+        matched = next(
+            (
+                item
+                for item in configured
+                if secrets.compare_digest(digest, str(item.get("hash")))
+                and token_is_active(item, now)
+            ),
+            None,
+        )
+        if not matched:
+            raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
     # Keep a lightweight estimate when an upstream does not return usage metadata.
     # The request body is cached by Starlette, so downstream handlers can read it again.
     input_tokens = 0
@@ -649,17 +753,22 @@ async def require_api_token(request: Request) -> None:
             model = str(body_data.get("model") or "")
     except Exception:
         pass
-    if model and not token_allows_model(matched, model):
+    if matched and model and not token_allows_model(matched, model):
         raise HTTPException(status_code=403, detail=f"当前 API令牌无权使用模型：{model}")
+    if matched:
+        limit_error = token_limit_error(matched, now, input_tokens)
+        if limit_error:
+            raise HTTPException(status_code=429, detail=limit_error)
     request.state.api_token = matched
     usage_id = uuid.uuid4().hex
     request.state.usage_id = usage_id
-    usage_item = {"id": usage_id, "token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method, "model": model, "latency_ms": None, "input_tokens": input_tokens, "output_tokens": 0, "total_tokens": input_tokens}
+    usage_item = {"id": usage_id, "token_id": matched.get("id") if matched else None, "token_name": matched.get("name", "") if matched else "未鉴权", "at": now, "path": request.url.path, "method": request.method, "model": model, "latency_ms": None, "input_tokens": input_tokens, "output_tokens": 0, "total_tokens": input_tokens}
     with database_connection() as database:
-        database.execute(
-            "UPDATE api_tokens SET last_used_at = ?, total_tokens = total_tokens + ? WHERE id = ?",
-            (int(time.time()), input_tokens, matched.get("id")),
-        )
+        if matched:
+            database.execute(
+                "UPDATE api_tokens SET last_used_at = ?, total_tokens = total_tokens + ? WHERE id = ?",
+                (now, input_tokens, matched.get("id")),
+            )
         database.execute(
             """INSERT INTO api_usage
                (id, token_id, token_name, at, path, method, model, latency_ms, input_tokens, output_tokens, total_tokens)
@@ -672,8 +781,10 @@ async def require_api_token(request: Request) -> None:
 def update_usage_record(usage_id: str | None, **values: Any) -> None:
     if not usage_id or not values:
         return
-    allowed = {"latency_ms", "input_tokens", "output_tokens", "total_tokens"}
+    allowed = {"latency_ms", "input_tokens", "output_tokens", "total_tokens", "resolved_model", "upstream", "status_code", "attempts", "error"}
     changes = {key: value for key, value in values.items() if key in allowed}
+    if "error" in changes:
+        changes["error"] = str(changes["error"] or "")[:500]
     if not changes:
         return
     with database_connection() as database:
@@ -909,10 +1020,51 @@ def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
     return result
 
 
+def virtual_model(settings: dict[str, Any], requested_model: str) -> dict[str, Any] | None:
+    for item in settings.get("virtual_models", []):
+        if isinstance(item, dict) and str(item.get("alias") or "") == requested_model:
+            return item
+    return None
+
+
+def resolved_model(settings: dict[str, Any], requested_model: str) -> str:
+    item = virtual_model(settings, requested_model)
+    return str(item.get("target") or requested_model) if item else requested_model
+
+
+def circuit_is_open(name: str, now: float | None = None) -> bool:
+    state = UPSTREAM_CIRCUITS.get(name) or {}
+    return float(state.get("open_until") or 0) > (time.time() if now is None else now)
+
+
+def record_upstream_success(name: str) -> None:
+    if name:
+        UPSTREAM_CIRCUITS.pop(name, None)
+
+
+def record_upstream_failure(settings: dict[str, Any], name: str, error: str) -> None:
+    if not name:
+        return
+    threshold = max(1, int(settings.get("circuit_breaker_failures", 3)))
+    cooldown = max(5, int(settings.get("circuit_breaker_cooldown_seconds", 60)))
+    state = UPSTREAM_CIRCUITS.setdefault(name, {"failures": 0, "open_until": 0.0, "last_error": ""})
+    state["failures"] = int(state.get("failures") or 0) + 1
+    state["last_error"] = str(error or "上游请求失败")[:500]
+    state["last_failure_at"] = time.time()
+    if state["failures"] >= threshold:
+        state["open_until"] = time.time() + cooldown
+        logger.warning("Upstream circuit opened: %s (%s)", name, state["last_error"])
+
+
 def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]]:
     upstreams = configured_upstreams(settings)
     names = {item["name"]: item for item in upstreams}
     preferred: list[dict[str, Any]] = []
+    virtual = virtual_model(settings, model)
+    if virtual:
+        for name in virtual.get("upstreams", []):
+            if name in names and names[name] not in preferred:
+                preferred.append(names[name])
     for route in settings.get("model_routes", []):
         if not isinstance(route, dict) or not fnmatch.fnmatchcase(model, str(route.get("pattern") or "")):
             continue
@@ -920,20 +1072,21 @@ def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]
             if name in names and names[name] not in preferred:
                 preferred.append(names[name])
         break
-    if preferred:
-        return preferred + [item for item in upstreams if item not in preferred]
     affinity = ROUTE_AFFINITY.get(model)
-    if affinity and affinity[1] > time.time():
+    if not preferred and affinity and affinity[1] > time.time():
         preferred = [item for item in upstreams if item["name"] == affinity[0]]
-        if preferred:
-            return preferred + [item for item in upstreams if item not in preferred]
+        if not preferred:
+            ROUTE_AFFINITY.pop(model, None)
+    elif affinity and affinity[1] <= time.time():
         ROUTE_AFFINITY.pop(model, None)
-    if MODEL_CACHE.get("data"):
-        available = [item.get("upstream") for item in MODEL_CACHE["data"] if item.get("id") == model]
+    if not preferred and MODEL_CACHE.get("data"):
+        lookup_model = resolved_model(settings, model)
+        available = [item.get("upstream") for item in MODEL_CACHE["data"] if item.get("id") == lookup_model]
         if available:
             preferred = [item for name in available for item in upstreams if item["name"] == name]
-            return preferred + [item for item in upstreams if item not in preferred]
-    return preferred + [item for item in upstreams if item not in preferred]
+    ordered = preferred + [item for item in upstreams if item not in preferred]
+    available = [item for item in ordered if not circuit_is_open(item["name"])]
+    return available
 
 
 def remember_route(settings: dict[str, Any], model: str, upstream_name: str) -> None:
@@ -981,6 +1134,17 @@ async def unhandled_exception(_: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500, content={"detail": "服务器内部错误，请查看容器日志"})
 
 
+@app.exception_handler(HTTPException)
+async def http_exception_response(request: Request, exc: HTTPException) -> JSONResponse:
+    if request.url.path.startswith("/v1/") and exc.status_code == 429:
+        return JSONResponse(
+            status_code=429,
+            content={"error": {"message": str(exc.detail), "type": "rate_limit_error", "code": "rate_limit_exceeded"}},
+            headers=exc.headers,
+        )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+
+
 @app.middleware("http")
 async def request_log_middleware(request: Request, call_next):
     started = time.perf_counter()
@@ -991,7 +1155,14 @@ async def request_log_middleware(request: Request, call_next):
         raise
     if request.url.path != "/health":
         elapsed_ms = (time.perf_counter() - started) * 1000
-        update_usage_record_safely(getattr(request.state, "usage_id", None), latency_ms=round(elapsed_ms, 1))
+        usage_id = getattr(request.state, "usage_id", None)
+        update_usage_record_safely(
+            usage_id,
+            latency_ms=round(elapsed_ms, 1),
+            status_code=response.status_code,
+        )
+        if usage_id:
+            response.headers["X-Request-ID"] = usage_id
         logger.info("%s %s -> %s (%.1f ms)", request.method, request.url.path, response.status_code, elapsed_ms)
         publish_status("request", {"path": request.url.path, "status": response.status_code, "latency_ms": round(elapsed_ms)})
     return response
@@ -1073,6 +1244,7 @@ async def update_settings(
     save_settings(settings)
     MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
     ROUTE_AFFINITY.clear()
+    UPSTREAM_CIRCUITS.clear()
     CONNECTIVITY_WAKEUP.set()
     return {"message": "设置已保存"}
 
@@ -1233,6 +1405,7 @@ async def import_settings(update: ConfigImportRequest, _: None = Depends(require
     save_settings(current)
     MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
     ROUTE_AFFINITY.clear()
+    UPSTREAM_CIRCUITS.clear()
     CONNECTIVITY_WAKEUP.set()
     return {"message": "配置已导入"}
 
@@ -1246,6 +1419,7 @@ async def reset_settings(_: None = Depends(require_admin)) -> dict[str, str]:
     save_settings(reset)
     MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
     ROUTE_AFFINITY.clear()
+    UPSTREAM_CIRCUITS.clear()
     CONNECTIVITY_WAKEUP.set()
     return {"message": "代理设置已恢复默认值"}
 
@@ -1299,6 +1473,10 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
             "allowed_models": token_model_rules(item),
             "status": "active" if token_is_active(item, now) else ("disabled" if not item.get("enabled", 1) else "expired"),
             "total_tokens": max(0, int(item.get("total_tokens", 0) or 0)),
+            "rpm_limit": max(0, int(item.get("rpm_limit", 0) or 0)),
+            "tpm_limit": max(0, int(item.get("tpm_limit", 0) or 0)),
+            "daily_token_limit": max(0, int(item.get("daily_token_limit", 0) or 0)),
+            "monthly_token_limit": max(0, int(item.get("monthly_token_limit", 0) or 0)),
         })
     return {"data": result}
 
@@ -1307,13 +1485,14 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
 async def create_api_token(update: ApiTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
     raw = "cln_" + secrets.token_urlsafe(24)
     token_id = uuid.uuid4().hex
-    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None, "expires_at": update.expires_at, "enabled": 1, "total_tokens": 0, "allowed_models": json.dumps(update.allowed_models, ensure_ascii=False)}
+    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None, "expires_at": update.expires_at, "enabled": 1, "total_tokens": 0, "allowed_models": json.dumps(update.allowed_models, ensure_ascii=False), "rpm_limit": update.rpm_limit, "tpm_limit": update.tpm_limit, "daily_token_limit": update.daily_token_limit, "monthly_token_limit": update.monthly_token_limit}
     with database_connection() as database:
         database.execute(
             """INSERT INTO api_tokens
-               (id, name, hash, cipher, created_at, last_used_at, expires_at, enabled, total_tokens, allowed_models)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            tuple(item[key] for key in ("id", "name", "hash", "cipher", "created_at", "last_used_at", "expires_at", "enabled", "total_tokens", "allowed_models")),
+               (id, name, hash, cipher, created_at, last_used_at, expires_at, enabled, total_tokens, allowed_models,
+                rpm_limit, tpm_limit, daily_token_limit, monthly_token_limit)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            tuple(item[key] for key in ("id", "name", "hash", "cipher", "created_at", "last_used_at", "expires_at", "enabled", "total_tokens", "allowed_models", "rpm_limit", "tpm_limit", "daily_token_limit", "monthly_token_limit")),
         )
     return {"id": item["id"], "name": item["name"], "token": raw, "created_at": item["created_at"]}
 
@@ -1337,8 +1516,10 @@ async def update_api_token_policy(
 ) -> dict[str, str]:
     with database_connection() as database:
         cursor = database.execute(
-            "UPDATE api_tokens SET expires_at = ?, allowed_models = ? WHERE id = ?",
-            (update.expires_at, json.dumps(update.allowed_models, ensure_ascii=False), token_id),
+            """UPDATE api_tokens SET expires_at = ?, allowed_models = ?, rpm_limit = ?, tpm_limit = ?,
+               daily_token_limit = ?, monthly_token_limit = ? WHERE id = ?""",
+            (update.expires_at, json.dumps(update.allowed_models, ensure_ascii=False), update.rpm_limit,
+             update.tpm_limit, update.daily_token_limit, update.monthly_token_limit, token_id),
         )
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="令牌不存在")
@@ -1437,6 +1618,84 @@ async def clear_usage_logs(_: None = Depends(require_admin)) -> dict[str, str]:
     return {"message": "使用日志已清除，调用与 Token 统计不受影响"}
 
 
+@app.get("/api/traces")
+async def request_traces(limit: int = 100, _: None = Depends(require_admin)) -> dict[str, Any]:
+    limit = max(1, min(limit, 500))
+    with database_connection() as database:
+        rows = database.execute(
+            """SELECT id, token_name, at, path, method, model, resolved_model, upstream,
+                      status_code, latency_ms, attempts, error
+               FROM api_usage WHERE visible = 1 ORDER BY at DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    return {"data": [row_dict(row) for row in rows]}
+
+
+@app.get("/api/routing/status")
+async def routing_status(_: None = Depends(require_admin)) -> dict[str, Any]:
+    settings = load_settings()
+    now = time.time()
+    data = []
+    for upstream in configured_upstreams(settings):
+        state = UPSTREAM_CIRCUITS.get(upstream["name"]) or {}
+        open_until = float(state.get("open_until") or 0)
+        data.append({
+            "name": upstream["name"],
+            "state": "open" if open_until > now else ("degraded" if state.get("failures") else "closed"),
+            "failures": int(state.get("failures") or 0),
+            "open_until": open_until or None,
+            "last_error": str(state.get("last_error") or ""),
+        })
+    return {
+        "failure_threshold": int(settings.get("circuit_breaker_failures", 3)),
+        "cooldown_seconds": int(settings.get("circuit_breaker_cooldown_seconds", 60)),
+        "data": data,
+    }
+
+
+@app.post("/api/routing/circuits/reset")
+async def reset_routing_circuits(_: None = Depends(require_admin)) -> dict[str, str]:
+    UPSTREAM_CIRCUITS.clear()
+    return {"message": "上游熔断状态已重置"}
+
+
+@app.post("/api/compatibility/test")
+async def compatibility_test(
+    update: CompatibilityTestRequest, _: None = Depends(require_admin)
+) -> dict[str, Any]:
+    settings = load_settings()
+    upstream = next((item for item in configured_upstreams(settings) if item["name"] == update.upstream), None)
+    if upstream is None:
+        raise HTTPException(status_code=404, detail="上游不存在")
+    test_model = resolved_model(settings, update.model)
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if upstream["api_key"]:
+        headers["Authorization"] = f"Bearer {upstream['api_key']}"
+    tests = [
+        ("模型列表", "GET", upstream["models_url"], None),
+        ("Chat Completions", "POST", upstream["url"], {"model": test_model, "messages": [{"role": "user", "content": "Reply with OK."}], "stream": False, "max_tokens": 8}),
+        ("Responses", "POST", endpoint_url_for_target(upstream["url"], "responses"), {"model": test_model, "input": "Reply with OK.", "stream": False, "max_output_tokens": 8}),
+    ]
+    results = []
+    timeout = min(float(upstream["timeout"]), 30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for name, method, url, payload in tests:
+            started = time.perf_counter()
+            try:
+                response = await client.request(method, url, headers=headers, json=payload)
+                elapsed = round((time.perf_counter() - started) * 1000, 1)
+                results.append({
+                    "name": name,
+                    "ok": response.status_code < 400,
+                    "status_code": response.status_code,
+                    "latency_ms": elapsed,
+                    "detail": "兼容" if response.status_code < 400 else f"HTTP {response.status_code}",
+                })
+            except httpx.RequestError as exc:
+                results.append({"name": name, "ok": False, "status_code": None, "latency_ms": round((time.perf_counter() - started) * 1000, 1), "detail": str(exc)[:300]})
+    return {"upstream": upstream["name"], "model": update.model, "results": results}
+
+
 @app.get("/api/system/events")
 async def system_events(_: None = Depends(require_admin)) -> StreamingResponse:
     async def stream():
@@ -1488,9 +1747,19 @@ async def get_models(refresh: bool = False, _: None = Depends(require_admin)) ->
 
 @app.get("/v1/models")
 async def public_models(request: Request, _: None = Depends(require_api_token)) -> dict[str, Any]:
-    result = await get_models(False, None)
+    try:
+        result = await get_models(False, None)
+    except HTTPException:
+        if not load_settings().get("virtual_models"):
+            raise
+        result = {"data": []}
     token = getattr(request.state, "api_token", None)
     models = [item for item in result.get("data", []) if token is None or token_allows_model(token, str(item.get("id") or ""))]
+    existing = {str(item.get("id") or "") for item in models}
+    for item in load_settings().get("virtual_models", []):
+        alias = str(item.get("alias") or "") if isinstance(item, dict) else ""
+        if alias and alias not in existing and (token is None or token_allows_model(token, alias)):
+            models.append({"id": alias, "created": 0, "owned_by": "cleanllm"})
     return {
         "object": "list",
         "data": [
@@ -1817,7 +2086,12 @@ async def clear_logs(_: None = Depends(require_admin)) -> dict[str, str]:
 async def native_responses_stream(payload: dict[str, Any], settings: dict[str, Any], request: Request) -> Response:
     """Relay native Responses SSE while preserving event order and stream semantics."""
     failures: list[str] = []
-    for upstream in route_upstreams(settings, str(payload.get("model") or "")):
+    requested_model = str(payload.get("model") or "")
+    target_model = resolved_model(settings, requested_model)
+    attempts = 0
+    for upstream in route_upstreams(settings, requested_model):
+        attempts += 1
+        update_usage_record_safely(getattr(request.state, "usage_id", None), resolved_model=target_model, upstream=upstream["name"], attempts=attempts)
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if upstream["api_key"]:
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
@@ -1826,15 +2100,18 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
         try:
             logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
             response = await client.send(
-                client.build_request("POST", responses_url, json={**payload, "stream": True}, headers=headers),
+                client.build_request("POST", responses_url, json={**payload, "model": target_model, "stream": True}, headers=headers),
                 stream=True,
             )
         except httpx.RequestError as exc:
             failures.append(f"{upstream['name']}: {exc}")
+            record_upstream_failure(settings, upstream["name"], str(exc))
             await client.aclose()
             continue
         if response.status_code >= 400:
             failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+            if response.status_code == 429 or response.status_code >= 500:
+                record_upstream_failure(settings, upstream["name"], f"HTTP {response.status_code}")
             await response.aclose()
             await client.aclose()
             continue
@@ -1846,7 +2123,14 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
 
         async def relay() -> Any:
             pending = b""
-            state: dict[str, Any] = {"completed": False, "terminal": False, "text_done": False, "text": "", "response": None}
+            state: dict[str, Any] = {
+                "completed": False,
+                "successful_terminal": False,
+                "terminal": False,
+                "text_done": False,
+                "text": "",
+                "response": None,
+            }
 
             def process_line(raw_line: bytes) -> bytes:
                 line = raw_line.rstrip(b"\r")
@@ -1882,13 +2166,26 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     isinstance(response_data, dict) and response_data.get("status") == "completed"
                 ):
                     state["completed"] = True
+                    state["successful_terminal"] = True
                     state["terminal"] = True
                     update_usage_record_safely(
                         getattr(request.state, "usage_id", None),
                         **usage_values(response_data.get("usage")),
                     )
                     remember_route(settings, str(payload.get("model") or ""), upstream["name"])
-                elif event_type in {"response.failed", "response.incomplete"}:
+                elif event_type == "response.incomplete" or (
+                    isinstance(response_data, dict) and response_data.get("status") == "incomplete"
+                ):
+                    state["successful_terminal"] = True
+                    state["terminal"] = True
+                    update_usage_record_safely(
+                        getattr(request.state, "usage_id", None),
+                        **usage_values(response_data.get("usage")),
+                    )
+                    remember_route(settings, str(payload.get("model") or ""), upstream["name"])
+                elif event_type == "response.failed" or (
+                    isinstance(response_data, dict) and response_data.get("status") == "failed"
+                ):
                     state["terminal"] = True
                 return b"data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
@@ -1900,6 +2197,8 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                         yield process_line(line) + b"\n"
             except httpx.RequestError as exc:
                 logger.warning("Responses stream from %s disconnected: %s", upstream["name"], exc)
+                record_upstream_failure(settings, upstream["name"], str(exc))
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流意外中断")
                 if not state["terminal"]:
                     failed = {
                         "type": "response.failed",
@@ -1916,7 +2215,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             else:
                 if pending:
                     yield process_line(pending)
-                if not state["completed"]:
+                if not state["terminal"]:
                     failed = {
                         "type": "response.failed",
                         "response": {
@@ -1929,12 +2228,15 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                         },
                     }
                     logger.warning("Responses stream from %s ended without response.completed", upstream["name"])
+                    record_upstream_failure(settings, upstream["name"], "响应流未收到 response.completed")
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束")
                     yield f"\nevent: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
             finally:
                 await response.aclose()
                 await client.aclose()
-                if state["completed"]:
-                    logger.info("Responses stream completed: %s", upstream["name"])
+                if state["successful_terminal"]:
+                    record_upstream_success(upstream["name"])
+                    logger.info("Responses stream ended normally: %s", upstream["name"])
                 update_usage_record_safely(
                     getattr(request.state, "usage_id", None),
                     latency_ms=round((time.perf_counter() - started) * 1000, 1),
@@ -1972,8 +2274,15 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
             raise HTTPException(status_code=400, detail="请求体不是有效 JSON")
     endpoint = request.url.path.removeprefix("/v1/")
     settings = load_settings()
+    requested_model = str(payload.get("model") or "")
+    target_model = resolved_model(settings, requested_model)
+    outbound_body = json.dumps({**payload, "model": target_model}, ensure_ascii=False).encode() if payload and requested_model else body
+    update_usage_record_safely(getattr(request.state, "usage_id", None), resolved_model=target_model)
     failures: list[str] = []
-    for upstream in route_upstreams(settings, str(payload.get("model") or "")):
+    attempts = 0
+    for upstream in route_upstreams(settings, requested_model):
+        attempts += 1
+        update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
         url = endpoint_url_for_target(upstream["url"], endpoint)
         headers = {
             "Content-Type": request.headers.get("content-type", "application/json"),
@@ -1983,11 +2292,14 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
         try:
             async with httpx.AsyncClient(timeout=float(upstream["timeout"])) as client:
-                response = await client.post(url, content=body, headers=headers)
+                response = await client.post(url, content=outbound_body, headers=headers)
             if response.status_code >= 400:
                 failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+                if response.status_code == 429 or response.status_code >= 500:
+                    record_upstream_failure(settings, upstream["name"], f"HTTP {response.status_code}")
                 continue
             remember_route(settings, str(payload.get("model") or endpoint), upstream["name"])
+            record_upstream_success(upstream["name"])
             response_headers = {}
             if response.headers.get("content-disposition"):
                 response_headers["Content-Disposition"] = response.headers["content-disposition"]
@@ -2004,6 +2316,7 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
                 headers=response_headers,
             )
         except httpx.RequestError as exc:
+            record_upstream_failure(settings, upstream["name"], str(exc))
             failures.append(f"{upstream['name']}: {exc}")
     return JSONResponse(
         status_code=502,
@@ -2036,11 +2349,15 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
     instructions = payload.get("instructions")
     if instructions:
         messages.insert(0, {"role": "system", "content": str(instructions)})
-    chat_payload = {"model": payload["model"], "messages": messages, "stream": False}
+    settings = load_settings()
+    requested_model = str(payload["model"])
+    target_model = resolved_model(settings, requested_model)
+    chat_payload = {"model": target_model, "messages": messages, "stream": False}
     for key in ("temperature", "top_p", "max_output_tokens"):
         if key in payload:
             chat_payload["max_tokens" if key == "max_output_tokens" else key] = payload[key]
-    settings = load_settings(); failures = []
+    failures = []
+    update_usage_record_safely(getattr(request.state, "usage_id", None), resolved_model=target_model)
     logger.info("Responses request received for model %s (stream=%s)", payload["model"], payload.get("stream") is True)
     if payload.get("stream") is True:
         native_stream = await native_responses_stream(payload, settings, request)
@@ -2059,7 +2376,10 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             native_completed = False
             chat_done = False
             stream_payload = {**chat_payload, "stream": True}
-            for upstream in route_upstreams(settings, str(payload["model"])):
+            attempts = 0
+            for upstream in route_upstreams(settings, requested_model):
+                attempts += 1
+                update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
                 headers = {"Content-Type": "application/json"}
                 if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
                 try:
@@ -2069,6 +2389,8 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         async with client.stream("POST", responses_url, json=stream_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
+                                if upstream_response.status_code == 429 or upstream_response.status_code >= 500:
+                                    record_upstream_failure(settings, upstream["name"], f"HTTP {upstream_response.status_code}")
                                 continue
                             selected_name = upstream["name"]
                             emitted = False
@@ -2117,20 +2439,26 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                 except (ValueError, IndexError, AttributeError):
                                     pass
                     break
-                except httpx.RequestError:
+                except httpx.RequestError as exc:
+                    record_upstream_failure(settings, upstream["name"], str(exc))
                     continue
             if native_completed:
+                record_upstream_success(str(selected_name or ""))
                 remember_route(settings, str(payload["model"]), str(selected_name or ""))
                 return
             if selected_name is None:
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="所有上游均不可用")
                 failed = {**base, "status": "failed", "error": {"message": "所有上游均不可用", "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
             if not chat_done:
+                record_upstream_failure(settings, str(selected_name), "响应流未正常结束")
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束")
                 failed = {**base, "status": "failed", "error": {"message": "上游响应流未正常结束", "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
             remember_route(settings, str(payload["model"]), str(selected_name))
+            record_upstream_success(str(selected_name))
             completed = {**base, "status": "completed", "output": [{"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": complete_text}]}]}
             sequence_number += 1
             completed["sequence_number"] = sequence_number
@@ -2138,16 +2466,23 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             yield f"event: response.completed\ndata: {json.dumps({'type':'response.completed','response':completed}, ensure_ascii=False)}\n\n"
         return StreamingResponse(response_events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
     async with httpx.AsyncClient() as client:
-        for upstream in route_upstreams(settings, str(payload["model"])):
+        attempts = 0
+        for upstream in route_upstreams(settings, requested_model):
+            attempts += 1
+            update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
             headers = {"Content-Type": "application/json"}
             if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
             try:
                 responses_url = upstream["url"].replace("/chat/completions", "/responses")
                 logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
-                response = await client.post(responses_url, json={**payload, "stream": False}, headers=headers, timeout=float(upstream["timeout"]))
+                response = await client.post(responses_url, json={**payload, "model": target_model, "stream": False}, headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code in {404, 405}:
                     response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
-                if response.status_code >= 400: failures.append(f"{upstream['name']}: HTTP {response.status_code}"); continue
+                if response.status_code >= 400:
+                    failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+                    if response.status_code == 429 or response.status_code >= 500:
+                        record_upstream_failure(settings, upstream["name"], f"HTTP {response.status_code}")
+                    continue
                 data = response.json(); text = data.get("output_text", "")
                 if not text:
                     output = data.get("output", [])
@@ -2159,6 +2494,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
                 update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage")))
                 remember_route(settings, str(payload["model"]), upstream["name"])
+                record_upstream_success(upstream["name"])
                 if payload.get("stream") is True:
                     async def events():
                         yield f"event: response.created\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
@@ -2168,6 +2504,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 return JSONResponse(status_code=response.status_code, content=result)
             except (httpx.RequestError, ValueError) as exc:
                 logger.warning("Responses upstream %s failed: %s", upstream["name"], exc)
+                record_upstream_failure(settings, upstream["name"], str(exc))
                 failures.append(f"{upstream['name']}: {exc}")
     return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
 
@@ -2181,34 +2518,46 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
     settings = load_settings()
+    requested_model = str(payload.get("model") or "")
+    target_model = resolved_model(settings, requested_model)
+    upstream_payload = {**payload, "model": target_model} if requested_model else payload
+    update_usage_record_safely(getattr(request.state, "usage_id", None), resolved_model=target_model)
     streaming = payload.get("stream") is True
     failures = []
     response = None
     selected = None
     client = None
-    for upstream in route_upstreams(settings, str(payload.get("model") or "")):
+    attempts = 0
+    for upstream in route_upstreams(settings, requested_model):
+        attempts += 1
+        update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=upstream["name"], attempts=attempts)
         headers = {"Content-Type": "application/json"}
         if upstream["api_key"]:
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
         try:
             if streaming:
                 candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
-                candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=payload, headers=headers), stream=True)
+                candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=upstream_payload, headers=headers), stream=True)
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
+                    if candidate.status_code == 429 or candidate.status_code >= 500:
+                        record_upstream_failure(settings, upstream["name"], f"HTTP {candidate.status_code}")
                     await candidate.aclose()
                     await candidate_client.aclose()
                     continue
                 client, response, selected = candidate_client, candidate, upstream
             else:
                 async with httpx.AsyncClient() as candidate_client:
-                    candidate = await candidate_client.post(upstream["url"], json=payload, headers=headers, timeout=float(upstream["timeout"]))
+                    candidate = await candidate_client.post(upstream["url"], json=upstream_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
+                    if candidate.status_code == 429 or candidate.status_code >= 500:
+                        record_upstream_failure(settings, upstream["name"], f"HTTP {candidate.status_code}")
                     continue
                 response, selected = candidate, upstream
             break
         except httpx.RequestError as exc:
+            record_upstream_failure(settings, upstream["name"], str(exc))
             failures.append(f"{upstream['name']}: {exc}")
     if response is None:
         return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
@@ -2227,7 +2576,10 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                             completed = True
                         elif line.startswith("data: "):
                             try:
-                                update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(json.loads(line[6:]).get("usage")))
+                                chunk = json.loads(line[6:])
+                                update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(chunk.get("usage")))
+                                if any(choice.get("finish_reason") for choice in chunk.get("choices", []) if isinstance(choice, dict)):
+                                    completed = True
                             except (ValueError, AttributeError):
                                 pass
                         yield (clean_stream_line(line, response_settings) + "\n").encode("utf-8")
@@ -2239,7 +2591,11 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 await response.aclose()
                 await client.aclose()
                 if completed:
-                    remember_route(settings, str(payload.get("model") or ""), selected["name"])
+                    record_upstream_success(selected["name"])
+                    remember_route(settings, requested_model, selected["name"])
+                else:
+                    record_upstream_failure(settings, selected["name"], "响应流未正常结束")
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束")
         return StreamingResponse(stream_response(), status_code=response.status_code, media_type=response.headers.get("content-type", "text/event-stream"))
     try:
         data = response.json()
@@ -2257,7 +2613,8 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         if isinstance(content, str):
             message["content"] = clean_content(content, response_settings)
     update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage") if isinstance(data, dict) else {}))
-    remember_route(settings, str(payload.get("model") or ""), selected["name"])
+    record_upstream_success(selected["name"])
+    remember_route(settings, requested_model, selected["name"])
     return JSONResponse(status_code=response.status_code, content=data)
 
 

@@ -53,6 +53,10 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - 已有 API令牌的过期时间和模型白名单必须可在 Web 中修改。
 - 模型列表的上游选项卡必须让当前选中项持续使用主题色，不能只依赖悬停状态变色，并与代理设置选项卡保持一致。
 - 上传背景图保存到 `/data/backgrounds`，`settings.json` 仅保存图片地址，不得重新内嵌 Base64 图片数据。
+- 虚拟模型权限按客户端请求的别名检查，转发时才替换为真实模型；指定上游保持有序优先级。
+- 上游熔断只统计连接异常、HTTP 429/5xx 和未正常结束的流；404/405 等接口兼容性差异不得误触发熔断。
+- API令牌 RPM、TPM、自然日及自然月 Token 限额保存在 SQLite，`0` 表示不限额，超限返回 OpenAI 客户端可识别的 HTTP 429。
+- 请求追踪仅保存请求 ID、令牌名、接口、模型映射、上游、尝试次数、状态、耗时和错误摘要；不得保存请求正文或响应内容。
 
 ## Configuration rules
 
