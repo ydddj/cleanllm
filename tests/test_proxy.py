@@ -168,6 +168,19 @@ def test_api_tokens_are_hashed_and_protect_proxy(tmp_path: Path) -> None:
     assert client.post("/v1/chat/completions", content="not-json", headers={"Authorization": f"Bearer {token}", "content-type": "application/json"}).status_code == 400
 
 
+def test_usage_token_fields_are_normalized() -> None:
+    assert proxy.usage_values({"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}) == {
+        "input_tokens": 12,
+        "output_tokens": 7,
+        "total_tokens": 19,
+    }
+    assert proxy.usage_values({"input_tokens": 8, "output_tokens": 3}) == {
+        "input_tokens": 8,
+        "output_tokens": 3,
+        "total_tokens": 11,
+    }
+
+
 def test_models_url_is_derived_and_can_be_overridden() -> None:
     assert proxy.models_url(
         {"target_api_url": "http://ollama:11434/v1/chat/completions", "models_api_url": ""}
