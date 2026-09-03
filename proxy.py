@@ -73,7 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.83")
+app = FastAPI(title="CleanLLM", version="1.0.87")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -326,7 +326,7 @@ def token_plain(cipher: str, token_id: str) -> str:
     return bytes(value ^ key[index % len(key)] for index, value in enumerate(encrypted)).decode()
 
 
-def require_api_token(request: Request) -> None:
+async def require_api_token(request: Request) -> None:
     settings = load_settings()
     configured = [item for item in settings.get("api_tokens", []) if isinstance(item, dict) and item.get("hash")]
     if not configured:
@@ -339,7 +339,15 @@ def require_api_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
     matched["last_used_at"] = int(time.time())
     save_settings(settings)
-    usage_item = {"token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method}
+    # Keep a lightweight estimate when an upstream does not return usage metadata.
+    # The request body is cached by Starlette, so downstream handlers can read it again.
+    input_tokens = 0
+    try:
+        raw_body = await request.body()
+        input_tokens = max(0, len(raw_body) // 4)
+    except Exception:
+        pass
+    usage_item = {"token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method, "input_tokens": input_tokens, "output_tokens": 0, "total_tokens": input_tokens}
     API_USAGE.append(usage_item); del API_USAGE[:-500]
     settings.setdefault("api_usage", []).append(usage_item); settings["api_usage"] = settings["api_usage"][-1000:]; save_settings(settings)
 
@@ -774,6 +782,8 @@ async def api_usage(token_name: str = "", _: None = Depends(require_admin)) -> d
     def in_period(item: dict[str, Any], start: datetime, end: datetime | None = None) -> bool:
         at = datetime.fromtimestamp(int(item.get("at", 0)), local_now.tzinfo)
         return at >= start and (end is None or at < end)
+    def token_total(items: list[dict[str, Any]], start: datetime, end: datetime | None = None) -> int:
+        return sum(max(0, int(item.get("total_tokens", item.get("tokens", 0)) or 0)) for item in items if in_period(item, start, end))
     by_token: dict[str, int] = {}
     for item in recent:
         key = str(item.get("token_name") or "未命名"); by_token[key] = by_token.get(key, 0) + 1
@@ -784,6 +794,9 @@ async def api_usage(token_name: str = "", _: None = Depends(require_admin)) -> d
         "week": sum(1 for item in recent if in_period(item, week_start)),
         "month": sum(1 for item in recent if in_period(item, month_start)),
         "year": sum(1 for item in recent if in_period(item, year_start)),
+        "tokens_today": token_total(recent, today_start),
+        "tokens_week": token_total(recent, week_start),
+        "tokens_month": token_total(recent, month_start),
         "by_token": by_token,
         "logs": list(reversed(recent[-100:])),
     }
@@ -977,7 +990,9 @@ async def export_ollama_archive(model: str, _: None = Depends(require_admin)) ->
         if not blob.is_file():
             raise HTTPException(status_code=404, detail=f"模型 blob 不完整：{digest}")
         blobs.append(blob)
-    temporary = tempfile.NamedTemporaryFile(prefix="cleanllm-model-", suffix=".tar.gz", delete=False, dir=DATA_DIR)
+    # Archives are download artifacts, not persistent application data. Keep them
+    # outside /data so the volume only retains settings and export metadata.
+    temporary = tempfile.NamedTemporaryFile(prefix="cleanllm-model-", suffix=".tar.gz", delete=False)
     temporary.close()
     archive_path = Path(temporary.name)
     def build_archive() -> None:
