@@ -73,7 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.78")
+app = FastAPI(title="CleanLLM", version="1.0.80")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -1194,6 +1194,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             selected_name = None
             sequence_number = 0
             item_id = f"msg-{secrets.token_hex(8)}"
+            native_completed = False
             stream_payload = {**payload, "stream": True}
             for upstream in route_upstreams(settings, str(payload["model"])):
                 headers = {"Content-Type": "application/json"}
@@ -1208,10 +1209,21 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                 continue
                             selected_name = upstream["name"]
                             emitted = False
+                            event_name = "message"
                             async for line in upstream_response.aiter_lines():
+                                if line.startswith("event: "):
+                                    event_name = line[7:].strip() or "message"
+                                    continue
                                 if not line.startswith("data: ") or line == "data: [DONE]": continue
                                 try:
-                                    chunk = json.loads(line[6:]); delta = chunk.get("delta", "") or chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                    chunk = json.loads(line[6:])
+                                    if isinstance(chunk, dict) and str(chunk.get("type", "")).startswith("response."):
+                                        emitted = True
+                                        if chunk.get("type") == "response.output_text.delta": complete_text += str(chunk.get("delta", ""))
+                                        if chunk.get("type") == "response.completed": native_completed = True
+                                        yield f"event: {event_name}\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                                        continue
+                                    delta = chunk.get("delta", "") or chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
                                 except (ValueError, IndexError, AttributeError):
                                     continue
                                 if not isinstance(delta, str) or not delta: continue
@@ -1235,6 +1247,9 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     break
                 except httpx.RequestError:
                     continue
+            if native_completed:
+                ROUTE_AFFINITY[str(payload["model"])] = (selected_name, time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
+                return
             if selected_name is None:
                 failed = {**base, "status": "failed", "error": {"message": "所有上游均不可用", "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
