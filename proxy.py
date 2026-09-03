@@ -72,7 +72,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.68")
+app = FastAPI(title="CleanLLM", version="1.0.69")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -476,6 +476,11 @@ def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
 
 def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]]:
     upstreams = configured_upstreams(settings)
+    if MODEL_CACHE.get("data"):
+        available = [item.get("upstream") for item in MODEL_CACHE["data"] if item.get("id") == model]
+        if available:
+            preferred = [item for name in available for item in upstreams if item["name"] == name]
+            return preferred + [item for item in upstreams if item not in preferred]
     names = {item["name"]: item for item in upstreams}
     preferred: list[dict[str, Any]] = []
     for route in settings.get("model_routes", []):
@@ -1201,7 +1206,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
             if streaming:
                 candidate_client = httpx.AsyncClient(timeout=None)
                 candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=payload, headers=headers), stream=True)
-                if candidate.status_code >= 500:
+                if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
                     await candidate.aclose()
                     await candidate_client.aclose()
@@ -1210,7 +1215,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
             else:
                 async with httpx.AsyncClient() as candidate_client:
                     candidate = await candidate_client.post(upstream["url"], json=payload, headers=headers, timeout=float(upstream["timeout"]))
-                if candidate.status_code >= 500:
+                if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
                     continue
                 response, selected = candidate, upstream
