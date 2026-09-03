@@ -1,4 +1,5 @@
 (() => {
+  document.querySelectorAll('[data-page="api-tokens"] span, [data-view="api-tokens"] h1, [data-view="api-tokens"] h2').forEach((node) => { node.textContent = "API令牌"; });
   const polish = document.createElement("style"); polish.textContent = ".appearance-settings{display:block!important;padding:0}.upstream-tabs{margin:-2px 0 20px;padding:0}.upstream-tab-list{display:flex;gap:6px;align-items:center;overflow:auto;border-bottom:1px solid var(--border);padding-bottom:6px}.upstream-tab,.upstream-tab-add{min-height:36px;padding:0 12px;border:1px solid var(--border);border-radius:9px;background:var(--soft);color:var(--muted);white-space:nowrap}.upstream-tab.dragging{opacity:.45}.upstream-tab.active{background:var(--primary-soft);border-color:var(--primary);color:var(--primary);font-weight:650}.upstream-tab i{margin-left:8px;color:var(--red);font-style:normal}.upstream-tab-add{color:var(--primary)}.upstream-tab-editor{margin-top:16px;padding:18px;border:1px solid var(--border);border-radius:12px;background:color-mix(in srgb,var(--surface) 72%,transparent)}.upstream-tab-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.upstream-tab-editor details{margin-top:8px}.upstream-tab-editor summary{cursor:pointer;color:var(--primary);font-weight:650}@media(max-width:760px){.upstream-tab-grid{grid-template-columns:1fr}}.stat-card:before{background:var(--primary)!important}.appearance-thumb{position:relative}.appearance-thumb::after{content:'×';position:absolute;right:4px;top:2px;width:18px;height:18px;border-radius:50%;background:rgba(0,0,0,.68);color:#fff;font-size:15px;line-height:17px;text-align:center;opacity:0;transition:opacity .15s}.appearance-thumb:hover::after{opacity:1}.appearance-texture-card{margin-top:18px;padding:0}.appearance-texture-card .panel-body{padding:22px}.topbar{background:color-mix(in srgb,var(--surface) var(--glass-opacity,51%),transparent)!important;backdrop-filter:blur(var(--glass-blur,18px)) saturate(145%)!important;-webkit-backdrop-filter:blur(var(--glass-blur,18px)) saturate(145%)!important}.content-wrap{width:100%;max-width:1800px}.panel,.stat-card,.sidebar,.topbar,.search,.icon-button,.button,.field input,.field textarea,.user-button{background:color-mix(in srgb,var(--surface) var(--glass-opacity,51%),transparent)!important;backdrop-filter:blur(var(--glass-blur,18px)) saturate(145%);-webkit-backdrop-filter:blur(var(--glass-blur,18px)) saturate(145%);border-color:color-mix(in srgb,var(--primary) 18%,var(--border))}.panel,.stat-card{box-shadow:inset 0 1px 0 color-mix(in srgb,var(--primary) 20%,transparent),0 14px 36px -22px color-mix(in srgb,var(--primary) 55%,transparent)}.advanced-model-actions{display:inline-flex;flex-wrap:wrap;gap:6px;margin-right:8px}.advanced-model-actions .button{min-height:34px;padding:0 11px}.data-table td{vertical-align:middle}.stat-card strong{min-height:32px}.data-table td:first-child code{overflow-wrap:anywhere}.log-view,.log-line{font-size:11px!important}.cleanllm-modal{position:fixed;inset:0;z-index:200;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.62);backdrop-filter:blur(4px)}.cleanllm-modal-card{width:min(520px,100%);max-height:80vh;overflow:auto;padding:26px;border:1px solid var(--border);border-radius:18px;background:var(--surface);color:var(--text);box-shadow:var(--shadow)}.cleanllm-modal-card h3{margin:0 0 20px;font-size:20px}.cleanllm-modal-actions{display:flex;justify-content:flex-end;align-items:center;gap:10px;margin-top:24px}.cleanllm-modal-actions .button{min-width:82px}.cleanllm-modal-card .field input{margin-top:2px}#cleanllm-modal dl{display:grid;grid-template-columns:90px 1fr;gap:10px;margin:18px 0}#cleanllm-modal dt{color:var(--muted)}#cleanllm-modal dd{margin:0;overflow-wrap:anywhere}@media(max-width:760px){.content-wrap{padding:20px 12px 40px}.data-table{min-width:760px}.advanced-model-actions{margin-bottom:6px}.cleanllm-modal-card{padding:20px}.cleanllm-modal-actions{flex-direction:row;justify-content:stretch}.cleanllm-modal-actions .button{flex:1}}"; document.head.append(polish);
   const glassPageStyle = document.createElement("style"); glassPageStyle.textContent = "body{position:relative}body::before,body::after{content:\"\";position:fixed;inset:0;pointer-events:none;z-index:15}body::before{background:#000;opacity:var(--page-dim,0)}body::after{background:#fff;opacity:var(--page-light,0)}.main{position:relative;z-index:16}.topbar{background:color-mix(in srgb,var(--surface) var(--glass-opacity,51%),transparent)!important;backdrop-filter:blur(var(--glass-blur,18px)) saturate(145%)!important;-webkit-backdrop-filter:blur(var(--glass-blur,18px)) saturate(145%)!important}"; document.head.append(glassPageStyle);
   const $ = (selector) => document.querySelector(selector);
@@ -25,7 +26,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.panel{width:100%}.log-line .level{color:var(--primary)!important}.button{cursor:pointer!important}.stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}@media(max-width:980px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}@media(max-width:600px){.stats-grid{grid-template-columns:1fr!important}}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.65";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.66";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -107,9 +108,11 @@
     event.currentTarget.disabled = true;
     try {
       const data = await request("/api/settings/test", {method:"POST"});
-      $("#connection-results").innerHTML = data.results.map((item) => `<div style="padding:8px 0;color:${item.ok?'var(--green)':'var(--red)'}"><strong>${item.ok?'✓':'×'} ${escape(item.name)}</strong> · ${escape(item.detail)} ${item.latency_ms ? `(${item.latency_ms} ms)` : ""}</div>`).join("");
+      $("#connection-results").innerHTML = `<div style="padding:8px 0;color:var(--primary)"><strong>总体连通性 ${data.availability_percent ?? 0}%</strong></div>` + data.results.map((item) => `<div style="padding:8px 0;color:${item.ok?'var(--green)':'var(--red)'}"><strong>${item.ok?'✓':'×'} ${escape(item.name)}</strong> · ${escape(item.detail)} ${item.latency_ms ? `(${item.latency_ms} ms)` : ""}</div>`).join("");
     } catch (error) { notify(error.message, true); } finally { event.currentTarget.disabled = false; }
   });
+  const runUpstreamCheck = () => { if (location.hash.slice(1) !== "upstream") return; $("#test-connections")?.click(); };
+  setInterval(runUpstreamCheck, 600000);
   $("#export-settings")?.addEventListener("click", () => location.assign("/api/settings/export"));
   $("#import-settings")?.addEventListener("change", async (event) => {
     try {
@@ -245,3 +248,24 @@
   Object.entries(textureControls).forEach(([id,meta])=>{const control=document.querySelector(id==="mask-opacity"?"#mask-opacity":"#glass-"+id);if(!control||control.dataset.bound)return;control.dataset.bound="1";control.addEventListener("input",()=>{const output=document.querySelector("#"+meta.output);if(output)output.textContent=control.value+meta.unit;applyTextureControls()})});
   document.querySelector("#copy-client-endpoint")?.addEventListener("click",async()=>{const value=document.querySelector("#client-endpoint")?.textContent||"";try{await navigator.clipboard.writeText(value)}catch(_){const area=document.createElement("textarea");area.value=value;area.style.position="fixed";area.style.opacity="0";document.body.append(area);area.select();document.execCommand("copy");area.remove()}notify("接口地址已复制")});applyTextureControls();upstreamTabsReady.finally(()=>{window.applyTexture?.();applyTextureControls();requestAnimationFrame(()=>document.body.style.visibility="visible")});
 })();
+
+// Group the aggregated model table by upstream without changing the API data model.
+const modelContainer = document.querySelector('#models-content');
+if (modelContainer) {
+  const observer = new MutationObserver(() => {
+    const table = modelContainer.querySelector('table');
+    if (!table || table.dataset.grouped) return;
+    const rows = [...table.querySelectorAll('tbody tr')];
+    const groups = new Map();
+    rows.forEach(row => { const key = row.cells[1]?.textContent.trim() || '默认上游'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); });
+    if (groups.size < 2) return;
+    table.dataset.grouped = 'true';
+    const tabs = document.createElement('div'); tabs.className = 'upstream-model-tabs';
+    const body = table.querySelector('tbody');
+    const select = key => { body.replaceChildren(...groups.get(key)); tabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.upstream === key)); };
+    groups.forEach((_, key) => { const button = document.createElement('button'); button.type = 'button'; button.className = 'button'; button.dataset.upstream = key; button.textContent = key; button.onclick = () => select(key); tabs.append(button); });
+    table.before(tabs); select(groups.keys().next().value);
+  });
+  observer.observe(modelContainer, {childList: true, subtree: true});
+}
+const modelTabStyle = document.createElement('style'); modelTabStyle.textContent = '.upstream-model-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.upstream-model-tabs .button{min-height:32px;padding:0 12px}.upstream-model-tabs .button.active{background:var(--primary-soft);color:var(--primary);border-color:var(--primary)}'; document.head.append(modelTabStyle);

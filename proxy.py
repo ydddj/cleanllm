@@ -70,7 +70,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.65")
+app = FastAPI(title="CleanLLM", version="1.0.66")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -604,7 +604,9 @@ async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
             results.append({"name": "Ollama 管理接口", "ok": True, "detail": response.json().get("version", "正常")})
         except Exception as exc:
             results.append({"name": "Ollama 管理接口", "ok": False, "detail": str(exc)})
-    return {"results": results}
+    checked = len(results)
+    healthy = sum(1 for item in results if item.get("ok"))
+    return {"results": results, "availability_percent": round(healthy / checked * 100, 1) if checked else 0}
 
 
 @app.get("/api/settings/export")
@@ -1086,6 +1088,53 @@ async def clear_logs(_: None = Depends(require_admin)) -> dict[str, str]:
         raise HTTPException(status_code=500, detail=f"清除日志失败：{exc}") from exc
     logger.info("System log cleared from Web UI")
     return {"message": "系统日志已清除"}
+
+
+@app.post("/v1/responses")
+async def responses_api(request: Request, _: None = Depends(require_api_token)) -> Response:
+    """Accept the OpenAI Responses request shape while using the existing chat upstreams."""
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="请求体不是有效 JSON") from exc
+    if not isinstance(payload, dict) or not payload.get("model"):
+        raise HTTPException(status_code=400, detail="Responses 请求必须包含 model")
+    source = payload.get("input", "")
+    if isinstance(source, str):
+        messages = [{"role": "user", "content": source}]
+    elif isinstance(source, list):
+        messages = []
+        for item in source:
+            if isinstance(item, dict) and item.get("role"):
+                content = item.get("content", "")
+                if isinstance(content, list):
+                    content = "\n".join(str(part.get("text", "")) for part in content if isinstance(part, dict))
+                messages.append({"role": item["role"], "content": content})
+    else:
+        messages = [{"role": "user", "content": str(source)}]
+    instructions = payload.get("instructions")
+    if instructions:
+        messages.insert(0, {"role": "system", "content": str(instructions)})
+    chat_payload = {"model": payload["model"], "messages": messages, "stream": False}
+    for key in ("temperature", "top_p", "max_output_tokens"):
+        if key in payload:
+            chat_payload["max_tokens" if key == "max_output_tokens" else key] = payload[key]
+    settings = load_settings(); failures = []
+    async with httpx.AsyncClient() as client:
+        for upstream in route_upstreams(settings, str(payload["model"])):
+            headers = {"Content-Type": "application/json"}
+            if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
+            try:
+                response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
+                if response.status_code >= 500: failures.append(f"{upstream['name']}: HTTP {response.status_code}"); continue
+                data = response.json(); choices = data.get("choices", [])
+                text = choices[0].get("message", {}).get("content", "") if choices else ""
+                text = clean_content(text, {**settings, "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", []))})
+                now = int(time.time())
+                result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
+                return JSONResponse(status_code=response.status_code, content=result)
+            except (httpx.RequestError, ValueError) as exc: failures.append(f"{upstream['name']}: {exc}")
+    return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
 
 
 @app.post("/v1/chat/completions")
