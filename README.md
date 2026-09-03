@@ -26,6 +26,7 @@ services:
       PGID: "10001"
       UPSTREAM_API_KEY: ""
       REQUEST_TIMEOUT: "120"
+      LOG_MAX_BYTES: "5242880"
     volumes:
       - cleanllm-data:/data
       # 用于“导出压缩包”；请改成宿主机实际 Ollama models 目录
@@ -58,11 +59,11 @@ docker compose logs -f
 docker compose down
 ```
 
-打开 `http://localhost:11515`，使用 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 登录。登录后可在“账户安全”中修改用户名和密码；密码以带随机盐的 scrypt 单向哈希保存在数据卷中。登录状态保存在 HttpOnly 会话 Cookie 中，有效期为 12 小时。
+打开 `http://localhost:11515`，使用 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 登录。登录后可在“系统设置”中修改用户名和密码；密码以带随机盐的 scrypt 单向哈希保存在数据卷中。登录状态保存在 HttpOnly 会话 Cookie 中，有效期为 12 小时。
 
 客户端主要请求地址为 `http://你的主机:11515/v1/chat/completions` 和 `/v1/responses`。此外支持 `/v1/models`、`/v1/embeddings`、`/v1/completions`、`/v1/images/generations`、`/v1/audio/transcriptions`、`/v1/audio/translations`、`/v1/audio/speech`、`/v1/moderations` 和 `/v1/rerank`，这些地址会从所选上游的 `/v1` 基础地址自动推导，无需逐项配置。设置保存在 Docker 数据卷中，升级容器不会丢失。
 
-常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
+常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT`、`LOG_MAX_BYTES` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
 
 `extra_hosts` 仅用于让 Linux 容器通过 `host.docker.internal` 访问宿主机。如果上游使用局域网 IP、公网地址或同一 Compose 中的服务名，可以删除这段配置；默认上游在宿主机时建议保留。
 
@@ -70,7 +71,7 @@ docker compose down
 
 管理中心可通过上游的 OpenAI 兼容 `/v1/models` 接口展示全部可用模型。默认地址由 Chat Completions 地址自动推导；非标准上游可通过网页或 `MODELS_API_URL` 单独指定。
 
-运行日志保存在数据卷的 `/data/cleanllm.log`，仅记录请求状态和系统事件，不记录 API Key 或请求正文。日志文件严格限制为 5 MB，达到上限后自动裁剪最旧内容。
+运行日志保存在数据卷的 `/data/cleanllm.log`，仅记录请求状态和系统事件，不记录 API Key 或请求正文。默认上限为 5 MB，可在系统日志页修改；达到上限后自动裁剪最旧内容。
 
 如果需要从源码构建，请复制 `.env.example` 为 `.env`，然后执行：
 
@@ -91,7 +92,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.101`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.102`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，并可随时修改到期时间及可用模型白名单。模型规则支持精确名称和 `*`、`?` 通配符，留空允许全部模型；受限令牌访问 `/v1/models` 时也只会看到允许的模型。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。使用日志明细保留 400 天，清除明细不会改变调用次数、周期 Token 统计或令牌累计用量。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 

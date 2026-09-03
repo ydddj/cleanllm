@@ -18,6 +18,7 @@ import sqlite3
 import tarfile
 import threading
 import io
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -29,7 +30,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 logger = logging.getLogger("cleanllm")
 BASE_DIR = Path(__file__).resolve().parent
@@ -75,12 +76,33 @@ DEFAULT_SETTINGS = {
 }
 RUNTIME_SETTINGS_KEYS = {"connectivity_history", "api_tokens", "export_history", "api_usage"}
 
-app = FastAPI(title="CleanLLM", version=APP_VERSION)
+
+@asynccontextmanager
+async def app_lifespan(_: FastAPI):
+    global CONNECTIVITY_TASK
+    history = database_connectivity_history()
+    if history:
+        CONNECTIVITY_STATE["checked_at"] = history[-1]["ts"]
+    CONNECTIVITY_TASK = asyncio.create_task(connectivity_scheduler())
+    try:
+        yield
+    finally:
+        CONNECTIVITY_TASK.cancel()
+        try:
+            await CONNECTIVITY_TASK
+        except asyncio.CancelledError:
+            pass
+        CONNECTIVITY_TASK = None
+
+
+app = FastAPI(title="CleanLLM", version=APP_VERSION, lifespan=app_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
 MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
 CONNECTIVITY_STATE: dict[str, Any] = {"checked_at": None, "results": [], "availability_percent": None}
+CONNECTIVITY_LOCK = asyncio.Lock()
+CONNECTIVITY_TASK: asyncio.Task | None = None
 STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
 ROUTE_AFFINITY: dict[str, tuple[str, float]] = {}
 INITIALIZED_DATABASES: set[str] = set()
@@ -88,7 +110,7 @@ DATABASE_INIT_LOCK = threading.Lock()
 
 
 class LoginRequest(BaseModel):
-    username: str = "admin"
+    username: str
     password: str
 
 
@@ -140,6 +162,81 @@ class SettingsUpdate(BaseModel):
                 raise ValueError(f"无效正则表达式：{pattern}（{exc}）") from exc
             cleaned.append(pattern)
         return cleaned
+
+    @field_validator("upstreams")
+    @classmethod
+    def validate_upstreams(cls, upstreams: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for index, item in enumerate(upstreams, start=2):
+            if not isinstance(item, dict):
+                raise ValueError(f"上游 {index} 必须是对象")
+            name = str(item.get("name") or f"上游 {index}").strip()
+            if not name or len(name) > 80:
+                raise ValueError(f"上游 {index} 名称长度必须为 1 至 80 个字符")
+            url = str(item.get("url") or "").strip()
+            parsed = urlsplit(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError(f"上游 {name} 的接口地址无效")
+            try:
+                timeout = int(item.get("timeout") or 120)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"上游 {name} 的请求超时必须是整数") from exc
+            if not 1 <= timeout <= 3600:
+                raise ValueError(f"上游 {name} 的请求超时范围为 1 至 3600 秒")
+            models_url = cls.validate_models_url(str(item.get("models_url") or ""))
+            ollama_url = cls.validate_models_url(str(item.get("ollama_url") or ""))
+            patterns = cls.validate_patterns(item.get("clean_patterns") or [])
+            routes = cls.validate_model_routes(item.get("model_routes") or [])
+            cleaned.append({
+                "name": name,
+                "url": url,
+                "api_key": str(item.get("api_key") or ""),
+                "timeout": timeout,
+                "models_url": models_url,
+                "ollama_url": ollama_url,
+                "clean_patterns": patterns,
+                "model_routes": routes,
+            })
+        return cleaned
+
+    @field_validator("model_routes")
+    @classmethod
+    def validate_model_routes(cls, routes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        cleaned: list[dict[str, Any]] = []
+        for index, route in enumerate(routes, start=1):
+            if not isinstance(route, dict):
+                raise ValueError(f"模型路由 {index} 必须是对象")
+            pattern = str(route.get("pattern") or "").strip()
+            names = route.get("upstreams") or []
+            if not pattern or len(pattern) > 200:
+                raise ValueError(f"模型路由 {index} 必须包含有效 pattern")
+            if not isinstance(names, list) or not all(isinstance(name, str) and name.strip() for name in names):
+                raise ValueError(f"模型路由 {index} 的 upstreams 必须是名称数组")
+            cleaned.append({"pattern": pattern, "upstreams": list(dict.fromkeys(name.strip() for name in names))})
+        return cleaned
+
+    @field_validator("appearance_background")
+    @classmethod
+    def validate_background(cls, value: str) -> str:
+        value = str(value or "")
+        if value and not value.startswith("data:image/") and not re.fullmatch(
+            r"/api/appearance/background/[0-9a-f]{64}\.(?:png|jpg|webp|gif|avif)", value
+        ):
+            raise ValueError("背景图必须来自本实例图库")
+        return value
+
+    @field_validator("appearance_backgrounds")
+    @classmethod
+    def validate_backgrounds(cls, values: list[str]) -> list[str]:
+        return list(dict.fromkeys(cls.validate_background(value) for value in values if value))
+
+    @model_validator(mode="after")
+    def validate_upstream_names(self) -> "SettingsUpdate":
+        names = [self.default_upstream_name.strip(), *(item["name"] for item in self.upstreams)]
+        if len(names) != len(set(names)):
+            raise ValueError("上游名称不能重复")
+        self.default_upstream_name = names[0]
+        return self
 
 
 class AccountUpdate(BaseModel):
@@ -431,6 +528,8 @@ def database_connection() -> sqlite3.Connection:
         usage_columns = {row[1] for row in connection.execute("PRAGMA table_info(api_usage)")}
         if "visible" not in usage_columns:
             connection.execute("ALTER TABLE api_usage ADD COLUMN visible INTEGER NOT NULL DEFAULT 1")
+        connection.execute("DELETE FROM api_usage WHERE at < ?", (int(time.time()) - 400 * 86400,))
+        connection.execute("DELETE FROM connectivity_history WHERE checked_at < ?", (time.time() - 8 * 86400,))
         INITIALIZED_DATABASES.add(key)
     return connection
 
@@ -453,7 +552,7 @@ def database_usage(since: int = 0) -> list[dict[str, Any]]:
 def database_connectivity_history() -> list[dict[str, Any]]:
     with database_connection() as database:
         rows = database.execute(
-            "SELECT checked_at, results_json FROM connectivity_history ORDER BY checked_at DESC LIMIT 1000"
+            "SELECT checked_at, results_json FROM connectivity_history ORDER BY checked_at DESC LIMIT 12000",
         ).fetchall()
     return [
         {"ts": float(row["checked_at"]), "results": json.loads(row["results_json"])}
@@ -468,7 +567,8 @@ def database_add_connectivity(checked_at: float, results: list[dict[str, Any]]) 
             (checked_at, json.dumps(results, ensure_ascii=False)),
         )
         database.execute(
-            "DELETE FROM connectivity_history WHERE id NOT IN (SELECT id FROM connectivity_history ORDER BY checked_at DESC LIMIT 1000)"
+            "DELETE FROM connectivity_history WHERE checked_at < ?",
+            (checked_at - 8 * 86400,),
         )
 
 
@@ -616,10 +716,14 @@ def load_settings() -> dict[str, Any]:
         if SETTINGS_FILE.exists():
             saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             settings.update({key: value for key, value in saved.items() if key not in RUNTIME_SETTINGS_KEYS})
+            original_background = str(settings.get("appearance_background") or "")
+            original_backgrounds = list(settings.get("appearance_backgrounds") or [])
+            normalize_background_settings(settings)
             embedded_backgrounds = str(settings.get("appearance_background") or "").startswith("data:image/") or any(
                 str(value).startswith("data:image/") for value in settings.get("appearance_backgrounds", [])
             )
-            if any(key in saved for key in RUNTIME_SETTINGS_KEYS) or embedded_backgrounds:
+            backgrounds_changed = original_background != settings.get("appearance_background") or original_backgrounds != settings.get("appearance_backgrounds")
+            if any(key in saved for key in RUNTIME_SETTINGS_KEYS) or embedded_backgrounds or backgrounds_changed:
                 save_settings(settings)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not load settings: %s", exc)
@@ -628,6 +732,8 @@ def load_settings() -> dict[str, Any]:
 
 def persist_background(value: str) -> str:
     if not value.startswith("data:image/"):
+        if value and not re.fullmatch(r"/api/appearance/background/[0-9a-f]{64}\.(?:png|jpg|webp|gif|avif)", value):
+            return ""
         return value
     match = re.fullmatch(r"data:image/(png|jpeg|jpg|webp|gif|avif);base64,(.+)", value, re.DOTALL | re.IGNORECASE)
     if not match:
@@ -655,7 +761,7 @@ def normalize_background_settings(settings: dict[str, Any]) -> None:
     selected_original = str(settings.get("appearance_background") or "")
     values = originals + ([selected_original] if selected_original and selected_original not in originals else [])
     replacements = {value: persist_background(value) for value in values}
-    normalized = list(dict.fromkeys(replacements[value] for value in values))[-20:]
+    normalized = list(dict.fromkeys(replacements[value] for value in values if replacements[value]))[-20:]
     settings["appearance_backgrounds"] = normalized
     settings["appearance_background"] = replacements.get(selected_original, selected_original)
     directory = DATA_DIR / "backgrounds"
@@ -692,13 +798,13 @@ def save_settings(settings: dict[str, Any]) -> None:
         ) from exc
 
 
-def clean_content(text: str, settings: dict[str, Any]) -> str:
+def clean_content(text: str, settings: dict[str, Any], *, strip_result: bool = True) -> str:
     for pattern in settings.get("clean_patterns", []):
         try:
             text = re.sub(pattern, "", text)
         except re.error as exc:
             logger.warning("Skipping invalid saved regex %r: %s", pattern, exc)
-    return text.strip()
+    return text.strip() if strip_result else text
 
 
 def models_url_for_target(target_url: str, override: str = "") -> str:
@@ -802,6 +908,17 @@ def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
 
 def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]]:
     upstreams = configured_upstreams(settings)
+    names = {item["name"]: item for item in upstreams}
+    preferred: list[dict[str, Any]] = []
+    for route in settings.get("model_routes", []):
+        if not isinstance(route, dict) or not fnmatch.fnmatchcase(model, str(route.get("pattern") or "")):
+            continue
+        for name in route.get("upstreams", []):
+            if name in names and names[name] not in preferred:
+                preferred.append(names[name])
+        break
+    if preferred:
+        return preferred + [item for item in upstreams if item not in preferred]
     affinity = ROUTE_AFFINITY.get(model)
     if affinity and affinity[1] > time.time():
         preferred = [item for item in upstreams if item["name"] == affinity[0]]
@@ -813,16 +930,18 @@ def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]
         if available:
             preferred = [item for name in available for item in upstreams if item["name"] == name]
             return preferred + [item for item in upstreams if item not in preferred]
-    names = {item["name"]: item for item in upstreams}
-    preferred: list[dict[str, Any]] = []
-    for route in settings.get("model_routes", []):
-        if not isinstance(route, dict) or not fnmatch.fnmatchcase(model, str(route.get("pattern") or "")):
-            continue
-        for name in route.get("upstreams", []):
-            if name in names and names[name] not in preferred:
-                preferred.append(names[name])
-        break
     return preferred + [item for item in upstreams if item not in preferred]
+
+
+def remember_route(settings: dict[str, Any], model: str, upstream_name: str) -> None:
+    minutes = max(0, int(settings.get("route_affinity_minutes", 15)))
+    if model and upstream_name and minutes:
+        ROUTE_AFFINITY[model] = (upstream_name, time.time() + minutes * 60)
+
+
+def upstream_stream_timeout(upstream: dict[str, Any]) -> httpx.Timeout:
+    seconds = max(1.0, float(upstream.get("timeout") or 120))
+    return httpx.Timeout(seconds, connect=min(seconds, 10.0), read=seconds, write=seconds, pool=min(seconds, 10.0))
 
 
 def clean_stream_line(line: str, settings: dict[str, Any]) -> str:
@@ -833,7 +952,7 @@ def clean_stream_line(line: str, settings: dict[str, Any]) -> str:
         for choice in payload.get("choices", []):
             delta = choice.get("delta") or {}
             if isinstance(delta.get("content"), str):
-                delta["content"] = clean_content(delta["content"], settings)
+                delta["content"] = clean_content(delta["content"], settings, strip_result=False)
         return "data: " + json.dumps(payload, ensure_ascii=False)
     except (json.JSONDecodeError, TypeError):
         return line
@@ -986,42 +1105,56 @@ def connectivity_metrics(
     }
 
 
+async def run_connectivity_test(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run one shared connectivity sample for every configured upstream."""
+    settings = settings or load_settings()
+    results = []
+    async with CONNECTIVITY_LOCK:
+        async with httpx.AsyncClient() as client:
+            for upstream in configured_upstreams(settings):
+                headers = {"Authorization": f"Bearer {upstream['api_key']}"} if upstream["api_key"] else {}
+                started = time.perf_counter()
+                try:
+                    response = await client.get(upstream["models_url"], headers=headers, timeout=8.0)
+                    response.raise_for_status()
+                    results.append({"name": upstream["name"], "ok": True, "latency_ms": round((time.perf_counter()-started)*1000), "detail": "模型接口正常"})
+                except Exception as exc:
+                    results.append({"name": upstream["name"], "ok": False, "latency_ms": round((time.perf_counter()-started)*1000), "detail": str(exc)})
+        checked = len(results)
+        healthy = sum(1 for item in results if item.get("ok"))
+        checked_at = time.time()
+        percent = round(healthy / checked * 100, 1) if checked else 0
+        database_add_connectivity(
+            checked_at,
+            [{"name": item["name"], "ok": item["ok"]} for item in results],
+        )
+        history = database_connectivity_history()
+        CONNECTIVITY_STATE.update({"checked_at": checked_at, "results": results, "availability_percent": percent})
+        for item in results:
+            item.update(connectivity_metrics(history, item["name"], checked_at))
+        return {**CONNECTIVITY_STATE}
+
+
 @app.post("/api/settings/test")
 async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
-    settings = load_settings()
-    results = []
-    async with httpx.AsyncClient() as client:
-        for upstream in configured_upstreams(settings):
-            headers = {"Authorization": f"Bearer {upstream['api_key']}"} if upstream["api_key"] else {}
-            url = upstream["url"]
-            parsed = urlsplit(url)
-            probe = urlunsplit((parsed.scheme, parsed.netloc, "/v1/models", "", ""))
-            started = time.perf_counter()
-            try:
-                response = await client.get(probe, headers=headers, timeout=8.0)
-                response.raise_for_status()
-                results.append({"name": upstream["name"], "ok": True, "latency_ms": round((time.perf_counter()-started)*1000), "detail": "模型接口正常"})
-            except Exception as exc:
-                results.append({"name": upstream["name"], "ok": False, "latency_ms": round((time.perf_counter()-started)*1000), "detail": str(exc)})
+    return await run_connectivity_test()
+
+
+async def connectivity_scheduler() -> None:
+    """Keep connectivity history current even when no admin browser is open."""
+    while True:
         try:
-            response = await client.get(f"{ollama_base_url(settings)}/api/version", timeout=5.0)
-            response.raise_for_status()
-            results.append({"name": "Ollama 管理接口", "ok": True, "detail": response.json().get("version", "正常")})
+            settings = load_settings()
+            interval = max(1, min(int(settings.get("connectivity_interval_minutes", 10)), 1440))
+            checked_at = float(CONNECTIVITY_STATE.get("checked_at") or 0)
+            delay = max(1.0, checked_at + interval * 60 - time.time())
+            await asyncio.sleep(delay)
+            await run_connectivity_test()
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
-            results.append({"name": "Ollama 管理接口", "ok": False, "detail": str(exc)})
-    checked = len(results)
-    healthy = sum(1 for item in results if item.get("ok"))
-    checked_at = time.time()
-    percent = round(healthy / checked * 100, 1) if checked else 0
-    database_add_connectivity(
-        checked_at,
-        [{"name": item["name"], "ok": item["ok"]} for item in results],
-    )
-    history = database_connectivity_history()
-    CONNECTIVITY_STATE.update({"checked_at": checked_at, "results": results, "availability_percent": percent})
-    for item in results:
-        item.update(connectivity_metrics(history, item["name"], checked_at))
-    return {**CONNECTIVITY_STATE}
+            logger.warning("Automatic upstream connectivity test failed: %s", exc)
+            await asyncio.sleep(60)
 
 
 @app.get("/api/settings/connectivity")
@@ -1180,36 +1313,74 @@ async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> d
 
 
 @app.get("/api/usage")
-async def api_usage(token_name: str = "", _: None = Depends(require_admin)) -> dict[str, Any]:
+async def api_usage(
+    token_id: str = "", token_name: str = "", _: None = Depends(require_admin)
+) -> dict[str, Any]:
     local_now = datetime.now().astimezone()
     today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
     week_start = today_start - timedelta(days=today_start.weekday())
     month_start = today_start.replace(day=1)
     year_start = today_start.replace(month=1, day=1)
-    recent = database_usage(int(min(year_start, yesterday_start).timestamp()))
-    if token_name:
-        recent = [item for item in recent if str(item.get("token_name") or "未命名") == token_name]
-    def in_period(item: dict[str, Any], start: datetime, end: datetime | None = None) -> bool:
-        at = datetime.fromtimestamp(int(item.get("at", 0)), local_now.tzinfo)
-        return at >= start and (end is None or at < end)
-    def token_total(items: list[dict[str, Any]], start: datetime, end: datetime | None = None) -> int:
-        return sum(max(0, int(item.get("total_tokens", item.get("tokens", 0)) or 0)) for item in items if in_period(item, start, end))
-    by_token: dict[str, int] = {}
-    for item in recent:
-        key = str(item.get("token_name") or "未命名"); by_token[key] = by_token.get(key, 0) + 1
+    bounds = {
+        "year": int(year_start.timestamp()),
+        "month": int(month_start.timestamp()),
+        "week": int(week_start.timestamp()),
+        "yesterday": int(yesterday_start.timestamp()),
+        "today": int(today_start.timestamp()),
+    }
+    where = "at >= ?"
+    params: list[Any] = [bounds["year"]]
+    if token_id:
+        where += " AND token_id = ?"
+        params.append(token_id)
+    elif token_name:  # Backward compatibility for older admin clients.
+        where += " AND token_name = ?"
+        params.append(token_name)
+    with database_connection() as database:
+        summary = database.execute(
+            f"""SELECT COUNT(*) AS total,
+                SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END) AS today,
+                SUM(CASE WHEN at >= ? AND at < ? THEN 1 ELSE 0 END) AS yesterday,
+                SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END) AS week,
+                SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END) AS month,
+                SUM(CASE WHEN at >= ? THEN 1 ELSE 0 END) AS year,
+                SUM(CASE WHEN at >= ? THEN total_tokens ELSE 0 END) AS tokens_today,
+                SUM(CASE WHEN at >= ? THEN total_tokens ELSE 0 END) AS tokens_week,
+                SUM(CASE WHEN at >= ? THEN total_tokens ELSE 0 END) AS tokens_month
+                FROM api_usage WHERE {where}""",
+            (
+                bounds["today"], bounds["yesterday"], bounds["today"],
+                bounds["week"], bounds["month"], bounds["year"],
+                bounds["today"], bounds["week"], bounds["month"], *params,
+            ),
+        ).fetchone()
+        log_rows = database.execute(
+            f"SELECT * FROM api_usage WHERE {where} AND visible = 1 ORDER BY at DESC LIMIT 100",
+            params,
+        ).fetchall()
+        by_token_rows = database.execute(
+            """SELECT COALESCE(token_id, '') AS token_id, token_name, COUNT(*) AS calls
+               FROM api_usage WHERE at >= ? GROUP BY token_id, token_name""",
+            (bounds["year"],),
+        ).fetchall()
+    values = row_dict(summary)
+    by_token = {
+        str(row["token_id"] or row["token_name"] or "未命名"): int(row["calls"])
+        for row in by_token_rows
+    }
     return {
-        "total": len(recent),
-        "today": sum(1 for item in recent if in_period(item, today_start)),
-        "yesterday": sum(1 for item in recent if in_period(item, yesterday_start, today_start)),
-        "week": sum(1 for item in recent if in_period(item, week_start)),
-        "month": sum(1 for item in recent if in_period(item, month_start)),
-        "year": sum(1 for item in recent if in_period(item, year_start)),
-        "tokens_today": token_total(recent, today_start),
-        "tokens_week": token_total(recent, week_start),
-        "tokens_month": token_total(recent, month_start),
+        "total": int(values.get("total") or 0),
+        "today": int(values.get("today") or 0),
+        "yesterday": int(values.get("yesterday") or 0),
+        "week": int(values.get("week") or 0),
+        "month": int(values.get("month") or 0),
+        "year": int(values.get("year") or 0),
+        "tokens_today": int(values.get("tokens_today") or 0),
+        "tokens_week": int(values.get("tokens_week") or 0),
+        "tokens_month": int(values.get("tokens_month") or 0),
         "by_token": by_token,
-        "logs": list(reversed([item for item in recent if bool(item.get("visible", 1))][-100:])),
+        "logs": [row_dict(row) for row in log_rows],
     }
 
 
@@ -1601,13 +1772,13 @@ async def clear_logs(_: None = Depends(require_admin)) -> dict[str, str]:
 
 
 async def native_responses_stream(payload: dict[str, Any], settings: dict[str, Any], request: Request) -> Response:
-    """Relay native Responses SSE bytes unchanged so event ordering and IDs stay intact."""
+    """Relay native Responses SSE while preserving event order and stream semantics."""
     failures: list[str] = []
     for upstream in route_upstreams(settings, str(payload.get("model") or "")):
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if upstream["api_key"]:
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
-        client = httpx.AsyncClient(timeout=None)
+        client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
         responses_url = upstream["url"].replace("/chat/completions", "/responses")
         try:
             logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
@@ -1624,36 +1795,43 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             await response.aclose()
             await client.aclose()
             continue
-        ROUTE_AFFINITY[str(payload["model"])] = (
-            upstream["name"],
-            time.time() + int(settings.get("route_affinity_minutes", 15)) * 60,
-        )
         started = time.perf_counter()
+        response_settings = {
+            **settings,
+            "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", [])),
+        }
 
         async def relay() -> Any:
             pending = b""
-            state: dict[str, Any] = {"completed": False, "text_done": False, "text": "", "response": None}
+            state: dict[str, Any] = {"completed": False, "terminal": False, "text_done": False, "text": "", "response": None}
 
-            def inspect_line(raw_line: bytes) -> None:
+            def process_line(raw_line: bytes) -> bytes:
                 line = raw_line.rstrip(b"\r")
                 if not line.startswith(b"data:"):
-                    return
+                    return raw_line
                 data = line[5:].lstrip()
-                if not data or data == b"[DONE]":
-                    return
+                if not data:
+                    return raw_line
+                if data == b"[DONE]":
+                    state["done_marker"] = True
+                    return raw_line
                 try:
                     event = json.loads(data)
                 except (ValueError, UnicodeDecodeError):
-                    return
+                    return raw_line
                 if not isinstance(event, dict):
-                    return
+                    return raw_line
                 event_type = str(event.get("type") or "")
                 if event_type == "response.output_text.delta":
-                    state["text"] += str(event.get("delta") or "")
+                    delta = clean_content(str(event.get("delta") or ""), response_settings, strip_result=False)
+                    event["delta"] = delta
+                    state["text"] += delta
                 elif event_type == "response.output_text.done":
                     state["text_done"] = True
                     if not state["text"]:
-                        state["text"] = str(event.get("text") or "")
+                        text = clean_content(str(event.get("text") or ""), response_settings)
+                        event["text"] = text
+                        state["text"] = text
                 response_data = event.get("response")
                 if isinstance(response_data, dict):
                     state["response"] = response_data
@@ -1661,21 +1839,25 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     isinstance(response_data, dict) and response_data.get("status") == "completed"
                 ):
                     state["completed"] = True
+                    state["terminal"] = True
                     update_usage_record_safely(
                         getattr(request.state, "usage_id", None),
                         **usage_values(response_data.get("usage")),
                     )
+                    remember_route(settings, str(payload.get("model") or ""), upstream["name"])
+                elif event_type in {"response.failed", "response.incomplete"}:
+                    state["terminal"] = True
+                return b"data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
             try:
                 async for chunk in response.aiter_bytes():
                     pending += chunk
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
-                        inspect_line(line)
-                    yield chunk
+                        yield process_line(line) + b"\n"
             except httpx.RequestError as exc:
                 logger.warning("Responses stream from %s disconnected: %s", upstream["name"], exc)
-                if not state["completed"]:
+                if not state["terminal"]:
                     failed = {
                         "type": "response.failed",
                         "response": {
@@ -1690,33 +1872,21 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     yield f"\n\nevent: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
             else:
                 if pending:
-                    inspect_line(pending)
+                    yield process_line(pending)
                 if not state["completed"]:
-                    prior = state["response"] if isinstance(state["response"], dict) else {}
-                    response_id = str(prior.get("id") or f"resp-{secrets.token_hex(12)}")
-                    text = str(state["text"])
-                    completed = {
-                        **prior,
-                        "id": response_id,
-                        "object": "response",
-                        "created_at": int(prior.get("created_at") or time.time()),
-                        "model": prior.get("model") or payload.get("model"),
-                        "status": "completed",
+                    failed = {
+                        "type": "response.failed",
+                        "response": {
+                            "id": f"resp-{secrets.token_hex(12)}",
+                            "object": "response",
+                            "created_at": int(time.time()),
+                            "model": payload.get("model"),
+                            "status": "failed",
+                            "error": {"type": "upstream_error", "message": "上游响应流未正常结束"},
+                        },
                     }
-                    if not completed.get("output"):
-                        completed["output"] = [{
-                            "id": f"msg-{secrets.token_hex(8)}",
-                            "type": "message",
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}],
-                        }]
-                    suffix = "\n\n"
-                    if text and not state["text_done"]:
-                        done = {"type": "response.output_text.done", "text": text, "response_id": response_id}
-                        suffix += f"event: response.output_text.done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"
-                    suffix += f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed}, ensure_ascii=False)}\n\n"
-                    logger.warning("Responses stream from %s ended without response.completed; appended a compatible terminal event", upstream["name"])
-                    yield suffix.encode()
+                    logger.warning("Responses stream from %s ended without response.completed", upstream["name"])
+                    yield f"\nevent: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
             finally:
                 await response.aclose()
                 await client.aclose()
@@ -1774,10 +1944,7 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
             if response.status_code >= 400:
                 failures.append(f"{upstream['name']}: HTTP {response.status_code}")
                 continue
-            ROUTE_AFFINITY[str(payload.get("model") or endpoint)] = (
-                upstream["name"],
-                time.time() + int(settings.get("route_affinity_minutes", 15)) * 60,
-            )
+            remember_route(settings, str(payload.get("model") or endpoint), upstream["name"])
             response_headers = {}
             if response.headers.get("content-disposition"):
                 response_headers["Content-Disposition"] = response.headers["content-disposition"]
@@ -1847,6 +2014,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             sequence_number = 0
             item_id = f"msg-{secrets.token_hex(8)}"
             native_completed = False
+            chat_done = False
             stream_payload = {**chat_payload, "stream": True}
             for upstream in route_upstreams(settings, str(payload["model"])):
                 headers = {"Content-Type": "application/json"}
@@ -1854,7 +2022,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 try:
                     responses_url = upstream["url"]
                     logger.info("Responses chat fallback request: %s -> %s", upstream["name"], responses_url)
-                    async with httpx.AsyncClient(timeout=None) as client:
+                    async with httpx.AsyncClient(timeout=upstream_stream_timeout(upstream)) as client:
                         async with client.stream("POST", responses_url, json=stream_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
@@ -1866,12 +2034,19 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                 if line.startswith("event: "):
                                     event_name = line[7:].strip() or "message"
                                     continue
-                                if not line.startswith("data: ") or line == "data: [DONE]": continue
+                                if line == "data: [DONE]":
+                                    chat_done = True
+                                    continue
+                                if not line.startswith("data: "):
+                                    continue
                                 try:
                                     chunk = json.loads(line[6:])
                                     if isinstance(chunk, dict) and str(chunk.get("type", "")).startswith("response."):
                                         emitted = True
-                                        if chunk.get("type") == "response.output_text.delta": complete_text += str(chunk.get("delta", ""))
+                                        if chunk.get("type") == "response.output_text.delta":
+                                            delta = clean_content(str(chunk.get("delta", "")), {**settings, "clean_patterns": upstream.get("clean_patterns", [])}, strip_result=False)
+                                            chunk["delta"] = delta
+                                            complete_text += delta
                                         if chunk.get("type") == "response.completed":
                                             native_completed = True
                                             update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values((chunk.get("response") or {}).get("usage")))
@@ -1881,7 +2056,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                 except (ValueError, IndexError, AttributeError):
                                     continue
                                 if not isinstance(delta, str) or not delta: continue
-                                delta = clean_content(delta, {**settings, "clean_patterns": upstream.get("clean_patterns", [])})
+                                delta = clean_content(delta, {**settings, "clean_patterns": upstream.get("clean_patterns", [])}, strip_result=False)
                                 if not delta: continue
                                 complete_text += delta
                                 emitted = True
@@ -1902,13 +2077,17 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 except httpx.RequestError:
                     continue
             if native_completed:
-                ROUTE_AFFINITY[str(payload["model"])] = (selected_name, time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
+                remember_route(settings, str(payload["model"]), str(selected_name or ""))
                 return
             if selected_name is None:
                 failed = {**base, "status": "failed", "error": {"message": "所有上游均不可用", "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
-            ROUTE_AFFINITY[str(payload["model"])] = (selected_name, time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
+            if not chat_done:
+                failed = {**base, "status": "failed", "error": {"message": "上游响应流未正常结束", "type": "upstream_error"}}
+                yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
+                return
+            remember_route(settings, str(payload["model"]), str(selected_name))
             completed = {**base, "status": "completed", "output": [{"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": complete_text}]}]}
             sequence_number += 1
             completed["sequence_number"] = sequence_number
@@ -1936,7 +2115,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 now = int(time.time())
                 result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
                 update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage")))
-                ROUTE_AFFINITY[str(payload["model"])] = (upstream["name"], time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
+                remember_route(settings, str(payload["model"]), upstream["name"])
                 if payload.get("stream") is True:
                     async def events():
                         yield f"event: response.created\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
@@ -1970,7 +2149,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
         try:
             if streaming:
-                candidate_client = httpx.AsyncClient(timeout=None)
+                candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
                 candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=payload, headers=headers), stream=True)
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
@@ -1991,28 +2170,33 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     if response is None:
         return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
     logger.info("Model %s routed to %s", payload.get("model", ""), selected["name"])
-    if payload.get("model"):
-        ROUTE_AFFINITY[str(payload["model"])] = (selected["name"], time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
     response_settings = {**settings, "clean_patterns": selected.get("clean_patterns", settings.get("clean_patterns", []))}
     if streaming:
         async def stream_response():
             buffer = ""
+            completed = False
             try:
                 async for text in response.aiter_text():
                     buffer += text
                     while "\n" in buffer:
                         line, buffer = buffer.split("\n", 1)
-                        if line.startswith("data: ") and line.strip() != "data: [DONE]":
+                        if line.strip() == "data: [DONE]":
+                            completed = True
+                        elif line.startswith("data: "):
                             try:
                                 update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(json.loads(line[6:]).get("usage")))
                             except (ValueError, AttributeError):
                                 pass
                         yield (clean_stream_line(line, response_settings) + "\n").encode("utf-8")
                 if buffer:
+                    if buffer.strip() == "data: [DONE]":
+                        completed = True
                     yield clean_stream_line(buffer, response_settings).encode("utf-8")
             finally:
                 await response.aclose()
                 await client.aclose()
+                if completed:
+                    remember_route(settings, str(payload.get("model") or ""), selected["name"])
         return StreamingResponse(stream_response(), status_code=response.status_code, media_type=response.headers.get("content-type", "text/event-stream"))
     try:
         data = response.json()
@@ -2030,6 +2214,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         if isinstance(content, str):
             message["content"] = clean_content(content, response_settings)
     update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage") if isinstance(data, dict) else {}))
+    remember_route(settings, str(payload.get("model") or ""), selected["name"])
     return JSONResponse(status_code=response.status_code, content=data)
 
 

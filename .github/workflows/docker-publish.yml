@@ -29,6 +29,10 @@ jobs:
       - name: Run tests
         run: |
           pip install -r requirements-dev.txt
+          python -m py_compile proxy.py tests/test_proxy.py
+          node --check static/app.js
+          node --check static/features.js
+          node --check static/login.js
           python -m pytest -q
 
       - name: Read application version

@@ -395,7 +395,7 @@ def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path,
     assert '"id":"resp_test"' in response.text
 
 
-def test_native_responses_stream_appends_completed_when_upstream_omits_it(tmp_path: Path, monkeypatch) -> None:
+def test_native_responses_stream_reports_failure_when_upstream_omits_terminal_event(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
 
     class FakeResponse:
@@ -425,8 +425,42 @@ def test_native_responses_stream_appends_completed_when_upstream_omits_it(tmp_pa
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
     response = client.post("/v1/responses", json={"model": "test", "input": "hello", "stream": True})
     assert response.status_code == 200
-    assert response.text.count("event: response.completed") == 1
-    assert '"text": "answer"' in response.text
+    assert "event: response.completed" not in response.text
+    assert response.text.count("event: response.failed") == 1
+
+
+def test_stream_cleaning_preserves_delta_whitespace() -> None:
+    line = 'data: {"choices":[{"delta":{"content":" hello"}}]}'
+    cleaned = proxy.clean_stream_line(line, {"clean_patterns": []})
+    assert json.loads(cleaned[6:])["choices"][0]["delta"]["content"] == " hello"
+
+
+def test_settings_reject_invalid_upstream_shapes() -> None:
+    base = {"target_api_url": "http://primary/v1"}
+    for upstream in (
+        {"name": "broken", "url": "not-a-url"},
+        {"name": "broken", "url": "http://backup/v1", "timeout": "bad"},
+    ):
+        try:
+            proxy.SettingsUpdate.model_validate({**base, "upstreams": [upstream]})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid upstream must be rejected")
+
+
+def test_settings_reject_duplicate_upstream_names_and_external_background() -> None:
+    invalid_values = (
+        {"target_api_url": "http://primary/v1", "default_upstream_name": "same", "upstreams": [{"name": "same", "url": "http://backup/v1"}]},
+        {"target_api_url": "http://primary/v1", "appearance_background": "javascript:alert(1)"},
+    )
+    for value in invalid_values:
+        try:
+            proxy.SettingsUpdate.model_validate(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unsafe settings must be rejected")
 
 
 def test_usage_token_fields_are_normalized() -> None:

@@ -1,0 +1,6 @@
+.login-tools{position:fixed;z-index:40;top:18px;right:20px;display:flex;gap:8px}
+.login-palette-menu{position:fixed;z-index:45;top:64px;right:20px;display:grid;grid-template-columns:repeat(2,minmax(90px,1fr));gap:7px;padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--surface);box-shadow:var(--shadow)}
+.palette-item{display:flex;align-items:center;gap:7px;min-height:34px;padding:0 9px;border:1px solid transparent;border-radius:8px;background:var(--soft);color:var(--text);cursor:pointer}
+.palette-item:hover{border-color:var(--primary);background:var(--primary-soft)}
+.palette-dot{width:15px;height:15px;border-radius:50%}
+.login-view{background-size:cover!important;background-position:center!important;background-repeat:no-repeat!important;background-attachment:fixed!important}
