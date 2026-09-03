@@ -59,6 +59,8 @@ DEFAULT_SETTINGS = {
     "log_max_bytes": int(os.getenv("LOG_MAX_BYTES", str(5 * 1024 * 1024))),
     "log_level": os.getenv("LOG_LEVEL", "WARNING").upper(),
     "model_cache_ttl": int(os.getenv("MODEL_CACHE_TTL", "60")),
+    "connectivity_interval_minutes": int(os.getenv("CONNECTIVITY_INTERVAL_MINUTES", "10")),
+    "connectivity_history": [],
     "api_tokens": [],
     "export_history": [],
     "api_usage": [],
@@ -70,7 +72,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.67")
+app = FastAPI(title="CleanLLM", version="1.0.68")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -97,6 +99,8 @@ class SettingsUpdate(BaseModel):
     upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     model_routes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     model_cache_ttl: int = Field(default=60, ge=0, le=86400)
+    connectivity_interval_minutes: int = Field(default=10, ge=1, le=1440)
+    connectivity_history: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
     appearance_background: str = Field(default="", max_length=7_000_000)
     appearance_backgrounds: list[str] = Field(default_factory=list, max_length=20)
@@ -389,7 +393,12 @@ def models_url_for_target(target_url: str, override: str = "") -> str:
             path = path[: -len(suffix)] + "/models"
             break
     else:
-        path = path.rsplit("/", 1)[0] + "/models"
+        if path == "/v1":
+            path = "/v1/models"
+        elif path == "/":
+            path = "/models"
+        else:
+            path = path.rsplit("/", 1)[0] + "/models"
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
@@ -620,7 +629,19 @@ async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
             results.append({"name": "Ollama 管理接口", "ok": False, "detail": str(exc)})
     checked = len(results)
     healthy = sum(1 for item in results if item.get("ok"))
-    CONNECTIVITY_STATE.update({"checked_at": time.time(), "results": results, "availability_percent": round(healthy / checked * 100, 1) if checked else 0})
+    checked_at = time.time()
+    percent = round(healthy / checked * 100, 1) if checked else 0
+    history = settings.get("connectivity_history", []) if isinstance(settings.get("connectivity_history"), list) else []
+    history.append({"ts": checked_at, "results": [{"name": item["name"], "ok": item["ok"]} for item in results]})
+    settings["connectivity_history"] = history[-1000:]
+    save_settings(settings)
+    CONNECTIVITY_STATE.update({"checked_at": checked_at, "results": results, "availability_percent": percent})
+    for item in results:
+        samples = [entry for entry in settings["connectivity_history"] if entry.get("ts", 0) >= checked_at - 7 * 86400]
+        values = [r.get("ok") for entry in samples for r in entry.get("results", []) if r.get("name") == item["name"]]
+        day_values = [r.get("ok") for entry in samples if entry.get("ts", 0) >= checked_at - 86400 for r in entry.get("results", []) if r.get("name") == item["name"]]
+        item["availability_24h"] = round(sum(day_values) / len(day_values) * 100, 1) if day_values else 0
+        item["availability_7d"] = round(sum(values) / len(values) * 100, 1) if values else 0
     return {**CONNECTIVITY_STATE}
 
 
