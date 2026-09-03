@@ -684,6 +684,23 @@ def test_model_discovery_aggregates_upstreams(tmp_path: Path, monkeypatch) -> No
     assert [(item["id"], item["upstream"]) for item in result.json()["data"]] == [
         ("primary", "默认上游"), ("shared", "备用")
     ]
+    assert result.json()["upstreams"] == ["默认上游", "备用"]
+
+
+def test_connectivity_lists_configured_upstreams_before_first_check(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = client.get("/api/settings").json()
+    settings["upstreams"] = [{"name": "尚未检测", "url": "http://backup:8000/v1"}]
+    assert client.put("/api/settings", json=settings).status_code == 200
+    proxy.CONNECTIVITY_STATE.update({"checked_at": None, "results": [], "availability_percent": None})
+
+    result = client.get("/api/settings/connectivity")
+
+    assert result.status_code == 200
+    assert [item["name"] for item in result.json()["results"]] == ["默认上游", "尚未检测"]
+    assert all(item["ok"] is None for item in result.json()["results"])
+    assert result.json()["availability_percent"] is None
 
 
 def test_capped_log_handler_never_keeps_an_oversized_file(tmp_path: Path) -> None:

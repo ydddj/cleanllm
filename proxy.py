@@ -1177,7 +1177,27 @@ async def get_connectivity(_: None = Depends(require_admin)) -> dict[str, Any]:
                 "results": results,
                 "availability_percent": round(healthy / len(results) * 100, 1) if results else 0,
             })
-    return {**CONNECTIVITY_STATE}
+    settings = load_settings()
+    history = database_connectivity_history()
+    current = {str(item.get("name") or ""): dict(item) for item in CONNECTIVITY_STATE.get("results", [])}
+    ordered_results = []
+    checked_at = float(CONNECTIVITY_STATE.get("checked_at") or time.time())
+    for upstream in configured_upstreams(settings):
+        item = current.get(upstream["name"], {
+            "name": upstream["name"],
+            "ok": None,
+            "latency_ms": None,
+            "detail": "等待检测",
+        })
+        item.update(connectivity_metrics(history, upstream["name"], checked_at))
+        ordered_results.append(item)
+    tested = [item for item in ordered_results if item.get("ok") is not None]
+    availability = round(sum(1 for item in tested if item["ok"]) / len(tested) * 100, 1) if tested else None
+    return {
+        "checked_at": CONNECTIVITY_STATE.get("checked_at"),
+        "results": ordered_results,
+        "availability_percent": availability,
+    }
 
 
 @app.get("/api/settings/export")
@@ -1416,10 +1436,11 @@ async def system_events(_: None = Depends(require_admin)) -> StreamingResponse:
 async def get_models(refresh: bool = False, _: None = Depends(require_admin)) -> dict[str, Any]:
     settings = load_settings()
     upstreams = configured_upstreams(settings)
+    upstream_names = [item["name"] for item in upstreams]
     sources = "|".join(f"{item['name']}:{item['models_url']}" for item in upstreams)
     ttl = max(0, int(settings.get("model_cache_ttl", 60)))
     if not refresh and MODEL_CACHE.get("data") is not None and time.time() - float(MODEL_CACHE.get("at", 0)) < ttl and MODEL_CACHE.get("source") == sources:
-        return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(MODEL_CACHE["data"]), "cached": True, "data": MODEL_CACHE["data"]}
+        return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(MODEL_CACHE["data"]), "cached": True, "data": MODEL_CACHE["data"], "upstreams": upstream_names}
     models: list[dict[str, Any]] = []
     failures: list[str] = []
     async with httpx.AsyncClient() as client:
@@ -1444,7 +1465,7 @@ async def get_models(refresh: bool = False, _: None = Depends(require_admin)) ->
     models.sort(key=lambda item: (upstream_order.get(item["upstream"], len(upstreams)), item["id"].lower()))
     MODEL_CACHE.update({"at": time.time(), "data": models, "source": sources})
     logger.info("Discovered %d models from %d upstreams", len(models), len(upstreams))
-    return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(models), "cached": False, "data": models, "failures": failures}
+    return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(models), "cached": False, "data": models, "failures": failures, "upstreams": upstream_names}
 
 
 @app.get("/v1/models")
