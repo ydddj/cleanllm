@@ -73,7 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.73")
+app = FastAPI(title="CleanLLM", version="1.0.75")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -761,8 +761,10 @@ async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> d
 
 
 @app.get("/api/usage")
-async def api_usage(_: None = Depends(require_admin)) -> dict[str, Any]:
+async def api_usage(token_name: str = "", _: None = Depends(require_admin)) -> dict[str, Any]:
     now = int(time.time()); recent = [item for item in load_settings().get("api_usage", API_USAGE) if now - int(item.get("at", 0)) < 30 * 86400]
+    if token_name:
+        recent = [item for item in recent if str(item.get("token_name") or "未命名") == token_name]
     local_now = datetime.now().astimezone()
     today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
