@@ -48,6 +48,8 @@ def test_web_login_and_protected_settings(tmp_path: Path) -> None:
 def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     client = client_for(tmp_path)
     login(client)
+    proxy.MODEL_CACHE.update({"at": time.time(), "data": [{"id": "stale"}], "source": "old"})
+    proxy.ROUTE_AFFINITY["stale"] = ("旧上游", time.time() + 900)
     settings = {
         "target_api_url": "http://ollama:11434/v1/chat/completions",
         "default_upstream_name": "本地 Ollama",
@@ -61,6 +63,8 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     assert loaded["default_upstream_name"] == settings["default_upstream_name"]
     assert loaded["clean_patterns"] == settings["clean_patterns"]
     assert proxy.clean_content("A<think>hidden</think>B<tag>", loaded) == "AB"
+    assert proxy.MODEL_CACHE["data"] is None
+    assert proxy.ROUTE_AFFINITY == {}
     assert not list(tmp_path.glob("settings-*.tmp"))
 
 

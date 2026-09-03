@@ -4,3 +4,19 @@
 .palette-item:hover{border-color:var(--primary);background:var(--primary-soft)}
 .palette-dot{width:15px;height:15px;border-radius:50%}
 .login-view{background-size:cover!important;background-position:center!important;background-repeat:no-repeat!important;background-attachment:fixed!important}
+@media(min-width:761px){
+  .menu-button{display:grid!important;margin-right:10px}
+  .sidebar,.main{transition:width .18s ease,margin-left .18s ease}
+  html.sidebar-collapsed .sidebar{width:76px;padding-inline:10px}
+  html.sidebar-collapsed .main{margin-left:76px}
+  html.sidebar-collapsed .sidebar-brand{justify-content:center;padding:0}
+  html.sidebar-collapsed .sidebar-brand>span:last-child,
+  html.sidebar-collapsed .nav-label,
+  html.sidebar-collapsed .nav a>span,
+  html.sidebar-collapsed .nav a>b,
+  html.sidebar-collapsed .sidebar-status>div{display:none}
+  html.sidebar-collapsed .nav{margin-top:25px;overflow:visible}
+  html.sidebar-collapsed .nav a{justify-content:center;padding:0}
+  html.sidebar-collapsed .nav a svg{width:20px;height:20px}
+  html.sidebar-collapsed .sidebar-status{justify-content:center;padding:15px 0}
+}

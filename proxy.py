@@ -103,6 +103,7 @@ MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
 CONNECTIVITY_STATE: dict[str, Any] = {"checked_at": None, "results": [], "availability_percent": None}
 CONNECTIVITY_LOCK = asyncio.Lock()
 CONNECTIVITY_TASK: asyncio.Task | None = None
+CONNECTIVITY_WAKEUP = asyncio.Event()
 STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
 ROUTE_AFFINITY: dict[str, tuple[str, float]] = {}
 INITIALIZED_DATABASES: set[str] = set()
@@ -340,7 +341,9 @@ class CappedFileHandler(logging.FileHandler):
                 if newline >= 0:
                     tail = tail[newline + 1 :]
                 with open(self.baseFilename, "wb") as target:
-                    target.write(b"--- older log entries trimmed (5 MB limit) ---\n")
+                    limit_mb = self.max_bytes / (1024 * 1024)
+                    marker = f"--- older log entries trimmed ({limit_mb:g} MB limit) ---\n"
+                    target.write(marker.encode("utf-8"))
                     target.write(tail)
                 self.stream = self._open()
         except OSError:
@@ -1068,6 +1071,9 @@ async def update_settings(
     settings = load_settings()
     settings.update(update.model_dump(mode="json"))
     save_settings(settings)
+    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+    ROUTE_AFFINITY.clear()
+    CONNECTIVITY_WAKEUP.set()
     return {"message": "设置已保存"}
 
 
@@ -1152,7 +1158,13 @@ async def connectivity_scheduler() -> None:
             interval = max(1, min(int(settings.get("connectivity_interval_minutes", 10)), 1440))
             checked_at = float(CONNECTIVITY_STATE.get("checked_at") or 0)
             delay = max(1.0, checked_at + interval * 60 - time.time())
-            await asyncio.sleep(delay)
+            try:
+                await asyncio.wait_for(CONNECTIVITY_WAKEUP.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                CONNECTIVITY_WAKEUP.clear()
+                continue
             await run_connectivity_test()
         except asyncio.CancelledError:
             raise
@@ -1219,6 +1231,9 @@ async def import_settings(update: ConfigImportRequest, _: None = Depends(require
     validated = SettingsUpdate.model_validate(candidate).model_dump(mode="json")
     current.update(validated)
     save_settings(current)
+    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+    ROUTE_AFFINITY.clear()
+    CONNECTIVITY_WAKEUP.set()
     return {"message": "配置已导入"}
 
 
@@ -1229,6 +1244,9 @@ async def reset_settings(_: None = Depends(require_admin)) -> dict[str, str]:
     reset = copy.deepcopy(DEFAULT_SETTINGS)
     reset.update(preserved)
     save_settings(reset)
+    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+    ROUTE_AFFINITY.clear()
+    CONNECTIVITY_WAKEUP.set()
     return {"message": "代理设置已恢复默认值"}
 
 
