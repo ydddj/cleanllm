@@ -45,6 +45,10 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - API令牌列表保持表格结构，依次展示名称、密钥、状态、累计 Token 用量、过期时间、创建时间和删除；状态使用图标，显示与复制图标紧跟密钥。
 - `settings.json` 只保存配置；API令牌、API 用量、连通性历史和导出历史保存到 `/data/cleanllm.db`。新增高频或持续增长的运行数据不得写回 `settings.json`。
 - API令牌支持启用、停用和可选到期时间；只有已启用且未过期的令牌可以通过代理鉴权。
+- API令牌使用日志明细保留 400 天；自动刷新必须保留已加载数量和滚动位置。清除日志只隐藏并清理明细字段，不得影响调用统计、Token 周期统计或令牌累计 Token 用量。
+- API令牌的模型权限使用精确名称或 `fnmatch` 通配白名单，空列表允许全部模型；代理请求和 `GET /v1/models` 必须执行相同的模型过滤规则。
+- 已有 API令牌的过期时间和模型白名单必须可在 Web 中修改。
+- 模型列表的上游选项卡必须让当前选中项持续使用主题色，不能只依赖悬停状态变色，并与代理设置选项卡保持一致。
 - 上传背景图保存到 `/data/backgrounds`，`settings.json` 仅保存图片地址，不得重新内嵌 Base64 图片数据。
 
 ## Configuration rules

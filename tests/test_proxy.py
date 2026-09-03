@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import sqlite3
 import time
 from datetime import datetime
 from pathlib import Path
@@ -221,16 +222,106 @@ def test_api_token_total_tracks_usage_updates(tmp_path: Path) -> None:
     assert listed["total_tokens"] == 10
 
 
+def test_clear_usage_logs_preserves_statistics_and_token_total(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    client.post("/api/tokens", json={"name": "统计客户端"})
+    token_id = proxy.database_tokens()[0]["id"]
+    now = int(time.time())
+    with proxy.database_connection() as database:
+        database.execute("UPDATE api_tokens SET total_tokens = 1234 WHERE id = ?", (token_id,))
+        database.execute(
+            """INSERT INTO api_usage
+               (id, token_id, token_name, at, path, method, model, input_tokens, output_tokens, total_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("clear-me", token_id, "统计客户端", now, "/v1/responses", "POST", "test", 1000, 234, 1234),
+        )
+
+    before = client.get("/api/usage").json()
+    assert before["today"] == 1
+    assert before["tokens_today"] == 1234
+    assert len(before["logs"]) == 1
+    assert client.delete("/api/usage/logs").status_code == 200
+
+    after = client.get("/api/usage").json()
+    assert after["today"] == before["today"]
+    assert after["tokens_today"] == before["tokens_today"]
+    assert after["logs"] == []
+    assert proxy.database_tokens()[0]["total_tokens"] == 1234
+
+
+def test_usage_log_clear_requires_admin(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    assert client.delete("/api/usage/logs").status_code == 401
+
+
+def test_usage_rows_older_than_400_days_are_pruned_on_new_request(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    token = client.post("/api/tokens", json={"name": "保留策略客户端"}).json()["token"]
+    with proxy.database_connection() as database:
+        database.execute(
+            """INSERT INTO api_usage
+               (id, token_id, token_name, at, path, method, model, total_tokens)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?)""",
+            ("expired-usage", "旧客户端", int(time.time()) - 401 * 86400, "/v1/responses", "POST", "old", 1),
+        )
+
+    response = client.post(
+        "/v1/chat/completions",
+        content="not-json",
+        headers={"Authorization": f"Bearer {token}", "content-type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert all(item["id"] != "expired-usage" for item in proxy.database_usage())
+
+
+def test_existing_usage_schema_adds_visible_column(tmp_path: Path) -> None:
+    database_path = tmp_path / "cleanllm.db"
+    with sqlite3.connect(database_path) as database:
+        database.execute(
+            """CREATE TABLE api_usage (
+                id TEXT PRIMARY KEY, token_id TEXT, token_name TEXT NOT NULL,
+                at INTEGER NOT NULL, path TEXT NOT NULL, method TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '', latency_ms REAL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0
+            )"""
+        )
+    client_for(tmp_path)
+    with proxy.database_connection() as database:
+        columns = {row[1] for row in database.execute("PRAGMA table_info(api_usage)")}
+    assert "visible" in columns
+
+
 def test_api_token_can_expire_and_be_disabled(tmp_path: Path) -> None:
     client = client_for(tmp_path)
     login(client)
     expires_at = int(time.time()) + 3600
-    created = client.post("/api/tokens", json={"name": "限时客户端", "expires_at": expires_at})
+    created = client.post("/api/tokens", json={"name": "限时客户端", "expires_at": expires_at, "allowed_models": ["gpt-*"]})
     token_id = created.json()["id"]
     token = created.json()["token"]
     listed = client.get("/api/tokens").json()["data"][0]
     assert listed["expires_at"] == expires_at
     assert listed["status"] == "active"
+    assert listed["allowed_models"] == ["gpt-*"]
+    denied_model = client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-test", "messages": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert denied_model.status_code == 403
+
+    changed_expiration = expires_at + 3600
+    updated = client.patch(
+        f"/api/tokens/{token_id}/policy",
+        json={"expires_at": changed_expiration, "allowed_models": ["claude-*", "embedding-model"]},
+    )
+    assert updated.status_code == 200
+    listed = client.get("/api/tokens").json()["data"][0]
+    assert listed["expires_at"] == changed_expiration
+    assert listed["allowed_models"] == ["claude-*", "embedding-model"]
 
     response = client.patch(f"/api/tokens/{token_id}/status", json={"enabled": False})
     assert response.status_code == 200
@@ -242,6 +333,26 @@ def test_api_token_can_expire_and_be_disabled(tmp_path: Path) -> None:
     )
     assert denied.status_code == 401
     assert client.post("/api/tokens", json={"name": "无效", "expires_at": int(time.time()) - 1}).status_code == 422
+
+
+def test_api_token_filters_public_model_list(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    token = client.post(
+        "/api/tokens", json={"name": "模型白名单", "allowed_models": ["gpt-*", "embedding-model"]}
+    ).json()["token"]
+
+    async def fake_models(refresh=False, _=None):
+        return {"data": [
+            {"id": "gpt-test", "created": 0, "owned_by": "upstream"},
+            {"id": "embedding-model", "created": 0, "owned_by": "upstream"},
+            {"id": "claude-test", "created": 0, "owned_by": "upstream"},
+        ]}
+
+    monkeypatch.setattr(proxy, "get_models", fake_models)
+    response = client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["data"]] == ["gpt-test", "embedding-model"]
 
 
 def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path, monkeypatch) -> None:

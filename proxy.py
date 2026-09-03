@@ -174,6 +174,7 @@ class OllamaImportRequest(BaseModel):
 class ApiTokenRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     expires_at: int | None = Field(default=None, ge=1)
+    allowed_models: list[str] = Field(default_factory=list, max_length=100)
 
     @field_validator("expires_at")
     @classmethod
@@ -182,9 +183,34 @@ class ApiTokenRequest(BaseModel):
             raise ValueError("过期时间必须晚于当前时间")
         return value
 
+    @field_validator("allowed_models")
+    @classmethod
+    def validate_allowed_models(cls, values: list[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+        if any(len(value) > 200 for value in cleaned):
+            raise ValueError("单个模型规则不能超过 200 个字符")
+        return cleaned
+
 
 class ApiTokenStatusUpdate(BaseModel):
     enabled: bool
+
+
+class ApiTokenPolicyUpdate(BaseModel):
+    expires_at: int | None = Field(default=None, ge=1)
+    allowed_models: list[str] = Field(default_factory=list, max_length=100)
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expiration(cls, value: int | None) -> int | None:
+        if value is not None and value <= int(time.time()):
+            raise ValueError("过期时间必须晚于当前时间")
+        return value
+
+    @field_validator("allowed_models")
+    @classmethod
+    def validate_allowed_models(cls, values: list[str]) -> list[str]:
+        return ApiTokenRequest.validate_allowed_models(values)
 
 
 def publish_status(event: str, data: dict[str, Any]) -> None:
@@ -364,7 +390,8 @@ def database_connection() -> sqlite3.Connection:
             last_used_at INTEGER,
             expires_at INTEGER,
             enabled INTEGER NOT NULL DEFAULT 1,
-            total_tokens INTEGER NOT NULL DEFAULT 0
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            allowed_models TEXT NOT NULL DEFAULT '[]'
         );
         CREATE TABLE IF NOT EXISTS api_usage (
             id TEXT PRIMARY KEY,
@@ -378,6 +405,7 @@ def database_connection() -> sqlite3.Connection:
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
             total_tokens INTEGER NOT NULL DEFAULT 0,
+            visible INTEGER NOT NULL DEFAULT 1,
             FOREIGN KEY(token_id) REFERENCES api_tokens(id) ON DELETE SET NULL
         );
         CREATE INDEX IF NOT EXISTS idx_api_usage_at ON api_usage(at);
@@ -397,6 +425,12 @@ def database_connection() -> sqlite3.Connection:
         );
             """
         )
+        token_columns = {row[1] for row in connection.execute("PRAGMA table_info(api_tokens)")}
+        if "allowed_models" not in token_columns:
+            connection.execute("ALTER TABLE api_tokens ADD COLUMN allowed_models TEXT NOT NULL DEFAULT '[]'")
+        usage_columns = {row[1] for row in connection.execute("PRAGMA table_info(api_usage)")}
+        if "visible" not in usage_columns:
+            connection.execute("ALTER TABLE api_usage ADD COLUMN visible INTEGER NOT NULL DEFAULT 1")
         INITIALIZED_DATABASES.add(key)
     return connection
 
@@ -467,6 +501,20 @@ def token_is_active(item: dict[str, Any], now: int | None = None) -> bool:
         return False
 
 
+def token_model_rules(item: dict[str, Any]) -> list[str]:
+    value = item.get("allowed_models", "[]")
+    try:
+        rules = json.loads(value) if isinstance(value, str) else value
+    except (ValueError, TypeError):
+        return []
+    return [str(rule) for rule in rules if str(rule).strip()] if isinstance(rules, list) else []
+
+
+def token_allows_model(item: dict[str, Any], model: str) -> bool:
+    rules = token_model_rules(item)
+    return not rules or (bool(model) and any(fnmatch.fnmatchcase(model, rule) for rule in rules))
+
+
 async def require_api_token(request: Request) -> None:
     now = int(time.time())
     configured = database_tokens()
@@ -498,6 +546,9 @@ async def require_api_token(request: Request) -> None:
             model = str(body_data.get("model") or "")
     except Exception:
         pass
+    if model and not token_allows_model(matched, model):
+        raise HTTPException(status_code=403, detail=f"当前 API令牌无权使用模型：{model}")
+    request.state.api_token = matched
     usage_id = uuid.uuid4().hex
     request.state.usage_id = usage_id
     usage_item = {"id": usage_id, "token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method, "model": model, "latency_ms": None, "input_tokens": input_tokens, "output_tokens": 0, "total_tokens": input_tokens}
@@ -512,6 +563,7 @@ async def require_api_token(request: Request) -> None:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             tuple(usage_item[key] for key in ("id", "token_id", "token_name", "at", "path", "method", "model", "latency_ms", "input_tokens", "output_tokens", "total_tokens")),
         )
+        database.execute("DELETE FROM api_usage WHERE at < ?", (now - 400 * 86400,))
 
 
 def update_usage_record(usage_id: str | None, **values: Any) -> None:
@@ -1069,6 +1121,7 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
             "last_used_at": item.get("last_used_at"),
             "expires_at": expires_at,
             "enabled": bool(item.get("enabled", 1)),
+            "allowed_models": token_model_rules(item),
             "status": "active" if token_is_active(item, now) else ("disabled" if not item.get("enabled", 1) else "expired"),
             "total_tokens": max(0, int(item.get("total_tokens", 0) or 0)),
         })
@@ -1079,13 +1132,13 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
 async def create_api_token(update: ApiTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
     raw = "cln_" + secrets.token_urlsafe(24)
     token_id = uuid.uuid4().hex
-    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None, "expires_at": update.expires_at, "enabled": 1, "total_tokens": 0}
+    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None, "expires_at": update.expires_at, "enabled": 1, "total_tokens": 0, "allowed_models": json.dumps(update.allowed_models, ensure_ascii=False)}
     with database_connection() as database:
         database.execute(
             """INSERT INTO api_tokens
-               (id, name, hash, cipher, created_at, last_used_at, expires_at, enabled, total_tokens)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            tuple(item[key] for key in ("id", "name", "hash", "cipher", "created_at", "last_used_at", "expires_at", "enabled", "total_tokens")),
+               (id, name, hash, cipher, created_at, last_used_at, expires_at, enabled, total_tokens, allowed_models)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            tuple(item[key] for key in ("id", "name", "hash", "cipher", "created_at", "last_used_at", "expires_at", "enabled", "total_tokens", "allowed_models")),
         )
     return {"id": item["id"], "name": item["name"], "token": raw, "created_at": item["created_at"]}
 
@@ -1101,6 +1154,20 @@ async def update_api_token_status(
         if cursor.rowcount == 0:
             raise HTTPException(status_code=404, detail="令牌不存在")
     return {"message": "令牌已启用" if update.enabled else "令牌已停用"}
+
+
+@app.patch("/api/tokens/{token_id}/policy")
+async def update_api_token_policy(
+    token_id: str, update: ApiTokenPolicyUpdate, _: None = Depends(require_admin)
+) -> dict[str, str]:
+    with database_connection() as database:
+        cursor = database.execute(
+            "UPDATE api_tokens SET expires_at = ?, allowed_models = ? WHERE id = ?",
+            (update.expires_at, json.dumps(update.allowed_models, ensure_ascii=False), token_id),
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="令牌不存在")
+    return {"message": "令牌策略已保存"}
 
 
 @app.delete("/api/tokens/{token_id}")
@@ -1142,8 +1209,19 @@ async def api_usage(token_name: str = "", _: None = Depends(require_admin)) -> d
         "tokens_week": token_total(recent, week_start),
         "tokens_month": token_total(recent, month_start),
         "by_token": by_token,
-        "logs": list(reversed(recent[-100:])),
+        "logs": list(reversed([item for item in recent if bool(item.get("visible", 1))][-100:])),
     }
+
+
+@app.delete("/api/usage/logs")
+async def clear_usage_logs(_: None = Depends(require_admin)) -> dict[str, str]:
+    with database_connection() as database:
+        database.execute(
+            """UPDATE api_usage
+               SET visible = 0, path = '', method = '', model = '', latency_ms = NULL
+               WHERE visible = 1"""
+        )
+    return {"message": "使用日志已清除，调用与 Token 统计不受影响"}
 
 
 @app.get("/api/system/events")
@@ -1195,13 +1273,15 @@ async def get_models(refresh: bool = False, _: None = Depends(require_admin)) ->
 
 
 @app.get("/v1/models")
-async def public_models(_: None = Depends(require_api_token)) -> dict[str, Any]:
+async def public_models(request: Request, _: None = Depends(require_api_token)) -> dict[str, Any]:
     result = await get_models(False, None)
+    token = getattr(request.state, "api_token", None)
+    models = [item for item in result.get("data", []) if token is None or token_allows_model(token, str(item.get("id") or ""))]
     return {
         "object": "list",
         "data": [
             {"id": item["id"], "object": "model", "created": item.get("created") or 0, "owned_by": item.get("owned_by") or "upstream"}
-            for item in result.get("data", [])
+            for item in models
         ],
     }
 
