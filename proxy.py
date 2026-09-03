@@ -73,7 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.76")
+app = FastAPI(title="CleanLLM", version="1.0.77")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -1192,14 +1192,15 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             yield f"event: response.created\ndata: {json.dumps({'type':'response.created','response':base}, ensure_ascii=False)}\n\n"
             complete_text = ""
             selected_name = None
-            stream_payload = {**chat_payload, "stream": True}
+            stream_payload = {**payload, "stream": True}
             for upstream in route_upstreams(settings, str(payload["model"])):
                 headers = {"Content-Type": "application/json"}
                 if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
                 try:
-                    logger.info("Responses upstream request: %s -> %s", upstream["name"], upstream["url"])
+                    responses_url = upstream["url"].replace("/chat/completions", "/responses")
+                    logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
                     async with httpx.AsyncClient(timeout=None) as client:
-                        async with client.stream("POST", upstream["url"], json=stream_payload, headers=headers) as upstream_response:
+                        async with client.stream("POST", responses_url, json=stream_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
                                 continue
@@ -1208,7 +1209,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                             async for line in upstream_response.aiter_lines():
                                 if not line.startswith("data: ") or line == "data: [DONE]": continue
                                 try:
-                                    chunk = json.loads(line[6:]); delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                    chunk = json.loads(line[6:]); delta = chunk.get("delta", "") or chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
                                 except (ValueError, IndexError, AttributeError):
                                     continue
                                 if not isinstance(delta, str) or not delta: continue
@@ -1243,10 +1244,18 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             headers = {"Content-Type": "application/json"}
             if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
             try:
-                response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
+                responses_url = upstream["url"].replace("/chat/completions", "/responses")
+                logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
+                response = await client.post(responses_url, json={**payload, "stream": False}, headers=headers, timeout=float(upstream["timeout"]))
+                if response.status_code in {404, 405}:
+                    response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code >= 400: failures.append(f"{upstream['name']}: HTTP {response.status_code}"); continue
-                data = response.json(); choices = data.get("choices", [])
-                text = choices[0].get("message", {}).get("content", "") if choices else ""
+                data = response.json(); text = data.get("output_text", "")
+                if not text:
+                    output = data.get("output", [])
+                    text = "".join(part.get("text", "") for item in output if isinstance(item, dict) for part in item.get("content", []) if isinstance(part, dict))
+                if not text:
+                    choices = data.get("choices", []); text = choices[0].get("message", {}).get("content", "") if choices else ""
                 text = clean_content(text, {**settings, "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", []))})
                 now = int(time.time())
                 result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
