@@ -26,7 +26,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.panel{width:100%}.log-line .level{color:var(--primary)!important}.button{cursor:pointer!important}.stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}@media(max-width:980px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}@media(max-width:600px){.stats-grid{grid-template-columns:1fr!important}}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.69";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.71";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -108,18 +108,16 @@
     } catch(error) { notify(`保存失败：${error.message}`,true); } finally { button.disabled=false; }
   }, true);
   $("#test-connections")?.addEventListener("click", async (event) => {
-    event.currentTarget.disabled = true;
+    const button = event.currentTarget, label = button.textContent; button.textContent = "测试中…";
     try {
       const data = await request("/api/settings/test", {method:"POST"});
       $("#connection-results").innerHTML = `<div style="padding:8px 0;color:var(--primary)"><strong>总体连通性 ${data.availability_percent ?? 0}%</strong></div>` + data.results.map((item) => `<div style="padding:8px 0;color:${item.ok?'var(--green)':'var(--red)'}"><strong>${item.ok?'✓':'×'} ${escape(item.name)}</strong> · ${escape(item.detail)} ${item.latency_ms ? `(${item.latency_ms} ms)` : ""}</div>`).join("");
-    } catch (error) { notify(error.message, true); } finally { event.currentTarget.disabled = false; }
+    } catch (error) { notify(error.message, true); } finally { button.textContent = label; button.disabled = false; }
   });
   async function refreshUpstreamHealth() { try { const data = await request("/api/settings/test", {method:"POST"}); const percent = document.querySelector("#upstream-health-percent"); const meta = document.querySelector("#upstream-health-meta"); if (percent) percent.textContent = `总体连通 ${data.availability_percent ?? 0}%`; if (meta && data.checked_at) meta.textContent = `最近检测：${new Date(data.checked_at * 1000).toLocaleString("zh-CN", {hour12:false})}`; const out = document.querySelector("#upstream-health-results"); if (out) out.innerHTML = (data.results||[]).map(item => `<div class="health-row ${item.ok?'ok':'fail'}"><span>${item.ok?'●':'○'} ${escape(item.name)}</span><small>24h ${item.availability_24h ?? 0}% · 7天 ${item.availability_7d ?? 0}% · ${escape(item.detail||'')}</small></div>`).join(""); } catch (_) {} }
   refreshUpstreamHealth();
   let healthTimer; const scheduleHealth = () => { clearTimeout(healthTimer); const minutes = Math.max(1, Number(document.querySelector('#connectivity-interval')?.value || 10)); healthTimer = setTimeout(async () => { await refreshUpstreamHealth(); scheduleHealth(); }, minutes * 60000); }; scheduleHealth();
   document.querySelector('#connectivity-interval')?.addEventListener('change', async (event) => { const current = await request('/api/settings'); current.connectivity_interval_minutes = Math.max(1, Math.min(1440, Number(event.target.value) || 10)); await request('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(current)}); scheduleHealth(); notify('自动检测间隔已保存'); });
-  const runUpstreamCheck = () => { if (location.hash.slice(1) !== "upstream") return; $("#test-connections")?.click(); };
-  setInterval(runUpstreamCheck, 600000);
   $("#export-settings")?.addEventListener("click", () => location.assign("/api/settings/export"));
   $("#import-settings")?.addEventListener("change", async (event) => {
     try {
@@ -276,4 +274,4 @@ if (modelContainer) {
   observer.observe(modelContainer, {childList: true, subtree: true});
 }
 const modelTabStyle = document.createElement('style'); modelTabStyle.textContent = '.upstream-model-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.upstream-model-tabs .button{min-height:32px;padding:0 12px}.upstream-model-tabs .button.active{background:var(--primary-soft);color:var(--primary);border-color:var(--primary)}'; document.head.append(modelTabStyle);
-const healthStyle = document.createElement('style'); healthStyle.textContent = '.upstream-health-panel{margin-bottom:18px}.upstream-health-panel header strong{color:var(--primary)}.health-row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)}.health-row.ok span{color:var(--green)}.health-row.fail span{color:var(--red)}.health-row small{color:var(--muted)}'; document.head.append(healthStyle);
+const healthStyle = document.createElement('style'); healthStyle.textContent = '.page[data-view="models"].active{display:grid;gap:18px}.page[data-view="models"]>#ollama-panel{margin:0!important}.upstream-health-panel{margin-bottom:18px}.upstream-health-panel header strong{color:var(--primary)}.health-row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)}.health-row.ok span{color:var(--green)}.health-row.fail span{color:var(--red)}.health-row small{color:var(--muted)}'; document.head.append(healthStyle);

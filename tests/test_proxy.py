@@ -53,6 +53,7 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     assert loaded["default_upstream_name"] == settings["default_upstream_name"]
     assert loaded["clean_patterns"] == settings["clean_patterns"]
     assert proxy.clean_content("A<think>hidden</think>B<tag>", loaded) == "AB"
+    assert not list(tmp_path.glob("settings-*.tmp"))
 
 
 def test_invalid_regex_returns_json_validation_error(tmp_path: Path) -> None:

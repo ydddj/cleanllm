@@ -8,12 +8,12 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 import uuid
 import signal
 import socket
 import tarfile
-import tempfile
 import io
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -72,7 +72,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.69")
+app = FastAPI(title="CleanLLM", version="1.0.71")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -80,6 +80,7 @@ MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
 CONNECTIVITY_STATE: dict[str, Any] = {"checked_at": None, "results": [], "availability_percent": None}
 STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
 API_USAGE: list[dict[str, Any]] = []
+ROUTE_AFFINITY: dict[str, tuple[str, float]] = {}
 
 
 class LoginRequest(BaseModel):
@@ -354,12 +355,15 @@ def load_settings() -> dict[str, Any]:
 
 
 def save_settings(settings: dict[str, Any]) -> None:
+    temporary: Path | None = None
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        temporary = SETTINGS_FILE.with_suffix(".tmp")
-        temporary.write_text(
-            json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        handle, path = tempfile.mkstemp(prefix="settings-", suffix=".tmp", dir=DATA_DIR)
+        temporary = Path(path)
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(settings, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
         temporary.replace(SETTINGS_FILE)
         configured_limit = max(1 * 1024 * 1024, min(int(settings.get("log_max_bytes", MAX_LOG_BYTES)), 50 * 1024 * 1024))
         for handler in logger.handlers:
@@ -367,6 +371,8 @@ def save_settings(settings: dict[str, Any]) -> None:
                 handler.max_bytes = configured_limit
             logger.setLevel(getattr(logging, str(settings.get("log_level", "WARNING")).upper(), logging.WARNING))
     except OSError as exc:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
         logger.exception("Could not save settings")
         raise HTTPException(
             status_code=500, detail=f"无法保存设置，请检查数据卷写入权限：{exc}"
@@ -476,6 +482,12 @@ def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
 
 def route_upstreams(settings: dict[str, Any], model: str) -> list[dict[str, Any]]:
     upstreams = configured_upstreams(settings)
+    affinity = ROUTE_AFFINITY.get(model)
+    if affinity and affinity[1] > time.time():
+        preferred = [item for item in upstreams if item["name"] == affinity[0]]
+        if preferred:
+            return preferred + [item for item in upstreams if item not in preferred]
+        ROUTE_AFFINITY.pop(model, None)
     if MODEL_CACHE.get("data"):
         available = [item.get("upstream") for item in MODEL_CACHE["data"] if item.get("id") == model]
         if available:
@@ -1167,6 +1179,47 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
         if key in payload:
             chat_payload["max_tokens" if key == "max_output_tokens" else key] = payload[key]
     settings = load_settings(); failures = []
+    if payload.get("stream") is True:
+        response_id = f"resp-{secrets.token_hex(12)}"
+        created_at = int(time.time())
+        async def response_events():
+            base = {"id": response_id, "object": "response", "created_at": created_at, "model": payload["model"], "status": "in_progress", "output": []}
+            yield f"event: response.created\ndata: {json.dumps({'type':'response.created','response':base}, ensure_ascii=False)}\n\n"
+            complete_text = ""
+            selected_name = None
+            stream_payload = {**chat_payload, "stream": True}
+            for upstream in route_upstreams(settings, str(payload["model"])):
+                headers = {"Content-Type": "application/json"}
+                if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
+                try:
+                    async with httpx.AsyncClient(timeout=None) as client:
+                        async with client.stream("POST", upstream["url"], json=stream_payload, headers=headers) as upstream_response:
+                            if upstream_response.status_code >= 400:
+                                continue
+                            selected_name = upstream["name"]
+                            async for line in upstream_response.aiter_lines():
+                                if not line.startswith("data: ") or line == "data: [DONE]": continue
+                                try:
+                                    chunk = json.loads(line[6:]); delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                except (ValueError, IndexError, AttributeError):
+                                    continue
+                                if not isinstance(delta, str) or not delta: continue
+                                delta = clean_content(delta, {**settings, "clean_patterns": upstream.get("clean_patterns", [])})
+                                if not delta: continue
+                                complete_text += delta
+                                event = {"type": "response.output_text.delta", "delta": delta, "response_id": response_id}
+                                yield f"event: response.output_text.delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    break
+                except httpx.RequestError:
+                    continue
+            if selected_name is None:
+                failed = {**base, "status": "failed", "error": {"message": "所有上游均不可用", "type": "upstream_error"}}
+                yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
+                return
+            ROUTE_AFFINITY[str(payload["model"])] = (selected_name, time.time() + 900)
+            completed = {**base, "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": complete_text}]}]}
+            yield f"event: response.completed\ndata: {json.dumps({'type':'response.completed','response':completed}, ensure_ascii=False)}\n\n"
+        return StreamingResponse(response_events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
     async with httpx.AsyncClient() as client:
         for upstream in route_upstreams(settings, str(payload["model"])):
             headers = {"Content-Type": "application/json"}
@@ -1179,6 +1232,13 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 text = clean_content(text, {**settings, "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", []))})
                 now = int(time.time())
                 result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
+                ROUTE_AFFINITY[str(payload["model"])] = (upstream["name"], time.time() + 900)
+                if payload.get("stream") is True:
+                    async def events():
+                        yield f"event: response.created\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
+                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','delta':text,'response_id':result['id']}, ensure_ascii=False)}\n\n"
+                        yield f"event: response.completed\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
+                    return StreamingResponse(events(), media_type="text/event-stream")
                 return JSONResponse(status_code=response.status_code, content=result)
             except (httpx.RequestError, ValueError) as exc: failures.append(f"{upstream['name']}: {exc}")
     return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
@@ -1225,6 +1285,8 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     if response is None:
         return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
     logger.info("Model %s routed to %s", payload.get("model", ""), selected["name"])
+    if payload.get("model"):
+        ROUTE_AFFINITY[str(payload["model"])] = (selected["name"], time.time() + 900)
     response_settings = {**settings, "clean_patterns": selected.get("clean_patterns", settings.get("clean_patterns", []))}
     if streaming:
         async def stream_response():
