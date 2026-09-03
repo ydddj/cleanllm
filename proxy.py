@@ -667,6 +667,40 @@ async def update_settings(
     return {"message": "设置已保存"}
 
 
+def connectivity_metrics(
+    history: list[dict[str, Any]], name: str, checked_at: float
+) -> dict[str, float | int]:
+    samples = [entry for entry in history if entry.get("ts", 0) >= checked_at - 7 * 86400]
+    week_values = [
+        result.get("ok")
+        for entry in samples
+        for result in entry.get("results", [])
+        if result.get("name") == name
+    ]
+    day_values = [
+        result.get("ok")
+        for entry in samples
+        if entry.get("ts", 0) >= checked_at - 86400
+        for result in entry.get("results", [])
+        if result.get("name") == name
+    ]
+    local_now = datetime.fromtimestamp(checked_at).astimezone()
+    today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    today_values = [
+        result.get("ok")
+        for entry in samples
+        if entry.get("ts", 0) >= today_start
+        for result in entry.get("results", [])
+        if result.get("name") == name
+    ]
+    return {
+        "availability_24h": round(sum(day_values) / len(day_values) * 100, 1) if day_values else 0,
+        "availability_7d": round(sum(week_values) / len(week_values) * 100, 1) if week_values else 0,
+        "checks_today": len(today_values),
+        "failures_today": sum(1 for ok in today_values if not ok),
+    }
+
+
 @app.post("/api/settings/test")
 async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
     settings = load_settings()
@@ -700,11 +734,7 @@ async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
     save_settings(settings)
     CONNECTIVITY_STATE.update({"checked_at": checked_at, "results": results, "availability_percent": percent})
     for item in results:
-        samples = [entry for entry in settings["connectivity_history"] if entry.get("ts", 0) >= checked_at - 7 * 86400]
-        values = [r.get("ok") for entry in samples for r in entry.get("results", []) if r.get("name") == item["name"]]
-        day_values = [r.get("ok") for entry in samples if entry.get("ts", 0) >= checked_at - 86400 for r in entry.get("results", []) if r.get("name") == item["name"]]
-        item["availability_24h"] = round(sum(day_values) / len(day_values) * 100, 1) if day_values else 0
-        item["availability_7d"] = round(sum(values) / len(values) * 100, 1) if values else 0
+        item.update(connectivity_metrics(settings["connectivity_history"], item["name"], checked_at))
     return {**CONNECTIVITY_STATE}
 
 

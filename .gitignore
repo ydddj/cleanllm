@@ -5,3 +5,4 @@ __pycache__/
 venv/
 .testdata*/
 .pytest-tmp*/
+.button-test-data/

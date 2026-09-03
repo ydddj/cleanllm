@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+from datetime import datetime
 from pathlib import Path
 
 os.environ["ADMIN_PASSWORD"] = "test-password"
@@ -200,6 +201,21 @@ def test_models_url_is_derived_and_can_be_overridden() -> None:
     assert proxy.chat_url_for_target("http://ollama:11434/v1") == "http://ollama:11434/v1/chat/completions"
     assert proxy.endpoint_url_for_target("https://api.example.com/v1/chat/completions", "embeddings") == "https://api.example.com/v1/embeddings"
     assert proxy.endpoint_url_for_target("https://api.example.com/v1", "audio/speech") == "https://api.example.com/v1/audio/speech"
+
+
+def test_connectivity_metrics_include_natural_day_counts() -> None:
+    checked_at = datetime(2026, 9, 3, 12, 0).astimezone().timestamp()
+    today = datetime.fromtimestamp(checked_at).astimezone().replace(hour=8).timestamp()
+    yesterday = datetime.fromtimestamp(checked_at).astimezone().replace(day=2, hour=23).timestamp()
+    history = [
+        {"ts": yesterday, "results": [{"name": "上游 A", "ok": True}]},
+        {"ts": today, "results": [{"name": "上游 A", "ok": False}]},
+        {"ts": checked_at, "results": [{"name": "上游 A", "ok": True}]},
+    ]
+    metrics = proxy.connectivity_metrics(history, "上游 A", checked_at)
+    assert metrics["checks_today"] == 2
+    assert metrics["failures_today"] == 1
+    assert metrics["availability_7d"] == 66.7
 
 
 def test_log_api_reads_tail_and_reports_five_mb_limit(tmp_path: Path) -> None:

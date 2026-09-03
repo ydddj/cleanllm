@@ -27,6 +27,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Long-running Ollama pulls must remain streamed. Do not replace them with a short fixed timeout.
 - Format Unix timestamps in the browser as local date/time and support both seconds and milliseconds.
 - Keep the log file capped at 5 MB and preserve `/data` volume compatibility.
+- The runtime log viewer initially shows 100 newest entries, loads 100 more per action, and supports collapsing back to the initial set.
 - Ollama model definition exports should remain compatible with Open WebUI metadata; full weight exports use `.ollama.tar.gz` archives from the mounted models directory.
 - Keep the admin layout fluid on wide screens and horizontally scrollable for dense tables on narrow screens.
 - Keep navigation state in the URL hash so refresh and direct links restore the same page; release notes are a separate page from runtime logs.
@@ -39,6 +40,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
 - 多上游设置使用有序选项卡数组，数组首项始终是默认上游；默认上游名称可编辑，拖拽排序后保存顺序必须保持。
 - 模型上游路由记忆时长通过 `route_affinity_minutes` 配置，默认 15 分钟，设为 0 时关闭记忆。
+- 上游连通性按实例本地自然日展示当日检测次数和失败次数，同时保留 24 小时及 7 天连通率。
 
 ## Configuration rules
 
