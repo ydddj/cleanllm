@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import base64
 import asyncio
+import copy
 import fnmatch
 import json
 import logging
@@ -69,10 +70,10 @@ DEFAULT_SETTINGS = {
     "api_usage": [],
     "appearance_background": "",
     "appearance_backgrounds": [],
-    "appearance_glass_opacity": 49,
-    "appearance_glass_brightness": 32,
-    "appearance_glass_blur": 13,
-    "appearance_mask_opacity": 69,
+    "appearance_glass_opacity": 50,
+    "appearance_glass_brightness": 45,
+    "appearance_glass_blur": 10,
+    "appearance_mask_opacity": 50,
 }
 
 app = FastAPI(title="CleanLLM", version=APP_VERSION)
@@ -109,10 +110,10 @@ class SettingsUpdate(BaseModel):
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
     appearance_background: str = Field(default="", max_length=7_000_000)
     appearance_backgrounds: list[str] = Field(default_factory=list, max_length=20)
-    appearance_glass_opacity: int = Field(default=49, ge=0, le=100)
-    appearance_glass_brightness: int = Field(default=32, ge=0, le=100)
-    appearance_glass_blur: int = Field(default=13, ge=0, le=100)
-    appearance_mask_opacity: int = Field(default=69, ge=0, le=100)
+    appearance_glass_opacity: int = Field(default=50, ge=0, le=100)
+    appearance_glass_brightness: int = Field(default=45, ge=0, le=100)
+    appearance_glass_blur: int = Field(default=10, ge=0, le=100)
+    appearance_mask_opacity: int = Field(default=50, ge=0, le=100)
 
     @field_validator("models_api_url", "ollama_api_url")
     @classmethod
@@ -328,19 +329,42 @@ def token_plain(cipher: str, token_id: str) -> str:
     return bytes(value ^ key[index % len(key)] for index, value in enumerate(encrypted)).decode()
 
 
+def token_is_active(item: dict[str, Any], now: int | None = None) -> bool:
+    expires_at = item.get("expires_at")
+    if expires_at in (None, ""):
+        return True
+    try:
+        return int(expires_at) > (int(time.time()) if now is None else now)
+    except (TypeError, ValueError):
+        return False
+
+
 async def require_api_token(request: Request) -> None:
     settings = load_settings()
-    configured = [item for item in settings.get("api_tokens", []) if isinstance(item, dict) and item.get("hash")]
+    now = int(time.time())
+    configured = [
+        item
+        for item in settings.get("api_tokens", [])
+        if isinstance(item, dict)
+        and item.get("hash")
+    ]
     if not configured:
         return
     header = request.headers.get("authorization", "")
     supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
     digest = token_digest(supplied) if supplied else ""
-    matched = next((item for item in configured if secrets.compare_digest(digest, str(item.get("hash")))), None)
+    matched = next(
+        (
+            item
+            for item in configured
+            if secrets.compare_digest(digest, str(item.get("hash")))
+            and token_is_active(item, now)
+        ),
+        None,
+    )
     if not matched:
         raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
     matched["last_used_at"] = int(time.time())
-    save_settings(settings)
     # Keep a lightweight estimate when an upstream does not return usage metadata.
     # The request body is cached by Starlette, so downstream handlers can read it again.
     input_tokens = 0
@@ -357,6 +381,7 @@ async def require_api_token(request: Request) -> None:
     request.state.usage_id = usage_id
     usage_item = {"id": usage_id, "token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method, "model": model, "latency_ms": None, "input_tokens": input_tokens, "output_tokens": 0, "total_tokens": input_tokens}
     API_USAGE.append(usage_item); del API_USAGE[:-500]
+    matched["total_tokens"] = max(0, int(matched.get("total_tokens", 0) or 0)) + input_tokens
     settings.setdefault("api_usage", []).append(usage_item); settings["api_usage"] = settings["api_usage"][-1000:]; save_settings(settings)
 
 
@@ -364,11 +389,30 @@ def update_usage_record(usage_id: str | None, **values: Any) -> None:
     if not usage_id or not values:
         return
     settings = load_settings()
+    usage_item = None
+    previous_total = 0
     for item in reversed(settings.get("api_usage", [])):
         if isinstance(item, dict) and item.get("id") == usage_id:
+            usage_item = item
+            previous_total = max(0, int(item.get("total_tokens", 0) or 0))
             item.update(values)
             break
+    if usage_item is not None and "total_tokens" in values:
+        new_total = max(0, int(usage_item.get("total_tokens", 0) or 0))
+        delta = new_total - previous_total
+        for token in settings.get("api_tokens", []):
+            if isinstance(token, dict) and token.get("id") == usage_item.get("token_id"):
+                token["total_tokens"] = max(0, int(token.get("total_tokens", 0) or 0) + delta)
+                break
     save_settings(settings)
+
+
+def update_usage_record_safely(usage_id: str | None, **values: Any) -> None:
+    """Usage accounting must never interrupt an upstream model response."""
+    try:
+        update_usage_record(usage_id, **values)
+    except Exception as exc:
+        logger.warning("Could not persist API usage update: %s", exc)
 
 
 def usage_values(usage: Any) -> dict[str, int]:
@@ -381,8 +425,7 @@ def usage_values(usage: Any) -> dict[str, int]:
 
 
 def load_settings() -> dict[str, Any]:
-    settings = DEFAULT_SETTINGS.copy()
-    settings["clean_patterns"] = DEFAULT_PATTERNS.copy()
+    settings = copy.deepcopy(DEFAULT_SETTINGS)
     try:
         if SETTINGS_FILE.exists():
             saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
@@ -594,7 +637,7 @@ async def request_log_middleware(request: Request, call_next):
         raise
     if request.url.path != "/health":
         elapsed_ms = (time.perf_counter() - started) * 1000
-        update_usage_record(getattr(request.state, "usage_id", None), latency_ms=round(elapsed_ms, 1))
+        update_usage_record_safely(getattr(request.state, "usage_id", None), latency_ms=round(elapsed_ms, 1))
         logger.info("%s %s -> %s (%.1f ms)", request.method, request.url.path, response.status_code, elapsed_ms)
         publish_status("request", {"path": request.url.path, "status": response.status_code, "latency_ms": round(elapsed_ms)})
     return response
@@ -801,7 +844,17 @@ async def update_account(
 
 @app.get("/api/tokens")
 async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
-    items = load_settings().get("api_tokens", [])
+    settings = load_settings()
+    items = settings.get("api_tokens", [])
+    usage_by_token: dict[str, int] = {}
+    for usage in settings.get("api_usage", []):
+        if not isinstance(usage, dict):
+            continue
+        token_id = str(usage.get("token_id") or "")
+        usage_by_token[token_id] = usage_by_token.get(token_id, 0) + max(
+            0, int(usage.get("total_tokens", usage.get("tokens", 0)) or 0)
+        )
+    now = int(time.time())
     result = []
     for item in items:
         if not isinstance(item, dict):
@@ -811,7 +864,18 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
             token = token_plain(str(item.get("cipher") or ""), str(item.get("id"))) if item.get("cipher") else ""
         except (ValueError, UnicodeDecodeError):
             pass
-        result.append({"id": str(item.get("id")), "name": str(item.get("name")), "token": token, "created_at": item.get("created_at"), "last_used_at": item.get("last_used_at")})
+        token_id = str(item.get("id"))
+        expires_at = item.get("expires_at")
+        result.append({
+            "id": token_id,
+            "name": str(item.get("name")),
+            "token": token,
+            "created_at": item.get("created_at"),
+            "last_used_at": item.get("last_used_at"),
+            "expires_at": expires_at,
+            "status": "active" if token_is_active(item, now) else "expired",
+            "total_tokens": max(0, int(item.get("total_tokens", usage_by_token.get(token_id, 0)) or 0)),
+        })
     return {"data": result}
 
 
@@ -820,7 +884,7 @@ async def create_api_token(update: ApiTokenRequest, _: None = Depends(require_ad
     raw = "cln_" + secrets.token_urlsafe(24)
     settings = load_settings()
     token_id = uuid.uuid4().hex
-    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None}
+    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None, "total_tokens": 0}
     settings.setdefault("api_tokens", []).append(item)
     save_settings(settings)
     return {"id": item["id"], "name": item["name"], "token": raw, "created_at": item["created_at"]}
@@ -1278,25 +1342,97 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
 
         async def relay() -> Any:
             pending = b""
+            state: dict[str, Any] = {"completed": False, "text_done": False, "text": "", "response": None}
+
+            def inspect_line(raw_line: bytes) -> None:
+                line = raw_line.rstrip(b"\r")
+                if not line.startswith(b"data:"):
+                    return
+                data = line[5:].lstrip()
+                if not data or data == b"[DONE]":
+                    return
+                try:
+                    event = json.loads(data)
+                except (ValueError, UnicodeDecodeError):
+                    return
+                if not isinstance(event, dict):
+                    return
+                event_type = str(event.get("type") or "")
+                if event_type == "response.output_text.delta":
+                    state["text"] += str(event.get("delta") or "")
+                elif event_type == "response.output_text.done":
+                    state["text_done"] = True
+                    if not state["text"]:
+                        state["text"] = str(event.get("text") or "")
+                response_data = event.get("response")
+                if isinstance(response_data, dict):
+                    state["response"] = response_data
+                if event_type == "response.completed" or (
+                    isinstance(response_data, dict) and response_data.get("status") == "completed"
+                ):
+                    state["completed"] = True
+                    update_usage_record_safely(
+                        getattr(request.state, "usage_id", None),
+                        **usage_values(response_data.get("usage")),
+                    )
+
             try:
                 async for chunk in response.aiter_bytes():
                     pending += chunk
                     while b"\n" in pending:
                         line, pending = pending.split(b"\n", 1)
-                        if line.startswith(b"data: "):
-                            try:
-                                event = json.loads(line[6:])
-                                if isinstance(event, dict) and event.get("type") == "response.completed":
-                                    update_usage_record(getattr(request.state, "usage_id", None), **usage_values((event.get("response") or {}).get("usage")))
-                            except (ValueError, AttributeError, UnicodeDecodeError):
-                                pass
+                        inspect_line(line)
                     yield chunk
             except httpx.RequestError as exc:
                 logger.warning("Responses stream from %s disconnected: %s", upstream["name"], exc)
+                if not state["completed"]:
+                    failed = {
+                        "type": "response.failed",
+                        "response": {
+                            "id": f"resp-{secrets.token_hex(12)}",
+                            "object": "response",
+                            "created_at": int(time.time()),
+                            "model": payload.get("model"),
+                            "status": "failed",
+                            "error": {"type": "upstream_error", "message": "上游响应流意外中断"},
+                        },
+                    }
+                    yield f"\n\nevent: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
+            else:
+                if pending:
+                    inspect_line(pending)
+                if not state["completed"]:
+                    prior = state["response"] if isinstance(state["response"], dict) else {}
+                    response_id = str(prior.get("id") or f"resp-{secrets.token_hex(12)}")
+                    text = str(state["text"])
+                    completed = {
+                        **prior,
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": int(prior.get("created_at") or time.time()),
+                        "model": prior.get("model") or payload.get("model"),
+                        "status": "completed",
+                    }
+                    if not completed.get("output"):
+                        completed["output"] = [{
+                            "id": f"msg-{secrets.token_hex(8)}",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }]
+                    suffix = "\n\n"
+                    if text and not state["text_done"]:
+                        done = {"type": "response.output_text.done", "text": text, "response_id": response_id}
+                        suffix += f"event: response.output_text.done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n"
+                    suffix += f"event: response.completed\ndata: {json.dumps({'type': 'response.completed', 'response': completed}, ensure_ascii=False)}\n\n"
+                    logger.warning("Responses stream from %s ended without response.completed; appended a compatible terminal event", upstream["name"])
+                    yield suffix.encode()
             finally:
                 await response.aclose()
                 await client.aclose()
-                update_usage_record(
+                if state["completed"]:
+                    logger.info("Responses stream completed: %s", upstream["name"])
+                update_usage_record_safely(
                     getattr(request.state, "usage_id", None),
                     latency_ms=round((time.perf_counter() - started) * 1000, 1),
                 )
@@ -1358,7 +1494,7 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
             if "application/json" in response.headers.get("content-type", ""):
                 try:
                     result = response.json()
-                    update_usage_record(getattr(request.state, "usage_id", None), **usage_values(result.get("usage") if isinstance(result, dict) else {}))
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(result.get("usage") if isinstance(result, dict) else {}))
                 except ValueError:
                     pass
             return Response(
@@ -1448,7 +1584,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                         if chunk.get("type") == "response.output_text.delta": complete_text += str(chunk.get("delta", ""))
                                         if chunk.get("type") == "response.completed":
                                             native_completed = True
-                                            update_usage_record(getattr(request.state, "usage_id", None), **usage_values((chunk.get("response") or {}).get("usage")))
+                                            update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values((chunk.get("response") or {}).get("usage")))
                                         yield f"event: {event_name}\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                                         continue
                                     delta = chunk.get("delta", "") or chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
@@ -1509,7 +1645,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 text = clean_content(text, {**settings, "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", []))})
                 now = int(time.time())
                 result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
-                update_usage_record(getattr(request.state, "usage_id", None), **usage_values(data.get("usage")))
+                update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage")))
                 ROUTE_AFFINITY[str(payload["model"])] = (upstream["name"], time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
                 if payload.get("stream") is True:
                     async def events():
@@ -1578,7 +1714,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                         line, buffer = buffer.split("\n", 1)
                         if line.startswith("data: ") and line.strip() != "data: [DONE]":
                             try:
-                                update_usage_record(getattr(request.state, "usage_id", None), **usage_values(json.loads(line[6:]).get("usage")))
+                                update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(json.loads(line[6:]).get("usage")))
                             except (ValueError, AttributeError):
                                 pass
                         yield (clean_stream_line(line, response_settings) + "\n").encode("utf-8")
@@ -1603,7 +1739,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, str):
             message["content"] = clean_content(content, response_settings)
-    update_usage_record(getattr(request.state, "usage_id", None), **usage_values(data.get("usage") if isinstance(data, dict) else {}))
+    update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(data.get("usage") if isinstance(data, dict) else {}))
     return JSONResponse(status_code=response.status_code, content=data)
 
 

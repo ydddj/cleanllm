@@ -1,6 +1,7 @@
 import os
 import logging
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -169,9 +170,125 @@ def test_api_tokens_are_hashed_and_protect_proxy(tmp_path: Path) -> None:
     saved = proxy.load_settings()["api_tokens"][0]
     assert token not in proxy.SETTINGS_FILE.read_text(encoding="utf-8")
     assert saved["hash"] == proxy.token_digest(token)
-    assert "hash" not in client.get("/api/tokens").text
+    listed = client.get("/api/tokens").json()["data"][0]
+    assert "hash" not in listed
+    assert listed["status"] == "active"
+    assert listed["expires_at"] is None
+    assert listed["total_tokens"] == 0
     assert client.post("/v1/chat/completions", json={}).status_code == 401
     assert client.post("/v1/chat/completions", content="not-json", headers={"Authorization": f"Bearer {token}", "content-type": "application/json"}).status_code == 400
+
+
+def test_expired_api_token_is_listed_but_cannot_authenticate(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    token = client.post("/api/tokens", json={"name": "过期客户端"}).json()["token"]
+    settings = proxy.load_settings()
+    saved_token = next(item for item in settings["api_tokens"] if item["hash"] == proxy.token_digest(token))
+    saved_token["expires_at"] = int(time.time()) - 1
+    saved_token.pop("total_tokens", None)
+    settings["api_usage"] = [{"token_id": saved_token["id"], "total_tokens": 2_500_000}]
+    proxy.save_settings(settings)
+
+    listed = client.get("/api/tokens").json()["data"][0]
+    assert listed["status"] == "expired"
+    assert listed["total_tokens"] == 2_500_000
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": "test", "messages": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert response.status_code == 401
+
+
+def test_api_token_total_tracks_usage_updates(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    client.post("/api/tokens", json={"name": "累计客户端"})
+    settings = proxy.load_settings()
+    token_id = settings["api_tokens"][0]["id"]
+    settings["api_tokens"][0]["total_tokens"] = 4
+    settings["api_usage"] = [{"id": "usage-1", "token_id": token_id, "total_tokens": 4}]
+    proxy.save_settings(settings)
+
+    proxy.update_usage_record("usage-1", total_tokens=10)
+
+    listed = client.get("/api/tokens").json()["data"][0]
+    assert listed["total_tokens"] == 10
+
+
+def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    chunks = [
+        b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
+        b'event: response.completed\ndata: {"type":"response.com',
+        b'pleted","response":{"id":"resp_test","status":"completed","usage":{"input_tokens":1,"output_tokens":1}}}\n\n',
+    ]
+
+    class FakeResponse:
+        status_code = 200
+        is_closed = False
+
+        async def aiter_bytes(self):
+            for chunk in chunks:
+                yield chunk
+            self.is_closed = True
+
+        async def aclose(self):
+            self.is_closed = True
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/responses", json={"model": "test", "input": "hello", "stream": True})
+    assert response.status_code == 200
+    assert response.text.count("event: response.completed") == 1
+    assert '"id":"resp_test"' in response.text
+
+
+def test_native_responses_stream_appends_completed_when_upstream_omits_it(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+
+    class FakeResponse:
+        status_code = 200
+        is_closed = False
+
+        async def aiter_bytes(self):
+            yield b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"answer"}\n\n'
+            self.is_closed = True
+
+        async def aclose(self):
+            self.is_closed = True
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/responses", json={"model": "test", "input": "hello", "stream": True})
+    assert response.status_code == 200
+    assert response.text.count("event: response.completed") == 1
+    assert '"text": "answer"' in response.text
 
 
 def test_usage_token_fields_are_normalized() -> None:
