@@ -178,6 +178,8 @@ def test_models_url_is_derived_and_can_be_overridden() -> None:
             "models_api_url": "http://custom:9000/catalog",
         }
     ) == "http://custom:9000/catalog"
+    assert proxy.chat_url_for_target("http://ollama:11434") == "http://ollama:11434/v1/chat/completions"
+    assert proxy.chat_url_for_target("http://ollama:11434/v1") == "http://ollama:11434/v1/chat/completions"
 
 
 def test_log_api_reads_tail_and_reports_five_mb_limit(tmp_path: Path) -> None:

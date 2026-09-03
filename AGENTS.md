@@ -36,6 +36,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Theme selection must persist both `dark` and `light` values across refreshes; never treat a saved light choice as missing.
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
 - 多上游设置使用有序选项卡数组，数组首项始终是默认上游；默认上游名称可编辑，拖拽排序后保存顺序必须保持。
+- 模型上游路由记忆时长通过 `route_affinity_minutes` 配置，默认 15 分钟，设为 0 时关闭记忆。
 
 ## Configuration rules
 

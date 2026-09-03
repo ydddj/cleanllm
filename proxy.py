@@ -60,6 +60,7 @@ DEFAULT_SETTINGS = {
     "log_level": os.getenv("LOG_LEVEL", "WARNING").upper(),
     "model_cache_ttl": int(os.getenv("MODEL_CACHE_TTL", "60")),
     "connectivity_interval_minutes": int(os.getenv("CONNECTIVITY_INTERVAL_MINUTES", "10")),
+    "route_affinity_minutes": int(os.getenv("ROUTE_AFFINITY_MINUTES", "15")),
     "connectivity_history": [],
     "api_tokens": [],
     "export_history": [],
@@ -72,7 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.71")
+app = FastAPI(title="CleanLLM", version="1.0.73")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -101,6 +102,7 @@ class SettingsUpdate(BaseModel):
     model_routes: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     model_cache_ttl: int = Field(default=60, ge=0, le=86400)
     connectivity_interval_minutes: int = Field(default=10, ge=1, le=1440)
+    route_affinity_minutes: int = Field(default=15, ge=0, le=1440)
     connectivity_history: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
     appearance_background: str = Field(default="", max_length=7_000_000)
@@ -1179,6 +1181,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
         if key in payload:
             chat_payload["max_tokens" if key == "max_output_tokens" else key] = payload[key]
     settings = load_settings(); failures = []
+    logger.info("Responses request received for model %s (stream=%s)", payload["model"], payload.get("stream") is True)
     if payload.get("stream") is True:
         response_id = f"resp-{secrets.token_hex(12)}"
         created_at = int(time.time())
@@ -1195,6 +1198,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     async with httpx.AsyncClient(timeout=None) as client:
                         async with client.stream("POST", upstream["url"], json=stream_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
+                                logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
                                 continue
                             selected_name = upstream["name"]
                             async for line in upstream_response.aiter_lines():
@@ -1216,7 +1220,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 failed = {**base, "status": "failed", "error": {"message": "所有上游均不可用", "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
-            ROUTE_AFFINITY[str(payload["model"])] = (selected_name, time.time() + 900)
+            ROUTE_AFFINITY[str(payload["model"])] = (selected_name, time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
             completed = {**base, "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": complete_text}]}]}
             yield f"event: response.completed\ndata: {json.dumps({'type':'response.completed','response':completed}, ensure_ascii=False)}\n\n"
         return StreamingResponse(response_events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
@@ -1232,7 +1236,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 text = clean_content(text, {**settings, "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", []))})
                 now = int(time.time())
                 result = {"id": f"resp-{secrets.token_hex(12)}", "object": "response", "created_at": now, "model": payload["model"], "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]}], "usage": data.get("usage", {})}
-                ROUTE_AFFINITY[str(payload["model"])] = (upstream["name"], time.time() + 900)
+                ROUTE_AFFINITY[str(payload["model"])] = (upstream["name"], time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
                 if payload.get("stream") is True:
                     async def events():
                         yield f"event: response.created\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
@@ -1240,7 +1244,9 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         yield f"event: response.completed\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
                     return StreamingResponse(events(), media_type="text/event-stream")
                 return JSONResponse(status_code=response.status_code, content=result)
-            except (httpx.RequestError, ValueError) as exc: failures.append(f"{upstream['name']}: {exc}")
+            except (httpx.RequestError, ValueError) as exc:
+                logger.warning("Responses upstream %s failed: %s", upstream["name"], exc)
+                failures.append(f"{upstream['name']}: {exc}")
     return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
 
 
@@ -1286,7 +1292,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         return JSONResponse(status_code=502, content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}})
     logger.info("Model %s routed to %s", payload.get("model", ""), selected["name"])
     if payload.get("model"):
-        ROUTE_AFFINITY[str(payload["model"])] = (selected["name"], time.time() + 900)
+        ROUTE_AFFINITY[str(payload["model"])] = (selected["name"], time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
     response_settings = {**settings, "clean_patterns": selected.get("clean_patterns", settings.get("clean_patterns", []))}
     if streaming:
         async def stream_response():
