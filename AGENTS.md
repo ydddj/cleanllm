@@ -34,6 +34,8 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Keep hover hints limited to important icon-only controls; do not add redundant tooltips to ordinary labeled buttons.
 - Default both login and admin pages to dark mode before application scripts run, avoiding a light-theme flash; log level colors must use theme variables.
 - Theme selection must persist both `dark` and `light` values across refreshes; never treat a saved light choice as missing.
+- All `<select>` and numeric inputs must hide native browser arrows and use the shared CSS-drawn control styling.
+- Keep each release under its own `##` heading in `CHANGELOG.md`; never append new release bullets to an older version section.
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
 - 多上游设置使用有序选项卡数组，数组首项始终是默认上游；默认上游名称可编辑，拖拽排序后保存顺序必须保持。
 - 模型上游路由记忆时长通过 `route_affinity_minutes` 配置，默认 15 分钟，设为 0 时关闭记忆。
