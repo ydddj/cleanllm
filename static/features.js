@@ -26,7 +26,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.panel{width:100%}.log-line .level{color:var(--primary)!important}.button{cursor:pointer!important}.stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}@media(max-width:980px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}@media(max-width:600px){.stats-grid{grid-template-columns:1fr!important}}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.81";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.83";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -66,7 +66,7 @@
   $("#save-log-limit")?.addEventListener("click", async () => { try { const current=await request("/api/settings"), mb=Number($("#log-max-mb").value); current.log_max_bytes=mb*1048576; current.log_level=$("#log-level")?.value||"WARNING"; await request("/api/settings", {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(current)}); notify(`日志设置已保存：${current.log_level}`); } catch(error) { notify(error.message,true); } });
   let upstreamTabsReady = Promise.resolve();
   if (patterns) {
-    patterns.closest("form")?.insertAdjacentHTML("beforebegin", '<section class="panel upstream-health-panel"><header class="panel-header"><div><h2>上游连通性</h2><p id="upstream-health-meta">每 10 分钟自动测试（范围为 1 至 1440 分钟，默认 10 分钟）</p></div><span id="upstream-health-percent" class="tag purple">等待检测</span><div class="health-controls"><label class="health-interval">检测间隔 <input id="connectivity-interval" type="number" min="1" max="1440" value="10"> 分钟</label><label class="health-interval">路由记忆 <input id="route-affinity-minutes" type="number" min="0" max="1440" value="15"> 分钟</label></div></header><div id="upstream-health-results" class="panel-body"></div></section>');
+    patterns.closest("form")?.insertAdjacentHTML("beforebegin", '<section class="panel upstream-health-panel"><header class="panel-header"><div><h2>上游连通性</h2><p id="upstream-health-meta">检测结果每 10 分钟自动更新</p><p id="upstream-health-range" class="form-note">范围为 1 至 1440 分钟</p></div><span id="upstream-health-percent" class="tag purple">等待检测</span><div class="health-controls"><label class="health-interval">检测间隔 <input id="connectivity-interval" type="number" min="1" max="1440" value="10"> 分钟</label><label class="health-interval">路由记忆 <input id="route-affinity-minutes" type="number" min="0" max="1440" value="15"> 分钟</label></div></header><div id="upstream-health-results" class="panel-body"></div></section>');
     const healthPanel = document.querySelector('.upstream-health-panel'), proxyPanel = patterns.closest('section.panel'); if (healthPanel && proxyPanel?.parentNode) proxyPanel.parentNode.insertBefore(healthPanel, proxyPanel);
     patterns.insertAdjacentHTML("beforebegin", `<label class="field wide"><span>备用上游（JSON）</span><textarea id="upstreams" rows="6" spellcheck="false" placeholder='[{"name":"备用","url":"http://server/v1/chat/completions","api_key":""}]'></textarea><small>默认上游失败后按顺序切换。</small></label><label class="field wide"><span>模型路由（JSON）</span><textarea id="model_routes" rows="5" spellcheck="false" placeholder='[{"pattern":"qwen*","upstreams":["默认上游","备用"]}]'></textarea><small>支持 * 和 ? 通配符。</small></label>`);
     const footer = $("#settings-form .form-footer");
@@ -114,7 +114,7 @@
       $("#connection-results").innerHTML = `<div style="padding:8px 0;color:var(--primary)"><strong>总体连通性 ${data.availability_percent ?? 0}%</strong></div>` + data.results.map((item) => `<div style="padding:8px 0;color:${item.ok?'var(--green)':'var(--red)'}"><strong>${item.ok?'✓':'×'} ${escape(item.name)}</strong> · ${escape(item.detail)} ${item.latency_ms ? `(${item.latency_ms} ms)` : ""}</div>`).join("");
     } catch (error) { notify(error.message, true); } finally { button.textContent = label; button.disabled = false; }
   });
-  async function refreshUpstreamHealth() { try { const data = await request("/api/settings/test", {method:"POST"}); const percent = document.querySelector("#upstream-health-percent"); const meta = document.querySelector("#upstream-health-meta"); if (percent) percent.textContent = `总体连通 ${data.availability_percent ?? 0}%`; if (meta && data.checked_at) meta.textContent = `最近检测：${new Date(data.checked_at * 1000).toLocaleString("zh-CN", {hour12:false})}`; const out = document.querySelector("#upstream-health-results"); if (out) out.innerHTML = `<div class="health-table-head"><span>上游</span><span>状态</span><span>24h 连通</span><span>7 天连通</span><span>最近检测</span></div>` + (data.results||[]).map(item => `<div class="health-row ${item.ok?'ok':'fail'}"><span>${escape(item.name)}</span><span>${item.ok?'正常':'异常'}</span><span>${item.availability_24h ?? 0}%</span><span>${item.availability_7d ?? 0}%</span><span>${data.checked_at?new Date(data.checked_at*1000).toLocaleString('zh-CN',{hour12:false}):'—'}</span></div>`).join(""); } catch (_) {} }
+  async function refreshUpstreamHealth() { try { const data = await request("/api/settings/test", {method:"POST"}); const percent = document.querySelector("#upstream-health-percent"); const meta = document.querySelector("#upstream-health-meta"); if (percent) percent.textContent = `总体连通 ${data.availability_percent ?? 0}%`; if (meta) meta.textContent = data.checked_at ? `最近检测：${new Date(data.checked_at * 1000).toLocaleString("zh-CN", {hour12:false})}` : "检测结果每 10 分钟自动更新"; const out = document.querySelector("#upstream-health-results"); if (out) out.innerHTML = `<div class="health-table-head"><span>上游</span><span>状态</span><span>24h 连通</span><span>7 天连通</span><span>最近检测</span></div>` + (data.results||[]).map(item => `<div class="health-row ${item.ok?'ok':'fail'}"><span>${escape(item.name)}</span><span>${item.ok?'正常':'异常'}</span><span>${item.availability_24h ?? 0}%</span><span>${item.availability_7d ?? 0}%</span><span>${data.checked_at?new Date(data.checked_at*1000).toLocaleString('zh-CN',{hour12:false}):'—'}</span></div>`).join(""); } catch (_) {} }
   refreshUpstreamHealth();
   let healthTimer; const scheduleHealth = () => { clearTimeout(healthTimer); const minutes = Math.max(1, Number(document.querySelector('#connectivity-interval')?.value || 10)); healthTimer = setTimeout(async () => { await refreshUpstreamHealth(); scheduleHealth(); }, minutes * 60000); }; scheduleHealth();
   document.querySelector('#connectivity-interval')?.addEventListener('change', async (event) => { const current = await request('/api/settings'); current.connectivity_interval_minutes = Math.max(1, Math.min(1440, Number(event.target.value) || 10)); await request('/api/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(current)}); scheduleHealth(); notify('自动检测间隔已保存'); });
@@ -271,18 +271,35 @@
   background-repeat: no-repeat;
   background-position: right 12px center;
   background-size: 12px 8px;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' fill='none' stroke='%2398a1b3' stroke-width='1.5'/%3E%3C/svg%3E") !important;
+  background-image: url(data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%228%22%20viewBox%3D%220%200%2012%208%22%3E%3Cpath%20d%3D%22M1%201l5%205%205-5%22%20fill%3D%22none%22%20stroke%3D%22%2398a1b3%22%20stroke-width%3D%221.5%22%2F%3E%3C%2Fsvg%3E) !important;
   color: var(--text);
   font: inherit;
   cursor: pointer;
 }
+.page select { background-color: var(--soft) !important; }
 .health-controls select,
 .topbar select { height: 32px; }
-.page select:focus { outline: 2px solid color-mix(in srgb, var(--primary) 35%, transparent); outline-offset: 1px; }
-input[type="number"] { appearance: none; -webkit-appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='22' viewBox='0 0 12 22'%3E%3Cpath d='M2 8l4-4 4 4M2 14l4 4 4-4' fill='none' stroke='%2398a1b3' stroke-width='1.5'/%3E%3C/svg%3E") !important; background-repeat: no-repeat !important; background-position: right 8px center !important; background-size: 12px 22px !important; padding-right: 28px !important; }
+.page select:focus { outline: none; border-color: var(--border); box-shadow: none; }
+input[type="number"] { appearance: none; -webkit-appearance: none; background-image: url(data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2212%22%20height%3D%2222%22%20viewBox%3D%220%200%2012%2022%22%3E%3Cpath%20d%3D%22M2%208l4-4%204%204M2%2014l4%204%204-4%22%20fill%3D%22none%22%20stroke%3D%22%2398a1b3%22%20stroke-width%3D%221.5%22%2F%3E%3C%2Fsvg%3E) !important; background-repeat: no-repeat !important; background-position: right 8px center !important; background-size: 12px 22px !important; padding-right: 28px !important; }
 input[type="number"]::-webkit-inner-spin-button, input[type="number"]::-webkit-outer-spin-button { opacity: 0; appearance: none; -webkit-appearance: none; margin: 0; }
 `;
   document.head.append(selectStyle);
+  document.querySelectorAll('input[type="number"]').forEach((input) => {
+    if (input.dataset.stepperBound) return;
+    input.dataset.stepperBound = "1";
+    input.addEventListener("click", (event) => {
+      const rect = input.getBoundingClientRect();
+      if (event.clientX < rect.right - 32) return;
+      const midpoint = rect.top + rect.height / 2;
+      const step = Number(input.step) > 0 ? Number(input.step) : 1;
+      const min = input.min === "" ? -Infinity : Number(input.min);
+      const max = input.max === "" ? Infinity : Number(input.max);
+      const next = Number(input.value || 0) + (event.clientY < midpoint ? step : -step);
+      input.value = String(Math.min(max, Math.max(min, next)));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  });
 })();
 
 // Group the aggregated model table by upstream without changing the API data model.
@@ -298,11 +315,11 @@ if (modelContainer) {
     table.dataset.grouped = 'true';
     const tabs = document.createElement('div'); tabs.className = 'upstream-model-tabs';
     const body = table.querySelector('tbody');
-    const select = key => { body.replaceChildren(...groups.get(key)); tabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.upstream === key)); };
+    const select = key => { body.replaceChildren(...groups.get(key)); tabs.querySelectorAll('button').forEach(b => b.classList.toggle('active', b.dataset.upstream === key)); const count = document.querySelector('#models-count'); if (count) count.textContent = `${groups.get(key).length} 个模型`; };
     groups.forEach((_, key) => { const button = document.createElement('button'); button.type = 'button'; button.className = 'button'; button.dataset.upstream = key; button.textContent = key; button.onclick = () => select(key); tabs.append(button); });
     table.before(tabs); select(groups.keys().next().value);
   });
   observer.observe(modelContainer, {childList: true, subtree: true});
 }
 const modelTabStyle = document.createElement('style'); modelTabStyle.textContent = '.upstream-model-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.upstream-model-tabs .button{min-height:32px;padding:0 12px}.upstream-model-tabs .button.active{background:var(--primary-soft);color:var(--primary);border-color:var(--primary)}'; document.head.append(modelTabStyle);
-const healthStyle = document.createElement('style'); healthStyle.textContent = '.page[data-view="models"].active{display:grid;gap:18px}.page[data-view="models"]>#ollama-panel{margin:0!important}.upstream-health-panel{margin-bottom:18px}.health-controls{display:flex;align-items:center;gap:10px}.health-interval{display:inline-flex;align-items:center;gap:5px;color:var(--muted);font-size:12px;white-space:nowrap}.health-interval input{width:58px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft);color:var(--text)}.health-table-head,.health-row{display:grid;grid-template-columns:1.5fr .7fr .8fr .8fr 1.4fr;align-items:center;gap:14px}.health-table-head{padding:0 0 10px;color:var(--muted2);font-size:11px;border-bottom:1px solid var(--border)}.health-row{padding:13px 0;border-bottom:1px solid var(--border);color:var(--muted)}.health-row:last-child{border-bottom:0}.health-row.ok span:nth-child(1),.health-row.ok span:nth-child(2){color:var(--green)}.health-row.fail span:nth-child(1),.health-row.fail span:nth-child(2){color:var(--red)}.release-note{padding:16px 18px;margin:0 0 14px;border:1px solid var(--border);border-radius:12px;background:var(--soft)}.release-note h3{margin:0 0 9px;color:var(--primary);font-size:14px}.release-note ul{margin:0;padding-left:20px;font-size:12px;line-height:1.8}.changelog-actions{display:flex;gap:9px}.settings-grid>.panel{margin:0!important}.usage-panel{margin-top:18px!important}@media(max-width:900px){.health-controls{flex-wrap:wrap;justify-content:flex-end}.health-table-head,.health-row{grid-template-columns:1.2fr .6fr .8fr .8fr 1.3fr;gap:8px;font-size:11px}}'; document.head.append(healthStyle);
+const healthStyle = document.createElement('style'); healthStyle.textContent = '.page[data-view="models"].active{display:grid;gap:18px}.page[data-view="models"]>#ollama-panel{margin:0!important}.upstream-health-panel{margin-bottom:18px}.upstream-health-panel .panel-header{position:relative}.upstream-health-panel .panel-header>div:first-child{min-width:240px}.upstream-health-range{margin-top:2px!important}.health-controls{display:flex;align-items:center;gap:10px}.health-interval{display:inline-flex;align-items:center;gap:5px;color:var(--muted);font-size:12px;white-space:nowrap}.health-interval input{width:58px;height:32px;padding:0 7px;border:1px solid var(--border);border-radius:8px;background:var(--soft);color:var(--text)}.health-table-head,.health-row{display:grid;grid-template-columns:1.5fr .7fr .8fr .8fr 1.4fr;align-items:center;gap:14px}.health-table-head{padding:0 0 10px;color:var(--muted2);font-size:11px;border-bottom:1px solid var(--border)}.health-row{padding:13px 0;border-bottom:1px solid var(--border);color:var(--muted)}.health-row:last-child{border-bottom:0}.health-row.ok span:nth-child(1),.health-row.ok span:nth-child(2){color:var(--green)}.health-row.fail span:nth-child(1),.health-row.fail span:nth-child(2){color:var(--red)}.release-note{padding:16px 18px;margin:0 0 14px;border:1px solid var(--border);border-radius:12px;background:var(--soft)}.release-note h3{margin:0 0 9px;color:var(--primary);font-size:14px}.release-note ul{margin:0;padding-left:20px;font-size:12px;line-height:1.8}.changelog-actions{display:flex;gap:9px}.settings-grid>.panel{margin:0!important}.usage-panel{margin-top:18px!important}@media(max-width:900px){.upstream-health-panel .panel-header{flex-wrap:wrap}.health-controls{width:100%;justify-content:flex-end;flex-wrap:wrap}.health-table-head,.health-row{grid-template-columns:1.2fr .6fr .8fr .8fr 1.3fr;gap:8px;font-size:11px}}'; document.head.append(healthStyle);
