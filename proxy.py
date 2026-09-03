@@ -73,7 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.77")
+app = FastAPI(title="CleanLLM", version="1.0.78")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -1192,6 +1192,8 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             yield f"event: response.created\ndata: {json.dumps({'type':'response.created','response':base}, ensure_ascii=False)}\n\n"
             complete_text = ""
             selected_name = None
+            sequence_number = 0
+            item_id = f"msg-{secrets.token_hex(8)}"
             stream_payload = {**payload, "stream": True}
             for upstream in route_upstreams(settings, str(payload["model"])):
                 headers = {"Content-Type": "application/json"}
@@ -1217,7 +1219,8 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                 if not delta: continue
                                 complete_text += delta
                                 emitted = True
-                                event = {"type": "response.output_text.delta", "delta": delta, "response_id": response_id}
+                                sequence_number += 1
+                                event = {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta, "response_id": response_id, "sequence_number": sequence_number}
                                 yield f"event: response.output_text.delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
                             if not emitted and "application/json" in upstream_response.headers.get("content-type", ""):
                                 try:
@@ -1225,7 +1228,8 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                     delta = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                                     if isinstance(delta, str) and delta:
                                         complete_text += clean_content(delta, {**settings, "clean_patterns": upstream.get("clean_patterns", [])})
-                                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','delta':complete_text,'response_id':response_id}, ensure_ascii=False)}\n\n"
+                                        sequence_number += 1
+                                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','item_id':item_id,'output_index':0,'content_index':0,'delta':complete_text,'response_id':response_id,'sequence_number':sequence_number}, ensure_ascii=False)}\n\n"
                                 except (ValueError, IndexError, AttributeError):
                                     pass
                     break
@@ -1236,7 +1240,10 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
             ROUTE_AFFINITY[str(payload["model"])] = (selected_name, time.time() + int(settings.get("route_affinity_minutes", 15)) * 60)
-            completed = {**base, "status": "completed", "output": [{"id": f"msg-{secrets.token_hex(8)}", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": complete_text}]}]}
+            completed = {**base, "status": "completed", "output": [{"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": complete_text}]}]}
+            sequence_number += 1
+            completed["sequence_number"] = sequence_number
+            yield f"event: response.output_text.done\ndata: {json.dumps({'type':'response.output_text.done','item_id':item_id,'output_index':0,'content_index':0,'text':complete_text,'response_id':response_id,'sequence_number':sequence_number}, ensure_ascii=False)}\n\n"
             yield f"event: response.completed\ndata: {json.dumps({'type':'response.completed','response':completed}, ensure_ascii=False)}\n\n"
         return StreamingResponse(response_events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
     async with httpx.AsyncClient() as client:
