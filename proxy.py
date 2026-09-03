@@ -1116,8 +1116,13 @@ async def run_connectivity_test(settings: dict[str, Any] | None = None) -> dict[
                 started = time.perf_counter()
                 try:
                     response = await client.get(upstream["models_url"], headers=headers, timeout=8.0)
-                    response.raise_for_status()
-                    results.append({"name": upstream["name"], "ok": True, "latency_ms": round((time.perf_counter()-started)*1000), "detail": "模型接口正常"})
+                    if response.status_code in {404, 405}:
+                        # Some OpenAI-compatible providers intentionally omit /models.
+                        # Probe the configured chat endpoint so transport health remains useful.
+                        response = await client.get(upstream["url"], headers=headers, timeout=8.0)
+                    if response.status_code >= 500 or response.status_code in {401, 403}:
+                        response.raise_for_status()
+                    results.append({"name": upstream["name"], "ok": True, "latency_ms": round((time.perf_counter()-started)*1000), "detail": "上游接口可达"})
                 except Exception as exc:
                     results.append({"name": upstream["name"], "ok": False, "latency_ms": round((time.perf_counter()-started)*1000), "detail": str(exc)})
         checked = len(results)
