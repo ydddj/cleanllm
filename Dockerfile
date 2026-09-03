@@ -14,6 +14,6 @@ COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN mkdir -p /data && chown -R 10001:10001 /app /data
 EXPOSE 11515
 VOLUME ["/data"]
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11515/health', timeout=3)"
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:11515/health/ready', timeout=3)"
 ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["uvicorn", "proxy:app", "--host", "0.0.0.0", "--port", "11515"]

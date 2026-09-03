@@ -3,6 +3,8 @@ import logging
 import json
 import sqlite3
 import time
+import io
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -646,13 +648,23 @@ def test_usage_token_fields_are_normalized() -> None:
     assert proxy.usage_values({"prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19}) == {
         "input_tokens": 12,
         "output_tokens": 7,
+        "cached_tokens": 0,
         "total_tokens": 19,
     }
     assert proxy.usage_values({"input_tokens": 8, "output_tokens": 3}) == {
         "input_tokens": 8,
         "output_tokens": 3,
+        "cached_tokens": 0,
         "total_tokens": 11,
     }
+
+
+def test_usage_values_reads_cached_tokens() -> None:
+    assert proxy.usage_values({
+        "input_tokens": 100,
+        "output_tokens": 20,
+        "input_tokens_details": {"cached_tokens": 80},
+    }) == {"input_tokens": 100, "output_tokens": 20, "cached_tokens": 80, "total_tokens": 120}
 
 
 def test_models_url_is_derived_and_can_be_overridden() -> None:
@@ -893,3 +905,171 @@ def test_capped_log_handler_never_keeps_an_oversized_file(tmp_path: Path) -> Non
         test_logger.info("line %s %s", index, "x" * 30)
     handler.close()
     assert path.stat().st_size <= 512
+
+
+def test_pricing_and_analytics_are_persisted(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = client.get("/api/settings").json()
+    settings["model_pricing"] = [{
+        "pattern": "gpt-*", "upstream": "", "input_price": 2.0,
+        "output_price": 8.0, "cached_price": 0.5,
+    }]
+    assert client.put("/api/settings", json=settings).status_code == 200
+    now = int(time.time())
+    with proxy.database_connection() as database:
+        database.execute(
+            """INSERT INTO api_usage
+               (id, token_name, at, path, method, model, resolved_model, upstream,
+                latency_ms, input_tokens, output_tokens, cached_tokens, total_tokens, status_code)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("priced", "demo", now, "/v1/responses", "POST", "gpt-alias", "gpt-real", "primary", 250, 1000, 500, 800, 1500, 200),
+        )
+    proxy.update_usage_record("priced", total_tokens=1500)
+    with proxy.database_connection() as database:
+        cost = database.execute("SELECT cost_usd FROM api_usage WHERE id = 'priced'").fetchone()[0]
+    assert cost == 0.0048
+    analytics = client.get("/api/analytics?days=1&group_by=model")
+    assert analytics.status_code == 200
+    assert analytics.json()["overview"]["calls"] == 1
+    assert analytics.json()["overview"]["p95_latency"] == 250
+    assert analytics.json()["groups"][0]["cost"] == 0.0048
+    exported = client.get("/api/analytics/export?days=1&group_by=model")
+    assert exported.status_code == 200
+    assert "text/csv" in exported.headers["content-type"]
+    assert "gpt-alias" in exported.text
+
+
+def test_token_monthly_budget_can_disable_token(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = client.get("/api/settings").json()
+    settings["model_pricing"] = [{"pattern": "*", "upstream": "", "input_price": 1000, "output_price": 0, "cached_price": 0}]
+    assert client.put("/api/settings", json=settings).status_code == 200
+    created = client.post("/api/tokens", json={"name": "budget", "monthly_budget_usd": 0.0001, "budget_action": "disable"}).json()
+    token = proxy.database_tokens()[0]
+    message = proxy.token_limit_error(token, int(time.time()), 1000, "gpt-test")
+    assert "自动停用" in message
+    assert proxy.database_tokens()[0]["enabled"] == 0
+
+
+def test_config_snapshots_restore_and_backup(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    initial = client.get("/api/settings").json()
+    initial["default_upstream_name"] = "before"
+    assert client.put("/api/settings", json=initial).status_code == 200
+    snapshot = client.post("/api/settings/snapshots", json={"reason": "known good"})
+    assert snapshot.status_code == 200
+    changed = client.get("/api/settings").json()
+    changed["default_upstream_name"] = "after"
+    assert client.put("/api/settings", json=changed).status_code == 200
+    restored = client.post(f"/api/settings/snapshots/{snapshot.json()['id']}/restore")
+    assert restored.status_code == 200
+    assert client.get("/api/settings").json()["default_upstream_name"] == "before"
+    backup = client.get("/api/backup")
+    assert backup.status_code == 200
+    assert backup.headers["content-type"] == "application/zip"
+    with zipfile.ZipFile(io.BytesIO(backup.content)) as archive:
+        assert {"settings.json", "cleanllm.db", "manifest.json"}.issubset(archive.namelist())
+
+
+def test_health_and_prometheus_metrics(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    assert client.get("/health/live").json()["status"] == "alive"
+    assert client.get("/health/ready").status_code == 200
+    metrics = client.get("/metrics")
+    assert metrics.status_code == 200
+    assert "cleanllm_requests_total" in metrics.text
+    assert "cleanllm_tokens_total" in metrics.text
+
+
+def test_second_stage_management_apis_require_admin(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    assert client.get("/api/analytics").status_code == 401
+    assert client.get("/api/settings/snapshots").status_code == 401
+    assert client.get("/api/backup").status_code == 401
+    assert client.post("/api/alerts/test", json={"url": "http://example.test/hook"}).status_code == 401
+
+
+def test_upstream_batch_status_and_safe_export(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = client.get("/api/settings").json()
+    settings["api_key"] = "primary-secret"
+    settings["upstreams"] = [{"name": "备用", "url": "http://backup/v1", "api_key": "backup-secret"}]
+    assert client.put("/api/settings", json=settings).status_code == 200
+
+    disabled = client.patch("/api/upstreams/status", json={"names": ["备用"], "enabled": False})
+    assert disabled.status_code == 200
+    loaded = client.get("/api/settings").json()
+    assert loaded["upstreams"][0]["enabled"] is False
+    assert [item["name"] for item in proxy.configured_upstreams(loaded)] == ["默认上游"]
+
+    exported = client.get("/api/upstreams/export")
+    assert exported.status_code == 200
+    payload = exported.json()
+    assert [item["api_key"] for item in payload["upstreams"]] == ["", ""]
+    assert "primary-secret" not in exported.text
+    assert "backup-secret" not in exported.text
+
+    cannot_disable_all = client.patch("/api/upstreams/status", json={"names": ["默认上游"], "enabled": False})
+    assert cannot_disable_all.status_code == 422
+
+
+def test_upstream_import_renames_duplicates(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    imported = client.post("/api/upstreams/import", json={
+        "mode": "append",
+        "upstreams": [{"name": "默认上游", "url": "http://second/v1", "enabled": True}],
+    })
+    assert imported.status_code == 200, imported.text
+    names = [client.get("/api/settings").json()["default_upstream_name"], *[
+        item["name"] for item in client.get("/api/settings").json()["upstreams"]
+    ]]
+    assert names == ["默认上游", "默认上游 2"]
+
+
+def test_model_metadata_normalizes_context_capabilities_and_interfaces() -> None:
+    metadata = proxy.model_metadata({
+        "context_window": 128000,
+        "capabilities": {"tools": True, "audio": False},
+        "supported_endpoints": ["/v1/chat/completions", "/v1/responses"],
+    }, "vision-model")
+    assert metadata["context_length"] == 128000
+    assert metadata["capabilities"] == ["tools", "vision"]
+    assert metadata["interfaces"] == ["v1/chat/completions", "v1/responses"]
+    assert proxy.model_metadata({}, "text-embedding-3-small")["interfaces"] == ["v1/embeddings"]
+
+
+def test_token_note_ip_allowlist_and_audit_log(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    created = client.post("/api/tokens", json={
+        "name": "restricted",
+        "note": "office client",
+        "ip_allowlist": ["10.0.0.25", "2001:db8::/32"],
+    })
+    assert created.status_code == 200, created.text
+    listed = client.get("/api/tokens").json()["data"][0]
+    assert listed["note"] == "office client"
+    assert listed["ip_allowlist"] == ["10.0.0.25/32", "2001:db8::/32"]
+    saved = proxy.database_tokens()[0]
+    assert proxy.token_allows_ip(saved, "10.0.0.25")
+    assert not proxy.token_allows_ip(saved, "10.0.0.26")
+
+    rejected = client.get("/v1/models", headers={"Authorization": f"Bearer {created.json()['token']}"})
+    assert rejected.status_code == 403
+    assert "IP" in rejected.json()["detail"]
+    audit = client.get("/api/audit/logs").json()["data"]
+    assert any(item["action"] == "创建令牌" and item["actor"] == "admin" for item in audit)
+    assert all("office client" not in json.dumps(item) for item in audit)
+
+
+def test_third_stage_management_apis_require_admin(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    assert client.get("/api/upstreams/export").status_code == 401
+    assert client.post("/api/upstreams/import", json={"upstreams": [{"name": "x", "url": "http://x/v1"}]}).status_code == 401
+    assert client.patch("/api/upstreams/status", json={"names": ["x"], "enabled": True}).status_code == 401
+    assert client.get("/api/audit/logs").status_code == 401
