@@ -70,11 +70,12 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.66")
+app = FastAPI(title="CleanLLM", version="1.0.67")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
 MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
+CONNECTIVITY_STATE: dict[str, Any] = {"checked_at": None, "results": [], "availability_percent": None}
 STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
 API_USAGE: list[dict[str, Any]] = []
 
@@ -392,6 +393,19 @@ def models_url_for_target(target_url: str, override: str = "") -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
+def chat_url_for_target(target_url: str) -> str:
+    """Accept a host, /v1, or a complete endpoint and normalize it internally."""
+    parsed = urlsplit(target_url)
+    path = parsed.path.rstrip("/")
+    if not path:
+        path = "/v1/chat/completions"
+    elif path == "/v1":
+        path = "/v1/chat/completions"
+    elif path.endswith("/models"):
+        path = path[:-7].rstrip("/") + "/chat/completions"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
 def models_url(settings: dict[str, Any]) -> str:
     return models_url_for_target(str(settings["target_api_url"]), str(settings.get("models_api_url") or ""))
 
@@ -427,7 +441,7 @@ def ollama_manifest_path(model: str) -> Path:
 def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
     primary = {
         "name": str(settings.get("default_upstream_name") or "默认上游"),
-        "url": str(settings["target_api_url"]),
+        "url": chat_url_for_target(str(settings["target_api_url"])),
         "api_key": str(settings.get("api_key") or ""),
         "timeout": int(settings.get("timeout_seconds") or 120),
         "models_url": models_url(settings),
@@ -442,7 +456,7 @@ def configured_upstreams(settings: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         result.append({
             "name": str(item.get("name") or f"上游 {len(result) + 1}"),
-            "url": str(item["url"]),
+            "url": chat_url_for_target(str(item["url"])),
             "api_key": str(item.get("api_key") or ""),
             "timeout": max(1, min(int(item.get("timeout") or 120), 3600)),
             "models_url": models_url_for_target(str(item["url"]), str(item.get("models_url") or "")),
@@ -606,7 +620,13 @@ async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
             results.append({"name": "Ollama 管理接口", "ok": False, "detail": str(exc)})
     checked = len(results)
     healthy = sum(1 for item in results if item.get("ok"))
-    return {"results": results, "availability_percent": round(healthy / checked * 100, 1) if checked else 0}
+    CONNECTIVITY_STATE.update({"checked_at": time.time(), "results": results, "availability_percent": round(healthy / checked * 100, 1) if checked else 0})
+    return {**CONNECTIVITY_STATE}
+
+
+@app.get("/api/settings/connectivity")
+async def get_connectivity(_: None = Depends(require_admin)) -> dict[str, Any]:
+    return {**CONNECTIVITY_STATE}
 
 
 @app.get("/api/settings/export")
@@ -768,7 +788,8 @@ async def get_models(refresh: bool = False, _: None = Depends(require_admin)) ->
                     models.append({"id": str(model_id), "owned_by": str(item.get("owned_by") or item.get("owner") or "upstream") if isinstance(item, dict) else "upstream", "created": item.get("created") or item.get("modified_at") if isinstance(item, dict) else None, "upstream": upstream["name"]})
     if not models and failures:
         raise HTTPException(status_code=502, detail="获取上游模型失败：" + "；".join(failures))
-    models.sort(key=lambda item: (item["id"].lower(), item["upstream"].lower()))
+    upstream_order = {item["name"]: index for index, item in enumerate(upstreams)}
+    models.sort(key=lambda item: (upstream_order.get(item["upstream"], len(upstreams)), item["id"].lower()))
     MODEL_CACHE.update({"at": time.time(), "data": models, "source": sources})
     logger.info("Discovered %d models from %d upstreams", len(models), len(upstreams))
     return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(models), "cached": False, "data": models, "failures": failures}
@@ -1126,7 +1147,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
             try:
                 response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
-                if response.status_code >= 500: failures.append(f"{upstream['name']}: HTTP {response.status_code}"); continue
+                if response.status_code >= 400: failures.append(f"{upstream['name']}: HTTP {response.status_code}"); continue
                 data = response.json(); choices = data.get("choices", [])
                 text = choices[0].get("message", {}).get("content", "") if choices else ""
                 text = clean_content(text, {**settings, "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", []))})

@@ -26,7 +26,7 @@
   const layout = document.createElement("style"); layout.textContent = ".content-wrap{max-width:none!important;width:100%;margin:0}.panel{width:100%}.log-line .level{color:var(--primary)!important}.button{cursor:pointer!important}.stats-grid{grid-template-columns:repeat(3,minmax(0,1fr))!important}@media(max-width:980px){.stats-grid{grid-template-columns:repeat(2,minmax(0,1fr))!important}}@media(max-width:600px){.stats-grid{grid-template-columns:1fr!important}}"; document.head.append(layout);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.66";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.67";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -66,6 +66,7 @@
   $("#save-log-limit")?.addEventListener("click", async () => { try { const current=await request("/api/settings"), mb=Number($("#log-max-mb").value); current.log_max_bytes=mb*1048576; current.log_level=$("#log-level")?.value||"WARNING"; await request("/api/settings", {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(current)}); notify(`日志设置已保存：${current.log_level}`); } catch(error) { notify(error.message,true); } });
   let upstreamTabsReady = Promise.resolve();
   if (patterns) {
+    patterns.closest("form")?.insertAdjacentHTML("beforebegin", '<section class="panel upstream-health-panel"><header class="panel-header"><div><h3>上游连通性</h3><p id="upstream-health-meta">每 10 分钟自动检测</p></div><strong id="upstream-health-percent">等待检测</strong></header><div id="upstream-health-results" class="panel-body"></div></section>');
     patterns.insertAdjacentHTML("beforebegin", `<label class="field wide"><span>备用上游（JSON）</span><textarea id="upstreams" rows="6" spellcheck="false" placeholder='[{"name":"备用","url":"http://server/v1/chat/completions","api_key":""}]'></textarea><small>默认上游失败后按顺序切换。</small></label><label class="field wide"><span>模型路由（JSON）</span><textarea id="model_routes" rows="5" spellcheck="false" placeholder='[{"pattern":"qwen*","upstreams":["默认上游","备用"]}]'></textarea><small>支持 * 和 ? 通配符。</small></label>`);
     const footer = $("#settings-form .form-footer");
     footer.insertAdjacentHTML("beforebegin", `<div class="wide" style="display:flex;gap:9px;flex-wrap:wrap"><button id="test-connections" class="button" type="button">测试全部连接</button><button id="export-settings" class="button" type="button">导出脱敏配置</button><label class="button" style="display:inline-flex;align-items:center">导入配置<input id="import-settings" type="file" accept="application/json" hidden></label><button id="reset-settings" class="button" type="button" style="color:var(--primary)">恢复默认值</button></div><div id="connection-results" class="wide"></div>`);
@@ -111,6 +112,9 @@
       $("#connection-results").innerHTML = `<div style="padding:8px 0;color:var(--primary)"><strong>总体连通性 ${data.availability_percent ?? 0}%</strong></div>` + data.results.map((item) => `<div style="padding:8px 0;color:${item.ok?'var(--green)':'var(--red)'}"><strong>${item.ok?'✓':'×'} ${escape(item.name)}</strong> · ${escape(item.detail)} ${item.latency_ms ? `(${item.latency_ms} ms)` : ""}</div>`).join("");
     } catch (error) { notify(error.message, true); } finally { event.currentTarget.disabled = false; }
   });
+  async function refreshUpstreamHealth() { try { const data = await request("/api/settings/test", {method:"POST"}); const percent = document.querySelector("#upstream-health-percent"); const meta = document.querySelector("#upstream-health-meta"); if (percent) percent.textContent = `连通 ${data.availability_percent ?? 0}%`; if (meta && data.checked_at) meta.textContent = `最近检测：${new Date(data.checked_at * 1000).toLocaleString("zh-CN", {hour12:false})}`; const out = document.querySelector("#upstream-health-results"); if (out) out.innerHTML = (data.results||[]).map(item => `<div class="health-row ${item.ok?'ok':'fail'}"><span>${item.ok?'●':'○'} ${escape(item.name)}</span><small>${escape(item.detail||'')} ${item.latency_ms?`· ${item.latency_ms} ms`:''}</small></div>`).join(""); } catch (_) {} }
+  refreshUpstreamHealth();
+  setInterval(refreshUpstreamHealth, 600000);
   const runUpstreamCheck = () => { if (location.hash.slice(1) !== "upstream") return; $("#test-connections")?.click(); };
   setInterval(runUpstreamCheck, 600000);
   $("#export-settings")?.addEventListener("click", () => location.assign("/api/settings/export"));
@@ -269,3 +273,4 @@ if (modelContainer) {
   observer.observe(modelContainer, {childList: true, subtree: true});
 }
 const modelTabStyle = document.createElement('style'); modelTabStyle.textContent = '.upstream-model-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px}.upstream-model-tabs .button{min-height:32px;padding:0 12px}.upstream-model-tabs .button.active{background:var(--primary-soft);color:var(--primary);border-color:var(--primary)}'; document.head.append(modelTabStyle);
+const healthStyle = document.createElement('style'); healthStyle.textContent = '.upstream-health-panel{margin-bottom:18px}.upstream-health-panel header strong{color:var(--primary)}.health-row{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--border)}.health-row.ok span{color:var(--green)}.health-row.fail span{color:var(--red)}.health-row small{color:var(--muted)}'; document.head.append(healthStyle);
