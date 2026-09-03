@@ -73,7 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.75")
+app = FastAPI(title="CleanLLM", version="1.0.76")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -1197,12 +1197,14 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 headers = {"Content-Type": "application/json"}
                 if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
                 try:
+                    logger.info("Responses upstream request: %s -> %s", upstream["name"], upstream["url"])
                     async with httpx.AsyncClient(timeout=None) as client:
                         async with client.stream("POST", upstream["url"], json=stream_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
                                 continue
                             selected_name = upstream["name"]
+                            emitted = False
                             async for line in upstream_response.aiter_lines():
                                 if not line.startswith("data: ") or line == "data: [DONE]": continue
                                 try:
@@ -1213,8 +1215,18 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                 delta = clean_content(delta, {**settings, "clean_patterns": upstream.get("clean_patterns", [])})
                                 if not delta: continue
                                 complete_text += delta
+                                emitted = True
                                 event = {"type": "response.output_text.delta", "delta": delta, "response_id": response_id}
                                 yield f"event: response.output_text.delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                            if not emitted and "application/json" in upstream_response.headers.get("content-type", ""):
+                                try:
+                                    data = json.loads(await upstream_response.aread())
+                                    delta = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                                    if isinstance(delta, str) and delta:
+                                        complete_text += clean_content(delta, {**settings, "clean_patterns": upstream.get("clean_patterns", [])})
+                                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','delta':complete_text,'response_id':response_id}, ensure_ascii=False)}\n\n"
+                                except (ValueError, IndexError, AttributeError):
+                                    pass
                     break
                 except httpx.RequestError:
                     continue
