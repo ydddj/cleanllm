@@ -29,7 +29,7 @@ const usageLogState = { shown: 8, scrollTop: 0 };
   const buttonStyle = document.createElement("style"); buttonStyle.textContent = ".button{display:inline-flex!important;align-items:center!important;justify-content:center!important;gap:7px!important;min-height:38px;padding:0 15px;border:1px solid color-mix(in srgb,var(--primary) 18%,var(--border))!important;border-radius:10px!important;background:color-mix(in srgb,var(--surface) 82%,transparent)!important;color:var(--text)!important;font-size:13px;font-weight:650;line-height:1;white-space:nowrap;box-shadow:none!important;cursor:pointer;transition:background-color .15s,border-color .15s,color .15s,transform .1s,opacity .15s}.button:hover:not(:disabled){border-color:color-mix(in srgb,var(--primary) 52%,var(--border))!important;background:var(--primary-soft)!important;color:var(--primary)!important}.button:active:not(:disabled){transform:translateY(1px)}.button:focus-visible{outline:2px solid color-mix(in srgb,var(--primary) 48%,transparent);outline-offset:2px}.button.primary{border-color:transparent!important;background:linear-gradient(180deg,var(--primary),var(--primary2))!important;color:#fff!important;box-shadow:0 7px 18px color-mix(in srgb,var(--primary) 24%,transparent)!important}.button.primary:hover:not(:disabled){background:linear-gradient(180deg,color-mix(in srgb,var(--primary) 88%,#fff),var(--primary2))!important;color:#fff!important}.button.danger{border-color:color-mix(in srgb,var(--primary) 34%,var(--border))!important;color:var(--primary)!important;background:color-mix(in srgb,var(--primary-soft) 42%,transparent)!important}.button.danger:hover:not(:disabled){border-color:var(--primary)!important;background:var(--primary-soft)!important}.button.compact{min-height:34px;padding:0 11px}.button svg{width:16px;height:16px}.button:disabled{opacity:.5!important;cursor:not-allowed!important}.file-button{display:inline-flex!important}.icon-button{display:grid;place-items:center}.wide-button{width:100%}"; document.head.append(buttonStyle);
   const nav = document.querySelector(".nav");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.103";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.0.104";
   const modelPage = document.querySelector('[data-view="models"]'), ollama = document.querySelector("#ollama-panel"); if (modelPage && ollama) modelPage.appendChild(ollama);
   const topActions = document.querySelector(".topbar-actions");
   if ($("#theme-button")) $("#theme-button").title = "切换深浅主题";
@@ -349,7 +349,7 @@ if (modelContainer) {
     const rows = [...table.querySelectorAll('tbody tr')];
     const groups = new Map();
     rows.forEach(row => { const key = row.cells[1]?.textContent.trim() || '默认上游'; if (!groups.has(key)) groups.set(key, []); groups.get(key).push(row); });
-    if (groups.size < 2) return;
+    if (!groups.size) return;
     table.dataset.grouped = 'true';
     const tabs = document.createElement('div'); tabs.className = 'upstream-model-tabs';
     const body = table.querySelector('tbody');
