@@ -1,0 +1,44 @@
+{
+  "target_api_url": "http://host.docker.internal:11434/v1/chat/completions",
+  "default_upstream_name": "默认上游",
+  "api_key": "",
+  "timeout_seconds": 120,
+  "models_api_url": "",
+  "ollama_api_url": "",
+  "clean_patterns": [
+    "(?is)[<＜]\\s*[\\|｜]*\\s*channel\\s*[>＞].*?[<＜]\\s*[\\|｜/]*\\s*channel\\s*[\\|｜]*\\s*[>＞]",
+    "(?is)[<＜]\\s*think\\s*[>＞].*?[<＜]\\s*[\\|｜/]*\\s*think\\s*[>＞]",
+    "(?i)[<＜]\\s*[\\|｜/]*\\s*[a-zA-Z0-9_]+\\s*[\\|｜/]*\\s*[>＞]"
+  ],
+  "upstreams": [],
+  "model_routes": [],
+  "log_max_bytes": 5242880,
+  "log_level": "WARNING",
+  "model_cache_ttl": 60,
+  "connectivity_interval_minutes": 10,
+  "route_affinity_minutes": 15,
+  "connectivity_history": [
+    {
+      "ts": 1788416351.679996,
+      "results": [
+        {
+          "name": "默认上游",
+          "ok": false
+        },
+        {
+          "name": "Ollama 管理接口",
+          "ok": false
+        }
+      ]
+    }
+  ],
+  "api_tokens": [],
+  "export_history": [],
+  "api_usage": [],
+  "appearance_background": "",
+  "appearance_backgrounds": [],
+  "appearance_glass_opacity": 49,
+  "appearance_glass_brightness": 32,
+  "appearance_glass_blur": 13,
+  "appearance_mask_opacity": 69
+}

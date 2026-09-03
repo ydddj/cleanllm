@@ -11,6 +11,11 @@ from fastapi.testclient import TestClient
 import proxy
 
 
+def test_application_version_comes_from_version_file() -> None:
+    assert proxy.APP_VERSION == proxy.VERSION_FILE.read_text(encoding="utf-8").strip()
+    assert proxy.app.version == proxy.APP_VERSION
+
+
 def client_for(tmp_path: Path) -> TestClient:
     proxy.DATA_DIR = tmp_path
     proxy.SETTINGS_FILE = tmp_path / "settings.json"
@@ -193,6 +198,8 @@ def test_models_url_is_derived_and_can_be_overridden() -> None:
     ) == "http://custom:9000/catalog"
     assert proxy.chat_url_for_target("http://ollama:11434") == "http://ollama:11434/v1/chat/completions"
     assert proxy.chat_url_for_target("http://ollama:11434/v1") == "http://ollama:11434/v1/chat/completions"
+    assert proxy.endpoint_url_for_target("https://api.example.com/v1/chat/completions", "embeddings") == "https://api.example.com/v1/embeddings"
+    assert proxy.endpoint_url_for_target("https://api.example.com/v1", "audio/speech") == "https://api.example.com/v1/audio/speech"
 
 
 def test_log_api_reads_tail_and_reports_five_mb_limit(tmp_path: Path) -> None:

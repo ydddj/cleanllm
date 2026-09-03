@@ -35,6 +35,8 @@ SETTINGS_FILE = DATA_DIR / "settings.json"
 LOG_FILE = DATA_DIR / "cleanllm.log"
 MAX_LOG_BYTES = 5 * 1024 * 1024
 STATIC_DIR = BASE_DIR / "static"
+VERSION_FILE = BASE_DIR / "VERSION"
+APP_VERSION = VERSION_FILE.read_text(encoding="utf-8").strip() if VERSION_FILE.exists() else "0.0.0"
 OLLAMA_MODELS_DIR = Path(os.getenv("OLLAMA_MODELS_DIR", "/ollama-models"))
 SESSION_COOKIE = "cleanllm_session"
 SESSION_MAX_AGE = 12 * 60 * 60
@@ -73,7 +75,7 @@ DEFAULT_SETTINGS = {
     "appearance_mask_opacity": 69,
 }
 
-app = FastAPI(title="CleanLLM", version="1.0.91")
+app = FastAPI(title="CleanLLM", version=APP_VERSION)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
@@ -455,6 +457,13 @@ def chat_url_for_target(target_url: str) -> str:
     elif path.endswith("/models"):
         path = path[:-7].rstrip("/") + "/chat/completions"
     return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def endpoint_url_for_target(target_url: str, endpoint_path: str) -> str:
+    parsed = urlsplit(chat_url_for_target(target_url))
+    base_path = parsed.path.removesuffix("/chat/completions").rstrip("/")
+    path = f"{base_path}/{endpoint_path.lstrip('/')}"
+    return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
 def models_url(settings: dict[str, Any]) -> str:
@@ -877,6 +886,18 @@ async def get_models(refresh: bool = False, _: None = Depends(require_admin)) ->
     return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(models), "cached": False, "data": models, "failures": failures}
 
 
+@app.get("/v1/models")
+async def public_models(_: None = Depends(require_api_token)) -> dict[str, Any]:
+    result = await get_models(False, None)
+    return {
+        "object": "list",
+        "data": [
+            {"id": item["id"], "object": "model", "created": item.get("created") or 0, "owned_by": item.get("owned_by") or "upstream"}
+            for item in result.get("data", [])
+        ],
+    }
+
+
 @app.get("/api/ollama/status")
 async def get_ollama_status(_: None = Depends(require_admin)) -> dict[str, Any]:
     base_url = ollama_base_url(load_settings())
@@ -1195,6 +1216,135 @@ async def clear_logs(_: None = Depends(require_admin)) -> dict[str, str]:
     return {"message": "系统日志已清除"}
 
 
+async def native_responses_stream(payload: dict[str, Any], settings: dict[str, Any], request: Request) -> Response:
+    """Relay native Responses SSE bytes unchanged so event ordering and IDs stay intact."""
+    failures: list[str] = []
+    for upstream in route_upstreams(settings, str(payload.get("model") or "")):
+        headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
+        if upstream["api_key"]:
+            headers["Authorization"] = f"Bearer {upstream['api_key']}"
+        client = httpx.AsyncClient(timeout=None)
+        responses_url = upstream["url"].replace("/chat/completions", "/responses")
+        try:
+            logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
+            response = await client.send(
+                client.build_request("POST", responses_url, json={**payload, "stream": True}, headers=headers),
+                stream=True,
+            )
+        except httpx.RequestError as exc:
+            failures.append(f"{upstream['name']}: {exc}")
+            await client.aclose()
+            continue
+        if response.status_code >= 400:
+            failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+            await response.aclose()
+            await client.aclose()
+            continue
+        ROUTE_AFFINITY[str(payload["model"])] = (
+            upstream["name"],
+            time.time() + int(settings.get("route_affinity_minutes", 15)) * 60,
+        )
+        started = time.perf_counter()
+
+        async def relay() -> Any:
+            pending = b""
+            try:
+                async for chunk in response.aiter_bytes():
+                    pending += chunk
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        if line.startswith(b"data: "):
+                            try:
+                                event = json.loads(line[6:])
+                                if isinstance(event, dict) and event.get("type") == "response.completed":
+                                    update_usage_record(getattr(request.state, "usage_id", None), **usage_values((event.get("response") or {}).get("usage")))
+                            except (ValueError, AttributeError, UnicodeDecodeError):
+                                pass
+                    yield chunk
+            except httpx.RequestError as exc:
+                logger.warning("Responses stream from %s disconnected: %s", upstream["name"], exc)
+            finally:
+                await response.aclose()
+                await client.aclose()
+                update_usage_record(
+                    getattr(request.state, "usage_id", None),
+                    latency_ms=round((time.perf_counter() - started) * 1000, 1),
+                )
+
+        return StreamingResponse(
+            relay(),
+            status_code=response.status_code,
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
+    return JSONResponse(
+        status_code=502,
+        content={"error": {"message": "所有上游 Responses 接口均不可用：" + "；".join(failures), "type": "upstream_error"}},
+    )
+
+
+@app.post("/v1/embeddings")
+@app.post("/v1/completions")
+@app.post("/v1/images/generations")
+@app.post("/v1/audio/transcriptions")
+@app.post("/v1/audio/translations")
+@app.post("/v1/audio/speech")
+@app.post("/v1/moderations")
+@app.post("/v1/rerank")
+async def compatible_api(request: Request, _: None = Depends(require_api_token)) -> Response:
+    """Pass common OpenAI-compatible APIs to the configured upstreams."""
+    body = await request.body()
+    payload: dict[str, Any] = {}
+    if "application/json" in request.headers.get("content-type", ""):
+        try:
+            candidate = json.loads(body)
+            payload = candidate if isinstance(candidate, dict) else {}
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=400, detail="请求体不是有效 JSON")
+    endpoint = request.url.path.removeprefix("/v1/")
+    settings = load_settings()
+    failures: list[str] = []
+    for upstream in route_upstreams(settings, str(payload.get("model") or "")):
+        url = endpoint_url_for_target(upstream["url"], endpoint)
+        headers = {
+            "Content-Type": request.headers.get("content-type", "application/json"),
+            "Accept": request.headers.get("accept", "application/json"),
+        }
+        if upstream["api_key"]:
+            headers["Authorization"] = f"Bearer {upstream['api_key']}"
+        try:
+            async with httpx.AsyncClient(timeout=float(upstream["timeout"])) as client:
+                response = await client.post(url, content=body, headers=headers)
+            if response.status_code >= 400:
+                failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+                continue
+            ROUTE_AFFINITY[str(payload.get("model") or endpoint)] = (
+                upstream["name"],
+                time.time() + int(settings.get("route_affinity_minutes", 15)) * 60,
+            )
+            response_headers = {}
+            if response.headers.get("content-disposition"):
+                response_headers["Content-Disposition"] = response.headers["content-disposition"]
+            if "application/json" in response.headers.get("content-type", ""):
+                try:
+                    result = response.json()
+                    update_usage_record(getattr(request.state, "usage_id", None), **usage_values(result.get("usage") if isinstance(result, dict) else {}))
+                except ValueError:
+                    pass
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                media_type=response.headers.get("content-type", "application/octet-stream"),
+                headers=response_headers,
+            )
+        except httpx.RequestError as exc:
+            failures.append(f"{upstream['name']}: {exc}")
+    return JSONResponse(
+        status_code=502,
+        content={"error": {"message": "所有上游均不可用：" + "；".join(failures), "type": "upstream_error"}},
+    )
+
+
 @app.post("/v1/responses")
 async def responses_api(request: Request, _: None = Depends(require_api_token)) -> Response:
     """Accept the OpenAI Responses request shape while using the existing chat upstreams."""
@@ -1227,6 +1377,10 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
     settings = load_settings(); failures = []
     logger.info("Responses request received for model %s (stream=%s)", payload["model"], payload.get("stream") is True)
     if payload.get("stream") is True:
+        native_stream = await native_responses_stream(payload, settings, request)
+        if native_stream.status_code != 502:
+            return native_stream
+    if payload.get("stream") is True:
         response_id = f"resp-{secrets.token_hex(12)}"
         created_at = int(time.time())
         async def response_events():
@@ -1237,13 +1391,13 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             sequence_number = 0
             item_id = f"msg-{secrets.token_hex(8)}"
             native_completed = False
-            stream_payload = {**payload, "stream": True}
+            stream_payload = {**chat_payload, "stream": True}
             for upstream in route_upstreams(settings, str(payload["model"])):
                 headers = {"Content-Type": "application/json"}
                 if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
                 try:
-                    responses_url = upstream["url"].replace("/chat/completions", "/responses")
-                    logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
+                    responses_url = upstream["url"]
+                    logger.info("Responses chat fallback request: %s -> %s", upstream["name"], responses_url)
                     async with httpx.AsyncClient(timeout=None) as client:
                         async with client.stream("POST", responses_url, json=stream_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:

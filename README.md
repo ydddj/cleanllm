@@ -60,7 +60,7 @@ docker compose down
 
 打开 `http://localhost:11515`，使用 `ADMIN_USERNAME` 和 `ADMIN_PASSWORD` 登录。登录后可在“账户安全”中修改用户名和密码；密码以带随机盐的 scrypt 单向哈希保存在数据卷中。登录状态保存在 HttpOnly 会话 Cookie 中，有效期为 12 小时。
 
-客户端请求地址为 `http://你的主机:11515/v1/chat/completions`。设置保存在 Docker 数据卷中，升级容器不会丢失。
+客户端主要请求地址为 `http://你的主机:11515/v1/chat/completions` 和 `/v1/responses`。此外支持 `/v1/models`、`/v1/embeddings`、`/v1/completions`、`/v1/images/generations`、`/v1/audio/transcriptions`、`/v1/audio/translations`、`/v1/audio/speech`、`/v1/moderations` 和 `/v1/rerank`，这些地址会从所选上游的 `/v1` 基础地址自动推导，无需逐项配置。设置保存在 Docker 数据卷中，升级容器不会丢失。
 
 常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
 
@@ -91,7 +91,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-推送到 `main` 后会发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.91`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.95`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。账户安全页支持创建、复制和撤销 API 访问令牌，令牌以实例密钥加密保存，创建令牌后代理接口要求 `Authorization: Bearer <token>`。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 

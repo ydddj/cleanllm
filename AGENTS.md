@@ -86,9 +86,11 @@ Add regression tests for changed authentication, settings persistence, response 
 - Pushes to `main` run tests and publish `ydddj/cleanllm:latest` plus the current semantic version tag for `linux/amd64` and `linux/arm64`; do not add commit-based `sha-*` tags.
 - Tags matching `v*.*.*` also publish semantic-version tags.
 - Every user-visible release change must update the API/UI version, `CHANGELOG.md`, and the README's current version reference together.
+- `VERSION` is the canonical release version. Update it for every release; GitHub Actions and the FastAPI application read it directly.
 - Model discovery may use the persistent `model_cache_ttl` setting (seconds; 0 disables caching). API tokens retain a SHA-256 digest for authentication and an instance-key-encrypted copy for administrator re-copy; never log tokens or expose them outside authenticated management APIs. Status streaming uses the authenticated SSE endpoint `/api/system/events`.
 - Never place Docker Hub credentials in source files. Publishing uses the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
 - After publishing, verify the GitHub Actions job before reporting the Docker image as available.
 
 ## UI color rule
 - 新增界面功能（包括外观、上传、提示和操作按钮）必须使用 CSS 配色变量，切换配色后同步生效。
+- 全站命令按钮保持统一：保存、创建、确认、登录、拉取使用主题色实心主按钮；刷新、导入、导出、取消、加载更多使用描边次按钮；删除、清除、撤销、恢复默认使用跟随主题色的危险按钮。普通按钮统一高度、圆角、字号、图标间距及交互状态，图标按钮保持等宽方形。
