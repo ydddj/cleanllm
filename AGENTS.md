@@ -43,6 +43,9 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - 上游连通性按实例本地自然日展示当日检测次数和失败次数，同时保留 24 小时及 7 天连通率。
 - 界面质感的默认值为玻璃透明度 50%、玻璃明暗 45%、玻璃折射与模糊 10%、页面明暗 50%；后端默认值、表单初值和重置值必须同步。
 - API令牌列表保持表格结构，依次展示名称、密钥、状态、累计 Token 用量、过期时间、创建时间和删除；状态使用图标，显示与复制图标紧跟密钥。
+- `settings.json` 只保存配置；API令牌、API 用量、连通性历史和导出历史保存到 `/data/cleanllm.db`。新增高频或持续增长的运行数据不得写回 `settings.json`。
+- API令牌支持启用、停用和可选到期时间；只有已启用且未过期的令牌可以通过代理鉴权。
+- 上传背景图保存到 `/data/backgrounds`，`settings.json` 仅保存图片地址，不得重新内嵌 Base64 图片数据。
 
 ## Configuration rules
 

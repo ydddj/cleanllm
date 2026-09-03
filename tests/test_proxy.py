@@ -167,8 +167,8 @@ def test_api_tokens_are_hashed_and_protect_proxy(tmp_path: Path) -> None:
     created = client.post("/api/tokens", json={"name": "测试客户端"})
     assert created.status_code == 200
     token = created.json()["token"]
-    saved = proxy.load_settings()["api_tokens"][0]
-    assert token not in proxy.SETTINGS_FILE.read_text(encoding="utf-8")
+    saved = proxy.database_tokens()[0]
+    assert not proxy.SETTINGS_FILE.exists() or token not in proxy.SETTINGS_FILE.read_text(encoding="utf-8")
     assert saved["hash"] == proxy.token_digest(token)
     listed = client.get("/api/tokens").json()["data"][0]
     assert "hash" not in listed
@@ -183,12 +183,12 @@ def test_expired_api_token_is_listed_but_cannot_authenticate(tmp_path: Path) -> 
     client = client_for(tmp_path)
     login(client)
     token = client.post("/api/tokens", json={"name": "过期客户端"}).json()["token"]
-    settings = proxy.load_settings()
-    saved_token = next(item for item in settings["api_tokens"] if item["hash"] == proxy.token_digest(token))
-    saved_token["expires_at"] = int(time.time()) - 1
-    saved_token.pop("total_tokens", None)
-    settings["api_usage"] = [{"token_id": saved_token["id"], "total_tokens": 2_500_000}]
-    proxy.save_settings(settings)
+    saved_token = next(item for item in proxy.database_tokens() if item["hash"] == proxy.token_digest(token))
+    with proxy.database_connection() as database:
+        database.execute(
+            "UPDATE api_tokens SET expires_at = ?, total_tokens = ? WHERE id = ?",
+            (int(time.time()) - 1, 2_500_000, saved_token["id"]),
+        )
 
     listed = client.get("/api/tokens").json()["data"][0]
     assert listed["status"] == "expired"
@@ -205,16 +205,43 @@ def test_api_token_total_tracks_usage_updates(tmp_path: Path) -> None:
     client = client_for(tmp_path)
     login(client)
     client.post("/api/tokens", json={"name": "累计客户端"})
-    settings = proxy.load_settings()
-    token_id = settings["api_tokens"][0]["id"]
-    settings["api_tokens"][0]["total_tokens"] = 4
-    settings["api_usage"] = [{"id": "usage-1", "token_id": token_id, "total_tokens": 4}]
-    proxy.save_settings(settings)
+    token_id = proxy.database_tokens()[0]["id"]
+    with proxy.database_connection() as database:
+        database.execute("UPDATE api_tokens SET total_tokens = 4 WHERE id = ?", (token_id,))
+        database.execute(
+            """INSERT INTO api_usage
+               (id, token_id, token_name, at, path, method, model, total_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            ("usage-1", token_id, "累计客户端", int(time.time()), "/v1/responses", "POST", "test", 4),
+        )
 
     proxy.update_usage_record("usage-1", total_tokens=10)
 
     listed = client.get("/api/tokens").json()["data"][0]
     assert listed["total_tokens"] == 10
+
+
+def test_api_token_can_expire_and_be_disabled(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    expires_at = int(time.time()) + 3600
+    created = client.post("/api/tokens", json={"name": "限时客户端", "expires_at": expires_at})
+    token_id = created.json()["id"]
+    token = created.json()["token"]
+    listed = client.get("/api/tokens").json()["data"][0]
+    assert listed["expires_at"] == expires_at
+    assert listed["status"] == "active"
+
+    response = client.patch(f"/api/tokens/{token_id}/status", json={"enabled": False})
+    assert response.status_code == 200
+    assert client.get("/api/tokens").json()["data"][0]["status"] == "disabled"
+    denied = client.post(
+        "/v1/chat/completions",
+        json={"model": "test", "messages": []},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert denied.status_code == 401
+    assert client.post("/api/tokens", json={"name": "无效", "expires_at": int(time.time()) - 1}).status_code == 422
 
 
 def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path, monkeypatch) -> None:
@@ -333,6 +360,46 @@ def test_connectivity_metrics_include_natural_day_counts() -> None:
     assert metrics["checks_today"] == 2
     assert metrics["failures_today"] == 1
     assert metrics["availability_7d"] == 66.7
+
+
+def test_runtime_history_uses_sqlite_and_is_removed_from_settings(tmp_path: Path) -> None:
+    client_for(tmp_path)
+    proxy.SETTINGS_FILE.write_text(
+        json.dumps({
+            "target_api_url": "http://upstream/v1/chat/completions",
+            "api_tokens": [{"id": "old"}],
+            "api_usage": [{"id": "old"}],
+            "connectivity_history": [{"ts": 1, "results": []}],
+            "export_history": [{"id": "old"}],
+        }),
+        encoding="utf-8",
+    )
+
+    loaded = proxy.load_settings()
+    persisted = json.loads(proxy.SETTINGS_FILE.read_text(encoding="utf-8"))
+    assert loaded["target_api_url"] == "http://upstream/v1/chat/completions"
+    assert not proxy.RUNTIME_SETTINGS_KEYS.intersection(persisted)
+
+    proxy.database_add_connectivity(10.0, [{"name": "上游", "ok": True}])
+    proxy.database_add_export({"id": "export-1", "model": "test", "filename": "test.tar.gz", "created_at": 10, "size": 42})
+    assert proxy.database_connectivity_history()[-1]["results"][0]["ok"] is True
+    assert proxy.database_export_history()[0]["size"] == 42
+
+
+def test_embedded_background_is_moved_out_of_settings(tmp_path: Path) -> None:
+    client_for(tmp_path)
+    image = "data:image/png;base64,iVBORw0KGgo="
+    settings = proxy.load_settings()
+    settings["appearance_background"] = image
+    settings["appearance_backgrounds"] = [image]
+
+    proxy.save_settings(settings)
+
+    persisted = json.loads(proxy.SETTINGS_FILE.read_text(encoding="utf-8"))
+    selected = persisted["appearance_background"]
+    assert selected.startswith("/api/appearance/background/")
+    assert image not in proxy.SETTINGS_FILE.read_text(encoding="utf-8")
+    assert (tmp_path / "backgrounds" / Path(selected).name).read_bytes() == b"\x89PNG\r\n\x1a\n"
 
 
 def test_log_api_reads_tail_and_reports_five_mb_limit(tmp_path: Path) -> None:

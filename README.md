@@ -91,9 +91,11 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.97`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.0.98`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
-模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制和撤销令牌，并以表格展示状态、累计 Token 用量、过期时间及创建时间；令牌以实例密钥加密保存，创建后代理接口要求 `Authorization: Bearer <token>`。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
+模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，创建时可选择到期时间；列表展示状态、累计 Token 用量、过期时间及创建时间。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
+
+配置与运行数据均位于 `/data`：`settings.json` 只保存上游、清洗、外观等配置，`cleanllm.db` 使用 Python 内置 SQLite 保存 API令牌、调用用量、连通性采样和导出历史，上传的背景图保存在 `/data/backgrounds`。升级到 `1.0.98` 后不迁移旧运行历史，首次读取配置时会自动删除 `settings.json` 中旧的运行数组，并把已有 Base64 背景拆成图片文件，从而显著缩小配置文件。
 
 “上游与清洗”支持通过选项卡添加多个 OpenAI 兼容上游。常用连接项直接显示，模型列表地址、Ollama 地址、响应清洗规则、模型路由和备用上游 JSON 位于高级设置中；空配置保持留空，不显示无意义的 `[]`。模型列表会聚合所有可用上游，并标明每个模型的来源上游。连通性区域同时展示 24 小时、7 天可用率，以及按实例本地自然日计算的检测和失败次数。
 Web 重启依赖 Compose 的 `restart: unless-stopped`，不需要挂载 Docker Socket。查看 Docker 日志时可使用 `docker compose logs -t` 显示时间戳。

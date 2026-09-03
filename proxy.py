@@ -14,7 +14,9 @@ import time
 import uuid
 import signal
 import socket
+import sqlite3
 import tarfile
+import threading
 import io
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -64,10 +66,6 @@ DEFAULT_SETTINGS = {
     "model_cache_ttl": int(os.getenv("MODEL_CACHE_TTL", "60")),
     "connectivity_interval_minutes": int(os.getenv("CONNECTIVITY_INTERVAL_MINUTES", "10")),
     "route_affinity_minutes": int(os.getenv("ROUTE_AFFINITY_MINUTES", "15")),
-    "connectivity_history": [],
-    "api_tokens": [],
-    "export_history": [],
-    "api_usage": [],
     "appearance_background": "",
     "appearance_backgrounds": [],
     "appearance_glass_opacity": 50,
@@ -75,6 +73,7 @@ DEFAULT_SETTINGS = {
     "appearance_glass_blur": 10,
     "appearance_mask_opacity": 50,
 }
+RUNTIME_SETTINGS_KEYS = {"connectivity_history", "api_tokens", "export_history", "api_usage"}
 
 app = FastAPI(title="CleanLLM", version=APP_VERSION)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -83,8 +82,9 @@ OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
 MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
 CONNECTIVITY_STATE: dict[str, Any] = {"checked_at": None, "results": [], "availability_percent": None}
 STATUS_EVENTS: asyncio.Queue = asyncio.Queue(maxsize=20)
-API_USAGE: list[dict[str, Any]] = []
 ROUTE_AFFINITY: dict[str, tuple[str, float]] = {}
+INITIALIZED_DATABASES: set[str] = set()
+DATABASE_INIT_LOCK = threading.Lock()
 
 
 class LoginRequest(BaseModel):
@@ -106,7 +106,6 @@ class SettingsUpdate(BaseModel):
     model_cache_ttl: int = Field(default=60, ge=0, le=86400)
     connectivity_interval_minutes: int = Field(default=10, ge=1, le=1440)
     route_affinity_minutes: int = Field(default=15, ge=0, le=1440)
-    connectivity_history: list[dict[str, Any]] = Field(default_factory=list, max_length=1000)
     log_level: str = Field(default="WARNING", pattern=r"^(DEBUG|INFO|WARNING|ERROR)$")
     appearance_background: str = Field(default="", max_length=7_000_000)
     appearance_backgrounds: list[str] = Field(default_factory=list, max_length=20)
@@ -174,6 +173,18 @@ class OllamaImportRequest(BaseModel):
 
 class ApiTokenRequest(BaseModel):
     name: str = Field(min_length=1, max_length=80)
+    expires_at: int | None = Field(default=None, ge=1)
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expiration(cls, value: int | None) -> int | None:
+        if value is not None and value <= int(time.time()):
+            raise ValueError("过期时间必须晚于当前时间")
+        return value
+
+
+class ApiTokenStatusUpdate(BaseModel):
+    enabled: bool
 
 
 def publish_status(event: str, data: dict[str, Any]) -> None:
@@ -329,7 +340,124 @@ def token_plain(cipher: str, token_id: str) -> str:
     return bytes(value ^ key[index % len(key)] for index, value in enumerate(encrypted)).decode()
 
 
+def database_connection() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    path = DATA_DIR / "cleanllm.db"
+    connection = sqlite3.connect(path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    key = str(path.resolve())
+    if key in INITIALIZED_DATABASES:
+        return connection
+    with DATABASE_INIT_LOCK:
+        if key in INITIALIZED_DATABASES:
+            return connection
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            hash TEXT NOT NULL UNIQUE,
+            cipher TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER,
+            expires_at INTEGER,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            total_tokens INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS api_usage (
+            id TEXT PRIMARY KEY,
+            token_id TEXT,
+            token_name TEXT NOT NULL,
+            at INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            method TEXT NOT NULL,
+            model TEXT NOT NULL DEFAULT '',
+            latency_ms REAL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(token_id) REFERENCES api_tokens(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_api_usage_at ON api_usage(at);
+        CREATE INDEX IF NOT EXISTS idx_api_usage_token ON api_usage(token_id, at);
+        CREATE TABLE IF NOT EXISTS connectivity_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            checked_at REAL NOT NULL,
+            results_json TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_connectivity_checked_at ON connectivity_history(checked_at);
+        CREATE TABLE IF NOT EXISTS export_history (
+            id TEXT PRIMARY KEY,
+            model TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            size INTEGER NOT NULL DEFAULT 0
+        );
+            """
+        )
+        INITIALIZED_DATABASES.add(key)
+    return connection
+
+
+def row_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
+
+
+def database_tokens() -> list[dict[str, Any]]:
+    with database_connection() as database:
+        return [row_dict(row) for row in database.execute("SELECT * FROM api_tokens ORDER BY created_at DESC")]
+
+
+def database_usage(since: int = 0) -> list[dict[str, Any]]:
+    with database_connection() as database:
+        rows = database.execute("SELECT * FROM api_usage WHERE at >= ? ORDER BY at", (since,))
+        return [row_dict(row) for row in rows]
+
+
+def database_connectivity_history() -> list[dict[str, Any]]:
+    with database_connection() as database:
+        rows = database.execute(
+            "SELECT checked_at, results_json FROM connectivity_history ORDER BY checked_at DESC LIMIT 1000"
+        ).fetchall()
+    return [
+        {"ts": float(row["checked_at"]), "results": json.loads(row["results_json"])}
+        for row in reversed(rows)
+    ]
+
+
+def database_add_connectivity(checked_at: float, results: list[dict[str, Any]]) -> None:
+    with database_connection() as database:
+        database.execute(
+            "INSERT INTO connectivity_history(checked_at, results_json) VALUES (?, ?)",
+            (checked_at, json.dumps(results, ensure_ascii=False)),
+        )
+        database.execute(
+            "DELETE FROM connectivity_history WHERE id NOT IN (SELECT id FROM connectivity_history ORDER BY checked_at DESC LIMIT 1000)"
+        )
+
+
+def database_export_history() -> list[dict[str, Any]]:
+    with database_connection() as database:
+        rows = database.execute("SELECT * FROM export_history ORDER BY created_at DESC LIMIT 100").fetchall()
+        return [row_dict(row) for row in rows]
+
+
+def database_add_export(item: dict[str, Any]) -> None:
+    with database_connection() as database:
+        database.execute(
+            "INSERT INTO export_history(id, model, filename, created_at, size) VALUES (?, ?, ?, ?, ?)",
+            (item["id"], item["model"], item["filename"], item["created_at"], item["size"]),
+        )
+        database.execute(
+            "DELETE FROM export_history WHERE id NOT IN (SELECT id FROM export_history ORDER BY created_at DESC LIMIT 100)"
+        )
+
+
 def token_is_active(item: dict[str, Any], now: int | None = None) -> bool:
+    if not bool(item.get("enabled", 1)):
+        return False
     expires_at = item.get("expires_at")
     if expires_at in (None, ""):
         return True
@@ -340,14 +468,8 @@ def token_is_active(item: dict[str, Any], now: int | None = None) -> bool:
 
 
 async def require_api_token(request: Request) -> None:
-    settings = load_settings()
     now = int(time.time())
-    configured = [
-        item
-        for item in settings.get("api_tokens", [])
-        if isinstance(item, dict)
-        and item.get("hash")
-    ]
+    configured = database_tokens()
     if not configured:
         return
     header = request.headers.get("authorization", "")
@@ -364,7 +486,6 @@ async def require_api_token(request: Request) -> None:
     )
     if not matched:
         raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
-    matched["last_used_at"] = int(time.time())
     # Keep a lightweight estimate when an upstream does not return usage metadata.
     # The request body is cached by Starlette, so downstream handlers can read it again.
     input_tokens = 0
@@ -380,31 +501,44 @@ async def require_api_token(request: Request) -> None:
     usage_id = uuid.uuid4().hex
     request.state.usage_id = usage_id
     usage_item = {"id": usage_id, "token_id": matched.get("id"), "token_name": matched.get("name", ""), "at": int(time.time()), "path": request.url.path, "method": request.method, "model": model, "latency_ms": None, "input_tokens": input_tokens, "output_tokens": 0, "total_tokens": input_tokens}
-    API_USAGE.append(usage_item); del API_USAGE[:-500]
-    matched["total_tokens"] = max(0, int(matched.get("total_tokens", 0) or 0)) + input_tokens
-    settings.setdefault("api_usage", []).append(usage_item); settings["api_usage"] = settings["api_usage"][-1000:]; save_settings(settings)
+    with database_connection() as database:
+        database.execute(
+            "UPDATE api_tokens SET last_used_at = ?, total_tokens = total_tokens + ? WHERE id = ?",
+            (int(time.time()), input_tokens, matched.get("id")),
+        )
+        database.execute(
+            """INSERT INTO api_usage
+               (id, token_id, token_name, at, path, method, model, latency_ms, input_tokens, output_tokens, total_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            tuple(usage_item[key] for key in ("id", "token_id", "token_name", "at", "path", "method", "model", "latency_ms", "input_tokens", "output_tokens", "total_tokens")),
+        )
 
 
 def update_usage_record(usage_id: str | None, **values: Any) -> None:
     if not usage_id or not values:
         return
-    settings = load_settings()
-    usage_item = None
-    previous_total = 0
-    for item in reversed(settings.get("api_usage", [])):
-        if isinstance(item, dict) and item.get("id") == usage_id:
-            usage_item = item
-            previous_total = max(0, int(item.get("total_tokens", 0) or 0))
-            item.update(values)
-            break
-    if usage_item is not None and "total_tokens" in values:
-        new_total = max(0, int(usage_item.get("total_tokens", 0) or 0))
-        delta = new_total - previous_total
-        for token in settings.get("api_tokens", []):
-            if isinstance(token, dict) and token.get("id") == usage_item.get("token_id"):
-                token["total_tokens"] = max(0, int(token.get("total_tokens", 0) or 0) + delta)
-                break
-    save_settings(settings)
+    allowed = {"latency_ms", "input_tokens", "output_tokens", "total_tokens"}
+    changes = {key: value for key, value in values.items() if key in allowed}
+    if not changes:
+        return
+    with database_connection() as database:
+        current = database.execute(
+            "SELECT token_id, total_tokens FROM api_usage WHERE id = ?", (usage_id,)
+        ).fetchone()
+        if current is None:
+            return
+        previous_total = max(0, int(current["total_tokens"] or 0))
+        assignments = ", ".join(f"{key} = ?" for key in changes)
+        database.execute(
+            f"UPDATE api_usage SET {assignments} WHERE id = ?",
+            (*changes.values(), usage_id),
+        )
+        if "total_tokens" in changes and current["token_id"]:
+            delta = max(0, int(changes["total_tokens"] or 0)) - previous_total
+            database.execute(
+                "UPDATE api_tokens SET total_tokens = MAX(0, total_tokens + ?) WHERE id = ?",
+                (delta, current["token_id"]),
+            )
 
 
 def update_usage_record_safely(usage_id: str | None, **values: Any) -> None:
@@ -429,20 +563,66 @@ def load_settings() -> dict[str, Any]:
     try:
         if SETTINGS_FILE.exists():
             saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-            settings.update(saved)
+            settings.update({key: value for key, value in saved.items() if key not in RUNTIME_SETTINGS_KEYS})
+            embedded_backgrounds = str(settings.get("appearance_background") or "").startswith("data:image/") or any(
+                str(value).startswith("data:image/") for value in settings.get("appearance_backgrounds", [])
+            )
+            if any(key in saved for key in RUNTIME_SETTINGS_KEYS) or embedded_backgrounds:
+                save_settings(settings)
     except (OSError, json.JSONDecodeError) as exc:
         logger.warning("Could not load settings: %s", exc)
     return settings
 
 
+def persist_background(value: str) -> str:
+    if not value.startswith("data:image/"):
+        return value
+    match = re.fullmatch(r"data:image/(png|jpeg|jpg|webp|gif|avif);base64,(.+)", value, re.DOTALL | re.IGNORECASE)
+    if not match:
+        raise HTTPException(status_code=400, detail="背景图格式无效")
+    try:
+        content = base64.b64decode(match.group(2), validate=True)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="背景图数据无效") from exc
+    if not content or len(content) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="背景图大小必须在 5 MB 以内")
+    extension = "jpg" if match.group(1).lower() in {"jpeg", "jpg"} else match.group(1).lower()
+    filename = f"{hashlib.sha256(content).hexdigest()}.{extension}"
+    directory = DATA_DIR / "backgrounds"
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / filename
+    if not target.exists():
+        temporary = directory / f".{filename}.{secrets.token_hex(4)}.tmp"
+        temporary.write_bytes(content)
+        temporary.replace(target)
+    return f"/api/appearance/background/{filename}"
+
+
+def normalize_background_settings(settings: dict[str, Any]) -> None:
+    originals = [str(value) for value in settings.get("appearance_backgrounds", []) if value]
+    selected_original = str(settings.get("appearance_background") or "")
+    values = originals + ([selected_original] if selected_original and selected_original not in originals else [])
+    replacements = {value: persist_background(value) for value in values}
+    normalized = list(dict.fromkeys(replacements[value] for value in values))[-20:]
+    settings["appearance_backgrounds"] = normalized
+    settings["appearance_background"] = replacements.get(selected_original, selected_original)
+    directory = DATA_DIR / "backgrounds"
+    if directory.is_dir():
+        used = {Path(value).name for value in normalized if value.startswith("/api/appearance/background/")}
+        for path in directory.iterdir():
+            if path.is_file() and re.fullmatch(r"[0-9a-f]{64}\.(?:png|jpg|webp|gif|avif)", path.name) and path.name not in used:
+                path.unlink(missing_ok=True)
+
+
 def save_settings(settings: dict[str, Any]) -> None:
     temporary: Path | None = None
     try:
+        normalize_background_settings(settings)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         handle, path = tempfile.mkstemp(prefix="settings-", suffix=".tmp", dir=DATA_DIR)
         temporary = Path(path)
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(settings, stream, ensure_ascii=False, indent=2)
+            json.dump({key: value for key, value in settings.items() if key not in RUNTIME_SETTINGS_KEYS}, stream, ensure_ascii=False, indent=2)
             stream.flush()
             os.fsync(stream.fileno())
         temporary.replace(SETTINGS_FILE)
@@ -662,6 +842,16 @@ async def public_appearance() -> dict[str, str]:
     return {"background": str(load_settings().get("appearance_background") or "")}
 
 
+@app.get("/api/appearance/background/{filename}", include_in_schema=False)
+async def appearance_background(filename: str) -> FileResponse:
+    if not re.fullmatch(r"[0-9a-f]{64}\.(?:png|jpg|webp|gif|avif)", filename):
+        raise HTTPException(status_code=404, detail="背景图不存在")
+    path = DATA_DIR / "backgrounds" / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="背景图不存在")
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=31536000, immutable"})
+
+
 @app.post("/api/login")
 async def login(login_data: LoginRequest) -> JSONResponse:
     _, password_hash = configured_credentials()
@@ -771,25 +961,40 @@ async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
     healthy = sum(1 for item in results if item.get("ok"))
     checked_at = time.time()
     percent = round(healthy / checked * 100, 1) if checked else 0
-    history = settings.get("connectivity_history", []) if isinstance(settings.get("connectivity_history"), list) else []
-    history.append({"ts": checked_at, "results": [{"name": item["name"], "ok": item["ok"]} for item in results]})
-    settings["connectivity_history"] = history[-1000:]
-    save_settings(settings)
+    database_add_connectivity(
+        checked_at,
+        [{"name": item["name"], "ok": item["ok"]} for item in results],
+    )
+    history = database_connectivity_history()
     CONNECTIVITY_STATE.update({"checked_at": checked_at, "results": results, "availability_percent": percent})
     for item in results:
-        item.update(connectivity_metrics(settings["connectivity_history"], item["name"], checked_at))
+        item.update(connectivity_metrics(history, item["name"], checked_at))
     return {**CONNECTIVITY_STATE}
 
 
 @app.get("/api/settings/connectivity")
 async def get_connectivity(_: None = Depends(require_admin)) -> dict[str, Any]:
+    if CONNECTIVITY_STATE.get("checked_at") is None:
+        history = database_connectivity_history()
+        if history:
+            latest = history[-1]
+            results = [dict(item) for item in latest.get("results", [])]
+            for item in results:
+                item.setdefault("detail", "历史检测结果")
+                item.update(connectivity_metrics(history, str(item.get("name") or ""), float(latest["ts"])))
+            healthy = sum(1 for item in results if item.get("ok"))
+            CONNECTIVITY_STATE.update({
+                "checked_at": latest["ts"],
+                "results": results,
+                "availability_percent": round(healthy / len(results) * 100, 1) if results else 0,
+            })
     return {**CONNECTIVITY_STATE}
 
 
 @app.get("/api/settings/export")
 async def export_settings(_: None = Depends(require_admin)) -> Response:
     settings = load_settings()
-    safe = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS and key not in {"api_tokens", "export_history", "api_usage"}}
+    safe = {key: value for key, value in settings.items() if key in DEFAULT_SETTINGS}
     safe["api_key"] = ""
     for upstream in safe.get("upstreams", []):
         if isinstance(upstream, dict):
@@ -812,8 +1017,7 @@ async def import_settings(update: ConfigImportRequest, _: None = Depends(require
 async def reset_settings(_: None = Depends(require_admin)) -> dict[str, str]:
     current = load_settings()
     preserved = {key: current[key] for key in ("admin_username", "admin_password_hash", "_auth_revision") if key in current}
-    reset = DEFAULT_SETTINGS.copy()
-    reset["clean_patterns"] = DEFAULT_PATTERNS.copy()
+    reset = copy.deepcopy(DEFAULT_SETTINGS)
     reset.update(preserved)
     save_settings(reset)
     return {"message": "代理设置已恢复默认值"}
@@ -844,16 +1048,7 @@ async def update_account(
 
 @app.get("/api/tokens")
 async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
-    settings = load_settings()
-    items = settings.get("api_tokens", [])
-    usage_by_token: dict[str, int] = {}
-    for usage in settings.get("api_usage", []):
-        if not isinstance(usage, dict):
-            continue
-        token_id = str(usage.get("token_id") or "")
-        usage_by_token[token_id] = usage_by_token.get(token_id, 0) + max(
-            0, int(usage.get("total_tokens", usage.get("tokens", 0)) or 0)
-        )
+    items = database_tokens()
     now = int(time.time())
     result = []
     for item in items:
@@ -873,8 +1068,9 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
             "created_at": item.get("created_at"),
             "last_used_at": item.get("last_used_at"),
             "expires_at": expires_at,
-            "status": "active" if token_is_active(item, now) else "expired",
-            "total_tokens": max(0, int(item.get("total_tokens", usage_by_token.get(token_id, 0)) or 0)),
+            "enabled": bool(item.get("enabled", 1)),
+            "status": "active" if token_is_active(item, now) else ("disabled" if not item.get("enabled", 1) else "expired"),
+            "total_tokens": max(0, int(item.get("total_tokens", 0) or 0)),
         })
     return {"data": result}
 
@@ -882,33 +1078,51 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
 @app.post("/api/tokens")
 async def create_api_token(update: ApiTokenRequest, _: None = Depends(require_admin)) -> dict[str, Any]:
     raw = "cln_" + secrets.token_urlsafe(24)
-    settings = load_settings()
     token_id = uuid.uuid4().hex
-    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None, "total_tokens": 0}
-    settings.setdefault("api_tokens", []).append(item)
-    save_settings(settings)
+    item = {"id": token_id, "name": update.name.strip(), "hash": token_digest(raw), "cipher": token_cipher(raw, token_id), "created_at": int(time.time()), "last_used_at": None, "expires_at": update.expires_at, "enabled": 1, "total_tokens": 0}
+    with database_connection() as database:
+        database.execute(
+            """INSERT INTO api_tokens
+               (id, name, hash, cipher, created_at, last_used_at, expires_at, enabled, total_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            tuple(item[key] for key in ("id", "name", "hash", "cipher", "created_at", "last_used_at", "expires_at", "enabled", "total_tokens")),
+        )
     return {"id": item["id"], "name": item["name"], "token": raw, "created_at": item["created_at"]}
+
+
+@app.patch("/api/tokens/{token_id}/status")
+async def update_api_token_status(
+    token_id: str, update: ApiTokenStatusUpdate, _: None = Depends(require_admin)
+) -> dict[str, str]:
+    with database_connection() as database:
+        cursor = database.execute(
+            "UPDATE api_tokens SET enabled = ? WHERE id = ?", (int(update.enabled), token_id)
+        )
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="令牌不存在")
+    return {"message": "令牌已启用" if update.enabled else "令牌已停用"}
 
 
 @app.delete("/api/tokens/{token_id}")
 async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> dict[str, str]:
-    settings = load_settings(); before = len(settings.get("api_tokens", []))
-    settings["api_tokens"] = [i for i in settings.get("api_tokens", []) if not (isinstance(i, dict) and str(i.get("id")) == token_id)]
-    if len(settings["api_tokens"]) == before: raise HTTPException(status_code=404, detail="令牌不存在")
-    save_settings(settings); return {"message": "令牌已撤销"}
+    with database_connection() as database:
+        cursor = database.execute("DELETE FROM api_tokens WHERE id = ?", (token_id,))
+        if cursor.rowcount == 0:
+            raise HTTPException(status_code=404, detail="令牌不存在")
+    return {"message": "令牌已删除"}
 
 
 @app.get("/api/usage")
 async def api_usage(token_name: str = "", _: None = Depends(require_admin)) -> dict[str, Any]:
-    now = int(time.time()); recent = [item for item in load_settings().get("api_usage", API_USAGE) if now - int(item.get("at", 0)) < 30 * 86400]
-    if token_name:
-        recent = [item for item in recent if str(item.get("token_name") or "未命名") == token_name]
     local_now = datetime.now().astimezone()
     today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     yesterday_start = today_start - timedelta(days=1)
     week_start = today_start - timedelta(days=today_start.weekday())
     month_start = today_start.replace(day=1)
     year_start = today_start.replace(month=1, day=1)
+    recent = database_usage(int(min(year_start, yesterday_start).timestamp()))
+    if token_name:
+        recent = [item for item in recent if str(item.get("token_name") or "未命名") == token_name]
     def in_period(item: dict[str, Any], start: datetime, end: datetime | None = None) -> bool:
         at = datetime.fromtimestamp(int(item.get("at", 0)), local_now.tzinfo)
         return at >= start and (end is None or at < end)
@@ -1153,17 +1367,13 @@ async def export_ollama_archive(model: str, _: None = Depends(require_admin)) ->
         archive_path.unlink(missing_ok=True)
         raise
     filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", model) + ".ollama.tar.gz"
-    settings = load_settings()
-    history = settings.setdefault("export_history", [])
-    history.insert(0, {"id": uuid.uuid4().hex, "model": model, "filename": filename, "created_at": int(time.time()), "size": archive_path.stat().st_size})
-    settings["export_history"] = history[:100]
-    save_settings(settings)
+    database_add_export({"id": uuid.uuid4().hex, "model": model, "filename": filename, "created_at": int(time.time()), "size": archive_path.stat().st_size})
     return FileResponse(archive_path, filename=filename, media_type="application/gzip", background=BackgroundTask(archive_path.unlink, missing_ok=True))
 
 
 @app.get("/api/ollama/export-history")
 async def export_history(_: None = Depends(require_admin)) -> dict[str, Any]:
-    return {"data": load_settings().get("export_history", [])}
+    return {"data": database_export_history()}
 
 
 @app.get("/api/ollama/models/{model:path}")
