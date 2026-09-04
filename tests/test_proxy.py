@@ -43,6 +43,18 @@ def test_virtual_model_resolves_target_and_prioritizes_upstreams() -> None:
     assert [item["name"] for item in proxy.route_upstreams(settings, "coding-best")][:2] == ["backup", "primary"]
 
 
+def test_unknown_model_prefers_non_ollama_when_discovery_is_partial() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "https://pipio.example/v1",
+        "default_upstream_name": "pipio",
+        "upstreams": [{"name": "Ollama", "url": "http://127.0.0.1:11434/v1"}],
+    }).model_dump(mode="json")
+    proxy.MODEL_CACHE.update({"data": [{"id": "local-model", "upstream": "Ollama"}], "at": time.time(), "source": ""})
+    assert [item["name"] for item in proxy.route_upstreams(settings, "gpt-5.6-sol")][:2] == ["pipio", "Ollama"]
+    assert proxy.model_metadata({}, "local-model", ollama=True)["interfaces"] == ["v1/chat/completions"]
+    proxy.MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+
+
 def test_circuit_breaker_skips_open_upstream_and_recovers() -> None:
     settings = proxy.SettingsUpdate.model_validate({
         "target_api_url": "http://primary/v1",

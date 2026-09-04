@@ -1578,6 +1578,9 @@ def route_upstreams(settings: dict[str, Any], model: str, request: Request | Non
         if available:
             preferred = [item for name in available for item in upstreams if item["name"] == name]
     ordered = preferred + [item for item in upstreams if item not in preferred]
+    lookup_model = resolved_model(settings, model)
+    if MODEL_CACHE.get("data") and not any(item.get("id") == lookup_model for item in MODEL_CACHE["data"]):
+        ordered.sort(key=upstream_looks_ollama)
     available = [item for item in ordered if upstream_is_routable(item["name"])]
     # When discovery has explicitly declared endpoint support, avoid sending
     # an incompatible protocol to that upstream. Missing metadata remains
@@ -1613,6 +1616,12 @@ def remember_route(settings: dict[str, Any], model: str, upstream_name: str) -> 
 def upstream_stream_timeout(upstream: dict[str, Any]) -> httpx.Timeout:
     seconds = max(1.0, float(upstream.get("timeout") or 120))
     return httpx.Timeout(seconds, connect=min(seconds, 10.0), read=seconds, write=seconds, pool=min(seconds, 10.0))
+
+
+def upstream_looks_ollama(upstream: dict[str, Any]) -> bool:
+    """Identify the local Ollama OpenAI adapter without adding provider config."""
+    parsed = urlsplit(str(upstream.get("url") or ""))
+    return parsed.port == 11434 or parsed.path.rstrip("/").endswith("/ollama")
 
 
 def clean_stream_line(line: str, settings: dict[str, Any]) -> str:
@@ -2692,7 +2701,7 @@ async def system_events(_: None = Depends(require_admin)) -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control":"no-cache", "X-Accel-Buffering":"no"})
 
 
-def model_metadata(item: dict[str, Any], model_id: str) -> dict[str, Any]:
+def model_metadata(item: dict[str, Any], model_id: str, *, ollama: bool = False) -> dict[str, Any]:
     context_length = 0
     for key in ("context_length", "max_context_length", "context_window", "max_model_len"):
         try:
@@ -2733,6 +2742,8 @@ def model_metadata(item: dict[str, Any], model_id: str) -> dict[str, Any]:
             interfaces = ["v1/rerank"]
         elif any(marker in name for marker in ("dall-e", "image")):
             interfaces = ["v1/images/generations"]
+        elif ollama:
+            interfaces = ["v1/chat/completions"]
         else:
             interfaces = ["v1/chat/completions", "v1/responses"]
     return {"context_length": context_length or None, "capabilities": capabilities, "interfaces": list(dict.fromkeys(interfaces))}
@@ -2765,7 +2776,7 @@ async def get_models(refresh: bool = False, _: None = Depends(require_admin)) ->
                 model_id = item if isinstance(item, str) else item.get("id") or item.get("name") or item.get("model") if isinstance(item, dict) else None
                 if model_id:
                     details = item if isinstance(item, dict) else {}
-                    models.append({"id": str(model_id), "owned_by": str(details.get("owned_by") or details.get("owner") or "upstream"), "created": details.get("created") or details.get("modified_at"), "upstream": upstream["name"], **model_metadata(details, str(model_id))})
+                    models.append({"id": str(model_id), "owned_by": str(details.get("owned_by") or details.get("owner") or "upstream"), "created": details.get("created") or details.get("modified_at"), "upstream": upstream["name"], **model_metadata(details, str(model_id), ollama=upstream_looks_ollama(upstream))})
     if not models and failures:
         raise HTTPException(status_code=502, detail="获取上游模型失败：" + "；".join(failures))
     upstream_order = {item["name"]: index for index, item in enumerate(upstreams)}
