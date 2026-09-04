@@ -1171,3 +1171,19 @@ def test_third_stage_management_apis_require_admin(tmp_path: Path) -> None:
     assert client.post("/api/upstreams/import", json={"upstreams": [{"name": "x", "url": "http://x/v1"}]}).status_code == 401
     assert client.patch("/api/upstreams/status", json={"names": ["x"], "enabled": True}).status_code == 401
     assert client.get("/api/audit/logs").status_code == 401
+
+
+def test_sse_frame_helpers_and_retry_after() -> None:
+    frame, remainder = proxy.pop_sse_frame(b"event: response.output_text.delta\ndata: {\"delta\":\"ok\"}\n\nrest")
+    assert frame is not None and remainder == b"rest"
+    raw, payload = proxy.sse_frame_payload(frame)
+    assert raw.startswith("{\"delta\"")
+    assert payload == {"delta": "ok"}
+    assert proxy.chat_event_state("[DONE]", None) == (False, True, True)
+    assert proxy.retry_after_seconds({"retry-after": "7"}) == 7
+
+
+def test_responses_event_state_distinguishes_failure_and_output() -> None:
+    assert proxy.responses_event_state({"type": "response.created"}) == (False, False, False)
+    assert proxy.responses_event_state({"type": "response.failed", "error": {"message": "down"}})[0]
+    assert proxy.responses_event_state({"type": "response.output_text.delta", "delta": "hello"})[1]

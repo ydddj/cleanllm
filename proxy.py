@@ -21,6 +21,7 @@ import threading
 import io
 import csv
 import zipfile
+from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -119,6 +120,7 @@ CONNECTIVITY_WAKEUP = asyncio.Event()
 STATUS_SUBSCRIBERS: set[asyncio.Queue] = set()
 ROUTE_AFFINITY: dict[str, tuple[str, float]] = {}
 UPSTREAM_CIRCUITS: dict[str, dict[str, Any]] = {}
+NO_ROUTE_CACHE: dict[str, float] = {}
 ALERT_COOLDOWNS: dict[str, float] = {}
 INITIALIZED_DATABASES: set[str] = set()
 DATABASE_INIT_LOCK = threading.Lock()
@@ -1422,26 +1424,71 @@ def upstream_is_routable(name: str, now: float | None = None) -> bool:
 
 
 def record_upstream_failure(settings: dict[str, Any], name: str, error: str) -> None:
+    record_typed_upstream_failure(settings, name, error, "transient")
+
+
+def retry_after_seconds(headers: Any) -> int:
+    value = str(headers.get("retry-after", "") if headers else "").strip()
+    if not value:
+        return 0
+    try:
+        return max(0, int(float(value)))
+    except (TypeError, ValueError):
+        try:
+            retry_at = parsedate_to_datetime(value)
+            return max(0, int(retry_at.timestamp() - time.time()))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+
+def record_typed_upstream_failure(
+    settings: dict[str, Any],
+    name: str,
+    error: str,
+    category: str = "transient",
+    retry_after: int = 0,
+) -> None:
+    """Record failures with conservative, error-specific cooldown durations."""
     if not name:
         return
+    state = UPSTREAM_CIRCUITS.setdefault(name, {
+        "failures": 0, "open_until": 0.0, "last_error": "", "phase": "closed",
+        "probe_in_flight": False, "open_count": 0,
+    })
     threshold = max(1, int(settings.get("circuit_breaker_failures", 3)))
-    cooldown = max(5, int(settings.get("circuit_breaker_cooldown_seconds", 60)))
-    state = UPSTREAM_CIRCUITS.setdefault(name, {"failures": 0, "open_until": 0.0, "last_error": "", "phase": "closed", "probe_in_flight": False})
+    if category == "stream":
+        threshold = max(3, threshold)
     state["failures"] = int(state.get("failures") or 0) + 1
     state["last_error"] = str(error or "上游请求失败")[:500]
     state["last_failure_at"] = time.time()
-    if state["failures"] >= threshold:
-        state["open_until"] = time.time() + cooldown
-        state["phase"] = "open"
+    if state["failures"] < threshold:
         state["probe_in_flight"] = False
-        logger.warning("Upstream circuit opened: %s (%s)", name, state["last_error"])
-        if state["failures"] >= int(settings.get("alert_upstream_failures", threshold)):
-            schedule_alert("upstream_offline", f"上游已熔断：{name}", f"连续失败 {state['failures']} 次，冷却 {cooldown} 秒；{state['last_error']}")
+        return
+    base = max(5, int(settings.get("circuit_breaker_cooldown_seconds", 60)))
+    if category == "rate_limit":
+        cooldown = max(5, min(retry_after or 30, 120))
+    elif category == "auth":
+        cooldown = 300 if int(state.get("open_count") or 0) == 0 else 1800
+    else:
+        cooldown = min(base * (2 ** min(int(state.get("open_count") or 0), 3)), 300)
+    state["open_count"] = int(state.get("open_count") or 0) + 1
+    state["open_until"] = time.time() + cooldown
+    state["phase"] = "open"
+    state["probe_in_flight"] = False
+    logger.warning("Upstream circuit opened: %s (%s, %s seconds)", name, state["last_error"], cooldown)
+    if state["failures"] >= int(settings.get("alert_upstream_failures", threshold)):
+        schedule_alert("upstream_offline", f"上游已熔断：{name}", f"连续失败 {state['failures']} 次，冷却 {cooldown} 秒；{state['last_error']}")
 
 
-def record_upstream_http_result(settings: dict[str, Any], name: str, status_code: int) -> None:
-    if status_code == 429 or status_code >= 500:
-        record_upstream_failure(settings, name, f"HTTP {status_code}")
+def record_upstream_http_result(
+    settings: dict[str, Any], name: str, status_code: int, headers: Any = None
+) -> None:
+    if status_code == 429:
+        record_typed_upstream_failure(
+            settings, name, "HTTP 429", "rate_limit", retry_after_seconds(headers)
+        )
+    elif status_code >= 500:
+        record_typed_upstream_failure(settings, name, f"HTTP {status_code}", "transient")
     else:
         release_upstream_probe(name)
 
@@ -1490,6 +1537,12 @@ def weighted_virtual_upstreams(routes: list[dict[str, Any]], seed: str) -> list[
 
 
 def route_upstreams(settings: dict[str, Any], model: str, request: Request | None = None) -> list[dict[str, Any]]:
+    route_key = f"{model}|{request.url.path if request else ''}"
+    cached_until = NO_ROUTE_CACHE.get(route_key, 0.0)
+    if cached_until > time.time():
+        return []
+    if cached_until:
+        NO_ROUTE_CACHE.pop(route_key, None)
     upstreams = configured_upstreams(settings)
     names = {item["name"]: item for item in upstreams}
     preferred: list[dict[str, Any]] = []
@@ -1526,11 +1579,33 @@ def route_upstreams(settings: dict[str, Any], model: str, request: Request | Non
             preferred = [item for name in available for item in upstreams if item["name"] == name]
     ordered = preferred + [item for item in upstreams if item not in preferred]
     available = [item for item in ordered if upstream_is_routable(item["name"])]
+    # When discovery has explicitly declared endpoint support, avoid sending
+    # an incompatible protocol to that upstream. Missing metadata remains
+    # eligible so non-standard providers continue to work.
+    if request is not None and MODEL_CACHE.get("data"):
+        endpoint = request.url.path.removeprefix("/")
+        lookup_model = resolved_model(settings, model)
+        compatible = []
+        declared_any = False
+        for item in available:
+            records = [record for record in MODEL_CACHE["data"] if record.get("id") == lookup_model and record.get("upstream") == item["name"]]
+            declared = [interface for record in records for interface in (record.get("interfaces") or [])]
+            declared_any = declared_any or bool(declared)
+            if declared and endpoint not in {str(value).lstrip("/") for value in declared}:
+                continue
+            compatible.append(item)
+        if declared_any:
+            available = compatible
+    if not available:
+        NO_ROUTE_CACHE[route_key] = time.time() + 30.0
     return available
 
 
 def remember_route(settings: dict[str, Any], model: str, upstream_name: str) -> None:
     minutes = max(0, int(settings.get("route_affinity_minutes", 15)))
+    for key in list(NO_ROUTE_CACHE):
+        if key.startswith(f"{model}|"):
+            NO_ROUTE_CACHE.pop(key, None)
     if model and upstream_name and minutes:
         ROUTE_AFFINITY[model] = (upstream_name, time.time() + minutes * 60)
 
@@ -2525,6 +2600,7 @@ async def routing_status(_: None = Depends(require_admin)) -> dict[str, Any]:
 @app.post("/api/routing/circuits/reset")
 async def reset_routing_circuits(_: None = Depends(require_admin)) -> dict[str, str]:
     UPSTREAM_CIRCUITS.clear()
+    NO_ROUTE_CACHE.clear()
     return {"message": "上游熔断状态已重置"}
 
 
@@ -3037,17 +3113,159 @@ async def clear_logs(_: None = Depends(require_admin)) -> dict[str, str]:
     return {"message": "系统日志已清除"}
 
 
+SSE_KEEPALIVE_SECONDS = 8.0
+SSE_PREOUTPUT_LIMIT = 256 * 1024
+
+
+def pop_sse_frame(buffer: bytes) -> tuple[bytes | None, bytes]:
+    matches = []
+    for delimiter in (b"\r\n\r\n", b"\n\n", b"\r\r"):
+        index = buffer.find(delimiter)
+        if index >= 0:
+            matches.append((index, delimiter))
+    if not matches:
+        return None, buffer
+    index, delimiter = min(matches, key=lambda item: item[0])
+    end = index + len(delimiter)
+    return buffer[:end], buffer[end:]
+
+
+async def iter_sse_frames(response: Any, keepalive_seconds: float = SSE_KEEPALIVE_SECONDS):
+    """Yield complete SSE frames and None while an idle upstream needs a heartbeat."""
+    iterator = response.aiter_bytes().__aiter__()
+    pending = b""
+    read_task: asyncio.Task | None = None
+    try:
+        while True:
+            if read_task is None:
+                read_task = asyncio.create_task(iterator.__anext__())
+            done, _ = await asyncio.wait({read_task}, timeout=keepalive_seconds)
+            if not done:
+                yield None
+                continue
+            try:
+                chunk = read_task.result()
+            except StopAsyncIteration:
+                read_task = None
+                break
+            read_task = None
+            pending += chunk
+            while True:
+                frame, pending = pop_sse_frame(pending)
+                if frame is None:
+                    break
+                yield frame
+        if pending.strip():
+            yield pending
+    finally:
+        if read_task is not None and not read_task.done():
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+
+
+def sse_frame_payload(frame: bytes) -> tuple[str, dict[str, Any] | None]:
+    data_lines = []
+    for line in frame.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n"):
+        if line.startswith(b"data:"):
+            data_lines.append(line[5:].lstrip())
+    if not data_lines:
+        return "", None
+    raw = b"\n".join(data_lines).decode("utf-8", errors="replace").strip()
+    if raw == "[DONE]":
+        return raw, None
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return raw, None
+    return raw, payload if isinstance(payload, dict) else None
+
+
+def rewrite_sse_payload(frame: bytes, payload: dict[str, Any]) -> bytes:
+    lines = frame.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n")
+    prefix = [line for line in lines if line and not line.startswith(b"data:")]
+    data = b"data: " + json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return b"\n".join([*prefix, data]) + b"\n\n"
+
+
+def responses_event_state(payload: dict[str, Any] | None) -> tuple[bool, bool, bool]:
+    """Return semantic failure, meaningful output, and successful terminal state."""
+    if not payload:
+        return False, False, False
+    event_type = str(payload.get("type") or "").lower()
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+    status_value = str(payload.get("status") or response.get("status") or "").lower()
+    failed = bool(payload.get("error")) or event_type in {
+        "error", "response.error", "response.failed"
+    } or status_value in {"error", "failed"}
+    terminal = event_type in {"response.completed", "response.incomplete"} or status_value in {
+        "completed", "incomplete"
+    }
+    control = {"response.created", "response.in_progress", "response.queued"}
+    meaningful = terminal or (event_type.startswith("response.") and event_type not in control and not failed)
+    if event_type.endswith(".delta"):
+        meaningful = any(bool(payload.get(key)) for key in ("delta", "text", "arguments"))
+    return failed, meaningful, terminal
+
+
+def chat_event_state(raw: str, payload: dict[str, Any] | None) -> tuple[bool, bool, bool]:
+    if raw == "[DONE]":
+        return False, True, True
+    if not payload:
+        return False, False, False
+    failed = bool(payload.get("error")) or str(payload.get("type") or "").lower() in {
+        "error", "response.error", "response.failed"
+    }
+    meaningful = False
+    terminal = False
+    for choice in payload.get("choices", []) if isinstance(payload.get("choices"), list) else []:
+        if not isinstance(choice, dict):
+            continue
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+        if delta.get("content") or delta.get("tool_calls") or delta.get("function_call"):
+            meaningful = True
+        if choice.get("finish_reason") is not None:
+            meaningful = True
+            terminal = True
+    return failed, meaningful, terminal
+
+
+def stream_failure_event(model: str, message: str) -> bytes:
+    failed = {
+        "type": "response.failed",
+        "response": {
+            "id": f"resp-{secrets.token_hex(12)}", "object": "response",
+            "created_at": int(time.time()), "model": model, "status": "failed",
+            "error": {"type": "upstream_error", "message": message},
+        },
+    }
+    return f"event: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
+
+
+def chat_stream_failure_event(message: str) -> bytes:
+    payload = {"error": {"message": message, "type": "upstream_error"}}
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\ndata: [DONE]\n\n".encode()
+
+
 async def native_responses_stream(payload: dict[str, Any], settings: dict[str, Any], request: Request) -> Response:
-    """Relay native Responses SSE while preserving event order and stream semantics."""
+    """Relay Responses SSE and fail over until the first meaningful output."""
     failures: list[str] = []
     requested_model = str(payload.get("model") or "")
     target_model = resolved_model(settings, requested_model)
+    candidates = route_upstreams(settings, requested_model, request)
+    usage_id = getattr(request.state, "usage_id", None)
     attempts = 0
-    for upstream in route_upstreams(settings, requested_model, request):
+
+    async def connect(upstream: dict[str, Any]) -> tuple[Any, Any, float] | None:
+        nonlocal attempts
         if not acquire_upstream(upstream["name"]):
-            continue
+            return None
         attempts += 1
-        update_usage_record_safely(getattr(request.state, "usage_id", None), resolved_model=target_model, upstream=upstream["name"], attempts=attempts)
+        update_usage_record_safely(
+            usage_id, resolved_model=target_model, upstream=upstream["name"], attempts=attempts
+        )
         headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
         if upstream["api_key"]:
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
@@ -3057,167 +3275,156 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
         try:
             logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
             response = await client.send(
-                client.build_request("POST", responses_url, json={**payload, "model": target_model, "stream": True}, headers=headers),
+                client.build_request(
+                    "POST", responses_url,
+                    json={**payload, "model": target_model, "stream": True}, headers=headers,
+                ),
                 stream=True,
             )
         except httpx.RequestError as exc:
             failures.append(f"{upstream['name']}: {exc}")
-            record_upstream_failure(settings, upstream["name"], str(exc))
+            record_typed_upstream_failure(settings, upstream["name"], str(exc), "transient")
             await client.aclose()
-            continue
+            return None
         if response.status_code >= 400:
             failures.append(f"{upstream['name']}: HTTP {response.status_code}")
-            record_upstream_http_result(settings, upstream["name"], response.status_code)
+            record_upstream_http_result(
+                settings, upstream["name"], response.status_code, getattr(response, "headers", None)
+            )
             await response.aclose()
             await client.aclose()
-            continue
-        response_settings = {
-            **settings,
-            "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", [])),
-        }
+            return None
+        return client, response, started
 
-        async def relay() -> Any:
-            pending = b""
-            first_byte_recorded = False
-            state: dict[str, Any] = {
-                "completed": False,
-                "successful_terminal": False,
-                "terminal": False,
-                "text_done": False,
-                "text": "",
-                "response": None,
+    first_index = -1
+    first_connection = None
+    for index, upstream in enumerate(candidates):
+        first_connection = await connect(upstream)
+        if first_connection is not None:
+            first_index = index
+            break
+    if first_connection is None:
+        detail = "所有上游 Responses 接口均不可用：" + "；".join(failures)
+        update_usage_record_safely(
+            usage_id, status_code=502, error=detail, termination_reason="no_upstream_available"
+        )
+        return JSONResponse(status_code=502, content={"error": {"message": detail, "type": "upstream_error"}})
+
+    async def relay() -> Any:
+        connection = first_connection
+        output_started = False
+        for index in range(first_index, len(candidates)):
+            upstream = candidates[index]
+            if index != first_index:
+                connection = await connect(upstream)
+                if connection is None:
+                    continue
+            client, response, started = connection
+            response_settings = {
+                **settings,
+                "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", [])),
             }
-
-            def process_line(raw_line: bytes) -> bytes:
-                line = raw_line.rstrip(b"\r")
-                if not line.startswith(b"data:"):
-                    return raw_line
-                data = line[5:].lstrip()
-                if not data:
-                    return raw_line
-                if data == b"[DONE]":
-                    state["done_marker"] = True
-                    return raw_line
-                try:
-                    event = json.loads(data)
-                except (ValueError, UnicodeDecodeError):
-                    return raw_line
-                if not isinstance(event, dict):
-                    return raw_line
-                event_type = str(event.get("type") or "")
-                if event_type == "response.output_text.delta":
-                    delta = clean_content(str(event.get("delta") or ""), response_settings, strip_result=False)
-                    event["delta"] = delta
-                    state["text"] += delta
-                elif event_type == "response.output_text.done":
-                    state["text_done"] = True
-                    if not state["text"]:
-                        text = clean_content(str(event.get("text") or ""), response_settings)
-                        event["text"] = text
-                        state["text"] = text
-                response_data = event.get("response")
-                if isinstance(response_data, dict):
-                    state["response"] = response_data
-                if event_type == "response.completed" or (
-                    isinstance(response_data, dict) and response_data.get("status") == "completed"
-                ):
-                    state["completed"] = True
-                    state["successful_terminal"] = True
-                    state["terminal"] = True
-                    update_usage_record_safely(
-                        getattr(request.state, "usage_id", None),
-                        termination_reason="response.completed",
-                        **usage_values(response_data.get("usage")),
-                    )
-                    remember_route(settings, str(payload.get("model") or ""), upstream["name"])
-                elif event_type == "response.incomplete" or (
-                    isinstance(response_data, dict) and response_data.get("status") == "incomplete"
-                ):
-                    state["successful_terminal"] = True
-                    state["terminal"] = True
-                    update_usage_record_safely(
-                        getattr(request.state, "usage_id", None),
-                        termination_reason="response.incomplete",
-                        **usage_values(response_data.get("usage")),
-                    )
-                    remember_route(settings, str(payload.get("model") or ""), upstream["name"])
-                elif event_type == "response.failed" or (
-                    isinstance(response_data, dict) and response_data.get("status") == "failed"
-                ):
-                    state["terminal"] = True
-                    state["failed"] = True
-                    update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="response.failed")
-                return b"data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-
+            buffered: list[bytes] = []
+            buffered_size = 0
+            terminal = False
+            successful_terminal = False
+            semantic_failure = False
+            first_byte_recorded = False
+            stream_error = ""
             try:
-                async for chunk in response.aiter_bytes():
+                async for frame in iter_sse_frames(response):
+                    if frame is None:
+                        yield b": cleanllm-keepalive\n\n"
+                        continue
                     if not first_byte_recorded:
-                        update_usage_record_safely(getattr(request.state, "usage_id", None), first_byte_ms=round((time.perf_counter() - started) * 1000, 1))
+                        update_usage_record_safely(
+                            usage_id, first_byte_ms=round((time.perf_counter() - started) * 1000, 1)
+                        )
                         first_byte_recorded = True
-                    pending += chunk
-                    while b"\n" in pending:
-                        line, pending = pending.split(b"\n", 1)
-                        yield process_line(line) + b"\n"
+                    raw, event = sse_frame_payload(frame)
+                    if event is not None:
+                        event_type = str(event.get("type") or "")
+                        response_data = event.get("response") if isinstance(event.get("response"), dict) else {}
+                        if event_type == "response.output_text.delta":
+                            event["delta"] = clean_content(
+                                str(event.get("delta") or ""), response_settings, strip_result=False
+                            )
+                        elif event_type == "response.output_text.done":
+                            event["text"] = clean_content(str(event.get("text") or ""), response_settings)
+                        failed, meaningful, successful = responses_event_state(event)
+                        if failed:
+                            terminal = True
+                            semantic_failure = True
+                            update_usage_record_safely(usage_id, termination_reason="response.failed")
+                        elif successful:
+                            terminal = True
+                            successful_terminal = True
+                            reason = "response.incomplete" if event_type == "response.incomplete" else "response.completed"
+                            update_usage_record_safely(
+                                usage_id, termination_reason=reason,
+                                **usage_values(response_data.get("usage")),
+                            )
+                        frame = rewrite_sse_payload(frame, event)
+                    else:
+                        failed, meaningful, successful = False, raw == "[DONE]", False
+
+                    if semantic_failure and not output_started:
+                        stream_error = "上游在业务输出前返回失败事件"
+                        break
+                    if meaningful and not output_started:
+                        output_started = True
+                        for item in buffered:
+                            yield item
+                        buffered.clear()
+                    if output_started:
+                        yield frame
+                    else:
+                        buffered.append(frame)
+                        buffered_size += len(frame)
+                        if buffered_size > SSE_PREOUTPUT_LIMIT:
+                            stream_error = "业务输出前事件超过缓冲上限"
+                            break
             except httpx.RequestError as exc:
-                logger.warning("Responses stream from %s disconnected: %s", upstream["name"], exc)
-                record_upstream_failure(settings, upstream["name"], str(exc))
-                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流意外中断", termination_reason="stream_disconnected")
-                if not state["terminal"]:
-                    failed = {
-                        "type": "response.failed",
-                        "response": {
-                            "id": f"resp-{secrets.token_hex(12)}",
-                            "object": "response",
-                            "created_at": int(time.time()),
-                            "model": payload.get("model"),
-                            "status": "failed",
-                            "error": {"type": "upstream_error", "message": "上游响应流意外中断"},
-                        },
-                    }
-                    yield f"\n\nevent: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
-            else:
-                if pending:
-                    yield process_line(pending)
-                if not state["terminal"]:
-                    failed = {
-                        "type": "response.failed",
-                        "response": {
-                            "id": f"resp-{secrets.token_hex(12)}",
-                            "object": "response",
-                            "created_at": int(time.time()),
-                            "model": payload.get("model"),
-                            "status": "failed",
-                            "error": {"type": "upstream_error", "message": "上游响应流未正常结束"},
-                        },
-                    }
-                    logger.warning("Responses stream from %s ended without response.completed", upstream["name"])
-                    record_upstream_failure(settings, upstream["name"], "响应流未收到 response.completed")
-                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束", termination_reason="missing_terminal_event")
-                    yield f"\nevent: response.failed\ndata: {json.dumps(failed, ensure_ascii=False)}\n\n".encode()
+                stream_error = f"上游响应流意外中断：{exc}"
             finally:
                 await response.aclose()
                 await client.aclose()
-                if state["successful_terminal"]:
-                    record_upstream_success(upstream["name"])
-                    logger.info("Responses stream ended normally: %s", upstream["name"])
-                elif state.get("failed"):
-                    record_upstream_failure(settings, upstream["name"], "上游返回 response.failed")
                 update_usage_record_safely(
-                    getattr(request.state, "usage_id", None),
-                    latency_ms=round((time.perf_counter() - started) * 1000, 1),
+                    usage_id, latency_ms=round((time.perf_counter() - started) * 1000, 1)
                 )
 
-        return StreamingResponse(
-            relay(),
-            status_code=response.status_code,
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+            if successful_terminal:
+                record_upstream_success(upstream["name"])
+                remember_route(settings, requested_model, upstream["name"])
+                logger.info("Responses stream ended normally: %s", upstream["name"])
+                return
+            failure_message = stream_error or "上游响应流未正常结束"
+            failures.append(f"{upstream['name']}: {failure_message}")
+            record_typed_upstream_failure(
+                settings, upstream["name"], failure_message, "stream"
+            )
+            if output_started:
+                update_usage_record_safely(
+                    usage_id, status_code=502, error=failure_message,
+                    termination_reason="stream_disconnected" if stream_error else "missing_terminal_event",
+                )
+                if not terminal:
+                    yield stream_failure_event(requested_model, failure_message)
+                return
+            logger.warning(
+                "Responses stream from %s failed before business output; trying next upstream: %s",
+                upstream["name"], failure_message,
+            )
+
+        detail = "所有上游 Responses 接口均不可用：" + "；".join(failures)
+        update_usage_record_safely(
+            usage_id, status_code=502, error=detail, termination_reason="no_upstream_available"
         )
-    detail = "所有上游 Responses 接口均不可用：" + "；".join(failures)
-    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
-    return JSONResponse(
-        status_code=502,
-        content={"error": {"message": detail, "type": "upstream_error"}},
+        yield stream_failure_event(requested_model, detail)
+
+    return StreamingResponse(
+        relay(), status_code=200, media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
     )
 
 
@@ -3506,7 +3713,9 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     selected = None
     client = None
     attempts = 0
-    for upstream in route_upstreams(settings, requested_model, request):
+    candidates = route_upstreams(settings, requested_model, request)
+    selected_index = -1
+    for index, upstream in enumerate(candidates):
         if not acquire_upstream(upstream["name"]):
             continue
         attempts += 1
@@ -3520,11 +3729,15 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=upstream_payload, headers=headers), stream=True)
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
-                    record_upstream_http_result(settings, upstream["name"], candidate.status_code)
+                    record_upstream_http_result(
+                        settings, upstream["name"], candidate.status_code,
+                        getattr(candidate, "headers", None),
+                    )
                     await candidate.aclose()
                     await candidate_client.aclose()
                     continue
                 client, response, selected = candidate_client, candidate, upstream
+                selected_index = index
             else:
                 async with httpx.AsyncClient() as candidate_client:
                     candidate = await candidate_client.post(upstream["url"], json=upstream_payload, headers=headers, timeout=float(upstream["timeout"]))
@@ -3533,6 +3746,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                     record_upstream_http_result(settings, upstream["name"], candidate.status_code)
                     continue
                 response, selected = candidate, upstream
+                selected_index = index
             break
         except httpx.RequestError as exc:
             record_upstream_failure(settings, upstream["name"], str(exc))
@@ -3546,43 +3760,104 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     if streaming:
         stream_started = proxy_started
         async def stream_response():
-            buffer = ""
-            completed = False
-            first_byte_recorded = False
-            try:
-                async for text in response.aiter_text():
-                    if not first_byte_recorded:
-                        update_usage_record_safely(getattr(request.state, "usage_id", None), first_byte_ms=round((time.perf_counter() - stream_started) * 1000, 1))
-                        first_byte_recorded = True
-                    buffer += text
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
-                        if line.strip() == "data: [DONE]":
+            nonlocal attempts
+            current_client, current_response, current_upstream = client, response, selected
+            current_index = selected_index
+            emitted_output = False
+            failures_before_output = []
+            while current_upstream is not None:
+                completed = False
+                meaningful = False
+                buffered = []
+                buffered_size = 0
+                stream_error = ""
+                try:
+                    async for frame in iter_sse_frames(current_response):
+                        if frame is None:
+                            yield b": cleanllm-keepalive\n\n"
+                            continue
+                        if not frame.strip():
+                            continue
+                        raw, chunk = sse_frame_payload(frame)
+                        if chunk is not None:
+                            update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(chunk.get("usage")))
+                        failed, has_output, terminal = chat_event_state(raw, chunk)
+                        if failed:
+                            stream_error = "上游返回错误事件"
+                            break
+                        cleaned = frame
+                        if chunk is not None and raw != "[DONE]":
+                            text_frame = frame.decode("utf-8", errors="replace")
+                            cleaned = b"\n".join(
+                                (clean_stream_line(line, response_settings)).encode("utf-8")
+                                for line in text_frame.rstrip("\n").split("\n")
+                            ) + b"\n\n"
+                        if has_output:
+                            meaningful = True
+                            emitted_output = True
+                            for pending_frame in buffered:
+                                yield pending_frame
+                            buffered.clear()
+                        if emitted_output:
+                            yield cleaned
+                        else:
+                            buffered.append(cleaned)
+                            buffered_size += len(cleaned)
+                            if buffered_size > SSE_PREOUTPUT_LIMIT:
+                                stream_error = "业务输出前事件超过缓冲上限"
+                                break
+                        if terminal:
                             completed = True
-                        elif line.startswith("data: "):
-                            try:
-                                chunk = json.loads(line[6:])
-                                update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(chunk.get("usage")))
-                                if any(choice.get("finish_reason") for choice in chunk.get("choices", []) if isinstance(choice, dict)):
-                                    completed = True
-                            except (ValueError, AttributeError):
-                                pass
-                        yield (clean_stream_line(line, response_settings) + "\n").encode("utf-8")
-                if buffer:
-                    if buffer.strip() == "data: [DONE]":
-                        completed = True
-                    yield clean_stream_line(buffer, response_settings).encode("utf-8")
-            finally:
-                await response.aclose()
-                await client.aclose()
+                    if not stream_error and not completed:
+                        stream_error = "上游响应流未正常结束"
+                except httpx.RequestError as exc:
+                    stream_error = f"上游响应流意外中断：{exc}"
+                finally:
+                    await current_response.aclose()
+                    await current_client.aclose()
                 if completed:
-                    record_upstream_success(selected["name"])
-                    remember_route(settings, requested_model, selected["name"])
-                    update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="stream_completed")
-                else:
-                    record_upstream_failure(settings, selected["name"], "响应流未正常结束")
-                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游响应流未正常结束", termination_reason="missing_terminal_event")
-                update_usage_record_safely(getattr(request.state, "usage_id", None), latency_ms=round((time.perf_counter() - stream_started) * 1000, 1))
+                    record_upstream_success(current_upstream["name"])
+                    remember_route(settings, requested_model, current_upstream["name"])
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="stream_completed", latency_ms=round((time.perf_counter() - stream_started) * 1000, 1))
+                    return
+                record_typed_upstream_failure(settings, current_upstream["name"], stream_error, "stream")
+                failures_before_output.append(f"{current_upstream['name']}: {stream_error}")
+                if emitted_output:
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=stream_error, termination_reason="stream_disconnected")
+                    yield chat_stream_failure_event(stream_error)
+                    return
+                next_connection = None
+                for next_index in range(current_index + 1, len(candidates)):
+                    candidate_upstream = candidates[next_index]
+                    if not acquire_upstream(candidate_upstream["name"]):
+                        continue
+                    attempts += 1
+                    headers = {"Content-Type": "application/json"}
+                    if candidate_upstream["api_key"]:
+                        headers["Authorization"] = f"Bearer {candidate_upstream['api_key']}"
+                    candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(candidate_upstream))
+                    try:
+                        candidate_response = await candidate_client.send(candidate_client.build_request("POST", candidate_upstream["url"], json=upstream_payload, headers=headers), stream=True)
+                    except httpx.RequestError as exc:
+                        await candidate_client.aclose()
+                        record_typed_upstream_failure(settings, candidate_upstream["name"], str(exc), "transient")
+                        failures_before_output.append(f"{candidate_upstream['name']}: {exc}")
+                        continue
+                    if candidate_response.status_code >= 400:
+                        record_upstream_http_result(settings, candidate_upstream["name"], candidate_response.status_code, getattr(candidate_response, "headers", None))
+                        failures_before_output.append(f"{candidate_upstream['name']}: HTTP {candidate_response.status_code}")
+                        await candidate_response.aclose(); await candidate_client.aclose()
+                        continue
+                    current_client, current_response, current_upstream, current_index = candidate_client, candidate_response, candidate_upstream, next_index
+                    update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=current_upstream["name"], attempts=attempts)
+                    next_connection = True
+                    break
+                if next_connection:
+                    continue
+                detail = "所有上游均不可用：" + "；".join(failures_before_output)
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
+                yield chat_stream_failure_event(detail)
+                return
         return StreamingResponse(stream_response(), status_code=response.status_code, media_type=response.headers.get("content-type", "text/event-stream"))
     try:
         data = response.json()
