@@ -1235,6 +1235,112 @@ def clean_content(text: str, settings: dict[str, Any], *, strip_result: bool = T
     return text.strip() if strip_result else text
 
 
+class StreamTextCleaner:
+    """Incrementally clean text while preserving tags split across SSE events."""
+
+    _TAG_RE = re.compile(r"[<＜]\s*[*＊]?\s*[|｜/]?\s*[*＊]?\s*([A-Za-z0-9_]+)", re.IGNORECASE)
+
+    def __init__(self, settings: dict[str, Any], *, max_buffer: int = 8192):
+        self.settings = settings
+        self.max_buffer = max(256, int(max_buffer))
+        self.pending = ""
+        self.suppressed_tag: str | None = None
+        self.last_input_nonempty = False
+        self.last_output_nonempty = False
+        names: dict[str, int] = {}
+        ignored = {"is", "im", "s", "i", "or", "and", "if", "else"}
+        self._has_tag_pattern = False
+        for raw in settings.get("clean_patterns", []) or []:
+            try:
+                re.compile(str(raw))
+            except re.error:
+                continue
+            self._has_tag_pattern = self._has_tag_pattern or "<" in str(raw) or "＜" in str(raw)
+            # The source may contain escaped markup, so identify repeated
+            # tag-name words rather than relying on a literal tag match.
+            words = re.findall(r"\b[A-Za-z][A-Za-z0-9_]*\b", str(raw))
+            for name in words:
+                name = name.lower()
+                if name not in ignored:
+                    names[name] = names.get(name, 0) + 1
+        self._suppressed_names = {name for name, count in names.items() if count >= 2}
+        self._opening_names = tuple(sorted(self._suppressed_names))
+        self._open_re = (
+            re.compile(
+                r"[<＜]\s*[*＊]?\s*[|｜]*\s*(?:"
+                + "|".join(re.escape(name) for name in self._opening_names)
+                + r")\s*[*＊]?\s*[>＞]",
+                re.IGNORECASE,
+            )
+            if self._opening_names else None
+        )
+
+    def _closing_re(self, name: str) -> re.Pattern[str]:
+        return re.compile(
+            r"[<＜]\s*[*＊]?\s*[|｜/]*\s*" + re.escape(name)
+            + r"\s*[*＊]?\s*[|｜]*\s*[>＞]",
+            re.IGNORECASE,
+        )
+
+    def _clean_safe(self, value: str) -> str:
+        return clean_content(value, self.settings, strip_result=False)
+
+    def _may_be_open_prefix(self, value: str) -> bool:
+        if not self._has_tag_pattern or not value or value[0] not in "<＜":
+            return False
+        if ">" in value or "＞" in value:
+            return False
+        normalized = re.sub(r"[<＜\s*＊|｜]", "", value).lower()
+        return not normalized or any(name.startswith(normalized) for name in self._opening_names) or (
+            bool(re.search(r"[A-Za-z0-9_]", normalized)) and len(normalized) < 64
+        )
+
+    def feed(self, text: str) -> str:
+        self.last_input_nonempty = bool(text)
+        if not text:
+            self.last_output_nonempty = False
+            return ""
+        self.pending += str(text)
+        output: list[str] = []
+        while self.pending:
+            if self.suppressed_tag:
+                closing = self._closing_re(self.suppressed_tag).search(self.pending)
+                if closing:
+                    self.pending = self.pending[closing.end():]
+                    self.suppressed_tag = None
+                    continue
+                self.pending = self.pending[-min(self.max_buffer, max(32, len(self.suppressed_tag) + 16)):]
+                break
+            opening = self._open_re.search(self.pending) if self._open_re else None
+            if opening:
+                output.append(self._clean_safe(self.pending[:opening.start()]))
+                self.pending = self.pending[opening.end():]
+                match = self._TAG_RE.search(opening.group(0))
+                self.suppressed_tag = match.group(1).lower() if match else None
+                continue
+            last_open = max(self.pending.rfind("<"), self.pending.rfind("＜"))
+            candidate = self.pending[last_open:] if last_open >= 0 else ""
+            if self._may_be_open_prefix(candidate) and len(candidate) <= self.max_buffer:
+                if last_open:
+                    output.append(self._clean_safe(self.pending[:last_open]))
+                self.pending = self.pending[last_open:]
+            else:
+                output.append(self._clean_safe(self.pending))
+                self.pending = ""
+            break
+        result = "".join(output)
+        self.last_output_nonempty = bool(result)
+        return result
+
+    def flush(self) -> str:
+        if self.suppressed_tag:
+            self.pending = ""
+            return ""
+        value = self._clean_safe(self.pending)
+        self.pending = ""
+        return value
+
+
 def models_url_for_target(target_url: str, override: str = "") -> str:
     override = str(override or "").strip()
     if override:
@@ -1624,7 +1730,11 @@ def upstream_looks_ollama(upstream: dict[str, Any]) -> bool:
     return parsed.port == 11434 or parsed.path.rstrip("/").endswith("/ollama")
 
 
-def clean_stream_line(line: str, settings: dict[str, Any]) -> str:
+def clean_stream_line(
+    line: str,
+    settings: dict[str, Any],
+    cleaner: StreamTextCleaner | None = None,
+) -> str:
     if not line.startswith("data: ") or line.strip() == "data: [DONE]":
         return line
     try:
@@ -1632,7 +1742,11 @@ def clean_stream_line(line: str, settings: dict[str, Any]) -> str:
         for choice in payload.get("choices", []):
             delta = choice.get("delta") or {}
             if isinstance(delta.get("content"), str):
-                delta["content"] = clean_content(delta["content"], settings, strip_result=False)
+                delta["content"] = (
+                    cleaner.feed(delta["content"])
+                    if cleaner is not None
+                    else clean_content(delta["content"], settings, strip_result=False)
+                )
         return "data: " + json.dumps(payload, ensure_ascii=False)
     except (json.JSONDecodeError, TypeError):
         return line
@@ -3342,6 +3456,8 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             semantic_failure = False
             first_byte_recorded = False
             stream_error = ""
+            cleaner = StreamTextCleaner(response_settings)
+            last_keepalive = time.monotonic()
             try:
                 async for frame in iter_sse_frames(response):
                     if frame is None:
@@ -3357,9 +3473,11 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                         event_type = str(event.get("type") or "")
                         response_data = event.get("response") if isinstance(event.get("response"), dict) else {}
                         if event_type == "response.output_text.delta":
-                            event["delta"] = clean_content(
-                                str(event.get("delta") or ""), response_settings, strip_result=False
-                            )
+                            raw_delta = str(event.get("delta") or "")
+                            event["delta"] = cleaner.feed(raw_delta)
+                            if raw_delta and not event["delta"] and time.monotonic() - last_keepalive >= SSE_KEEPALIVE_SECONDS:
+                                yield b": cleanllm-keepalive\n\n"
+                                last_keepalive = time.monotonic()
                         elif event_type == "response.output_text.done":
                             event["text"] = clean_content(str(event.get("text") or ""), response_settings)
                         failed, meaningful, successful = responses_event_state(event)
@@ -3585,34 +3703,59 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                             selected_name = upstream["name"]
                             emitted = False
                             event_name = "message"
-                            async for line in upstream_response.aiter_lines():
-                                if line.startswith("event: "):
-                                    event_name = line[7:].strip() or "message"
+                            fallback_settings = {
+                                **settings,
+                                "clean_patterns": upstream.get("clean_patterns", settings.get("clean_patterns", [])),
+                            }
+                            fallback_cleaner = StreamTextCleaner(fallback_settings)
+                            last_keepalive = time.monotonic()
+                            async for frame in iter_sse_frames(upstream_response):
+                                if frame is None:
+                                    yield ": cleanllm-keepalive\n\n"
+                                    last_keepalive = time.monotonic()
                                     continue
-                                if line == "data: [DONE]":
+                                frame_lines = frame.decode("utf-8", errors="replace").splitlines()
+                                event_name = next(
+                                    (line[7:].strip() or "message" for line in frame_lines if line.startswith("event: ")),
+                                    "message",
+                                )
+                                raw, chunk = sse_frame_payload(frame)
+                                if raw == "[DONE]":
+                                    tail = fallback_cleaner.flush()
+                                    if tail:
+                                        complete_text += tail
+                                        sequence_number += 1
+                                        yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','item_id':item_id,'output_index':0,'content_index':0,'delta':tail,'response_id':response_id,'sequence_number':sequence_number}, ensure_ascii=False)}\n\n"
                                     chat_done = True
                                     continue
-                                if not line.startswith("data: "):
+                                if not isinstance(chunk, dict):
                                     continue
-                                try:
-                                    chunk = json.loads(line[6:])
-                                    if isinstance(chunk, dict) and str(chunk.get("type", "")).startswith("response."):
-                                        emitted = True
-                                        if chunk.get("type") == "response.output_text.delta":
-                                            delta = clean_content(str(chunk.get("delta", "")), {**settings, "clean_patterns": upstream.get("clean_patterns", [])}, strip_result=False)
-                                            chunk["delta"] = delta
-                                            complete_text += delta
-                                        if chunk.get("type") == "response.completed":
-                                            native_completed = True
-                                            update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values((chunk.get("response") or {}).get("usage")))
-                                        yield f"event: {event_name}\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-                                        continue
-                                    delta = chunk.get("delta", "") or chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
-                                except (ValueError, IndexError, AttributeError):
+                                if str(chunk.get("type", "")).startswith("response."):
+                                    emitted = True
+                                    if chunk.get("type") == "response.output_text.delta":
+                                        delta = fallback_cleaner.feed(str(chunk.get("delta") or ""))
+                                        chunk["delta"] = delta
+                                        complete_text += delta
+                                        if not delta and time.monotonic() - last_keepalive >= SSE_KEEPALIVE_SECONDS:
+                                            yield ": cleanllm-keepalive\n\n"
+                                            last_keepalive = time.monotonic()
+                                    if chunk.get("type") == "response.completed":
+                                        native_completed = True
+                                        update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values((chunk.get("response") or {}).get("usage")))
+                                    yield f"event: {event_name}\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
                                     continue
-                                if not isinstance(delta, str) or not delta: continue
-                                delta = clean_content(delta, {**settings, "clean_patterns": upstream.get("clean_patterns", [])}, strip_result=False)
-                                if not delta: continue
+                                delta = chunk.get("delta", "") or (
+                                    chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                    if isinstance(chunk.get("choices"), list) and chunk.get("choices") else ""
+                                )
+                                if not isinstance(delta, str) or not delta:
+                                    continue
+                                delta = fallback_cleaner.feed(delta)
+                                if not delta:
+                                    if time.monotonic() - last_keepalive >= SSE_KEEPALIVE_SECONDS:
+                                        yield ": cleanllm-keepalive\n\n"
+                                        last_keepalive = time.monotonic()
+                                    continue
                                 complete_text += delta
                                 emitted = True
                                 sequence_number += 1
@@ -3774,6 +3917,11 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
             nonlocal attempts
             current_client, current_response, current_upstream = client, response, selected
             current_index = selected_index
+            current_settings = {
+                **settings,
+                "clean_patterns": current_upstream.get("clean_patterns", settings.get("clean_patterns", [])),
+            }
+            current_cleaner = StreamTextCleaner(current_settings)
             emitted_output = False
             failures_before_output = []
             while current_upstream is not None:
@@ -3782,6 +3930,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 buffered = []
                 buffered_size = 0
                 stream_error = ""
+                last_keepalive = time.monotonic()
                 try:
                     async for frame in iter_sse_frames(current_response):
                         if frame is None:
@@ -3797,18 +3946,50 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                             stream_error = "上游返回错误事件"
                             break
                         cleaned = frame
+                        flush_frame: bytes | None = None
                         if chunk is not None and raw != "[DONE]":
                             text_frame = frame.decode("utf-8", errors="replace")
                             cleaned = b"\n".join(
-                                (clean_stream_line(line, response_settings)).encode("utf-8")
+                                (clean_stream_line(line, current_settings, current_cleaner)).encode("utf-8")
                                 for line in text_frame.rstrip("\n").split("\n")
                             ) + b"\n\n"
+                            if (
+                                current_cleaner.last_input_nonempty
+                                and not current_cleaner.last_output_nonempty
+                                and time.monotonic() - last_keepalive >= SSE_KEEPALIVE_SECONDS
+                            ):
+                                yield b": cleanllm-keepalive\n\n"
+                                last_keepalive = time.monotonic()
+                            cleaned_raw, cleaned_chunk = sse_frame_payload(cleaned)
+                            _, cleaned_has_output, _ = chat_event_state(cleaned_raw, cleaned_chunk)
+                            has_output = cleaned_has_output or bool(
+                                chunk and isinstance(chunk.get("choices"), list) and any(
+                                    isinstance(choice, dict)
+                                    and isinstance(choice.get("delta"), dict)
+                                    and (choice["delta"].get("tool_calls") or choice["delta"].get("function_call"))
+                                    for choice in chunk["choices"]
+                                )
+                            )
+                        if raw == "[DONE]":
+                            tail = current_cleaner.flush()
+                            if tail:
+                                flush_frame = (
+                                    b"data: " + json.dumps(
+                                        {"choices": [{"index": 0, "delta": {"content": tail}}]},
+                                        ensure_ascii=False,
+                                        separators=(",", ":"),
+                                    ).encode("utf-8") + b"\n\n"
+                                )
+                                has_output = True
+                                emitted_output = True
                         if has_output:
                             meaningful = True
                             emitted_output = True
                             for pending_frame in buffered:
                                 yield pending_frame
                             buffered.clear()
+                            if flush_frame is not None:
+                                yield flush_frame
                         if emitted_output:
                             yield cleaned
                         else:
@@ -3860,6 +4041,11 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                         await candidate_response.aclose(); await candidate_client.aclose()
                         continue
                     current_client, current_response, current_upstream, current_index = candidate_client, candidate_response, candidate_upstream, next_index
+                    current_settings = {
+                        **settings,
+                        "clean_patterns": candidate_upstream.get("clean_patterns", settings.get("clean_patterns", [])),
+                    }
+                    current_cleaner = StreamTextCleaner(current_settings)
                     update_usage_record_safely(getattr(request.state, "usage_id", None), upstream=current_upstream["name"], attempts=attempts)
                     next_connection = True
                     break

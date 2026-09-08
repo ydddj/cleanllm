@@ -678,6 +678,36 @@ def test_stream_cleaning_preserves_delta_whitespace() -> None:
     assert json.loads(cleaned[6:])["choices"][0]["delta"]["content"] == " hello"
 
 
+def test_incremental_stream_cleaner_handles_split_think_tags() -> None:
+    settings = {"clean_patterns": [r"(?is)<think>.*?</think>"]}
+    cleaner = proxy.StreamTextCleaner(settings)
+    assert cleaner.feed("before<th") == "before"
+    assert cleaner.feed("ink>hidden") == ""
+    assert cleaner.feed(" text</thi") == ""
+    assert cleaner.feed("nk>after") == "after"
+    assert cleaner.flush() == ""
+
+
+def test_incremental_stream_cleaner_handles_cleanllm_channel_syntax() -> None:
+    cleaner = proxy.StreamTextCleaner({"clean_patterns": proxy.DEFAULT_PATTERNS})
+    assert cleaner.feed("before<*|chan") == "before"
+    assert cleaner.feed("nel*>hidden") == ""
+    assert cleaner.feed("<|/chan") == ""
+    assert cleaner.feed("nel|>after") == "after"
+
+
+def test_incremental_stream_cleaner_does_not_buffer_unrelated_angle_text() -> None:
+    settings = {"clean_patterns": [r"(?is)<think>.*?</think>", r"(?i)<[a-z]+>"]}
+    cleaner = proxy.StreamTextCleaner(settings)
+    assert cleaner.feed("A<example>B") == "AB"
+
+
+def test_incremental_stream_cleaner_handles_generic_tag_split() -> None:
+    cleaner = proxy.StreamTextCleaner({"clean_patterns": [r"(?i)<[a-zA-Z0-9_]+>"]})
+    assert cleaner.feed("A<exam") == "A"
+    assert cleaner.feed("ple>B") == "B"
+
+
 def test_settings_reject_invalid_upstream_shapes() -> None:
     base = {"target_api_url": "http://primary/v1"}
     for upstream in (

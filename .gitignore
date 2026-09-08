@@ -9,3 +9,4 @@ venv/
 .pytest-audit*/
 .tmp-local-*/
 .button-test-data/
+.pytest-run/
