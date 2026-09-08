@@ -30,6 +30,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - The runtime log viewer initially shows 100 newest entries, loads 100 more per action, and supports collapsing back to the initial set.
 - Ollama model definition exports should remain compatible with Open WebUI metadata; full weight exports use `.ollama.tar.gz` archives from the mounted models directory.
 - Keep the admin layout fluid on wide screens and horizontally scrollable for dense tables on narrow screens.
+- 代理设置在移动端必须使用单列布局；健康检测、批量操作和上游编辑控件不得挤压或溢出，密集选项卡仅保留横向滚动。
 - Keep navigation state in the URL hash so refresh and direct links restore the same page; release notes are a separate page from runtime logs.
 - The UI provides approximately ten persisted Morandi color palettes; new palette changes must remain CSS-variable based and work in light/dark mode.
 - Keep hover hints limited to important icon-only controls; do not add redundant tooltips to ordinary labeled buttons.

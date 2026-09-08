@@ -26,3 +26,52 @@
 .button[hidden] {
   display: none !important;
 }
+
+/* 代理设置在窄屏上的专用布局：控件不挤压，密集内容仅在需要时横向滚动。 */
+@media (max-width:760px){
+  .page[data-view="upstream"].active{display:grid;gap:12px;min-width:0}
+  .page[data-view="upstream"]>.panel{min-width:0;overflow:hidden}
+  .page[data-view="upstream"] .panel-header{padding:16px;align-items:flex-start;flex-wrap:wrap;gap:10px}
+  .page[data-view="upstream"] .panel-header>div{min-width:0;flex:1 1 180px}
+  .page[data-view="upstream"] .panel-header>.tag{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .upstream-health-panel .panel-header>div:first-child{min-width:0!important;flex-basis:100%}
+  .page[data-view="upstream"] .upstream-health-panel .health-controls{width:100%!important;display:grid!important;grid-template-columns:minmax(0,1fr) minmax(0,1fr);align-items:start!important;gap:8px!important}
+  .page[data-view="upstream"] .upstream-health-panel .health-controls>.health-interval,.page[data-view="upstream"] .upstream-health-panel .health-controls>.health-route-control{min-width:0}
+  .health-interval{display:flex!important;align-items:center;flex-wrap:wrap;gap:5px;white-space:normal!important}
+  .health-interval input{width:58px!important;max-width:100%;flex:0 0 58px}
+  .health-route-control{min-width:0!important}
+  .health-route-control .health-interval{display:flex!important}
+  .page[data-view="upstream"] .upstream-health-panel .health-controls #upstream-health-range{max-width:100%;overflow:hidden;text-overflow:ellipsis;text-align:left!important;white-space:nowrap}
+  .page[data-view="upstream"] .upstream-health-panel .health-controls>#save-health-settings{grid-column:1/-1;width:100%}
+  #settings-form{display:grid;grid-template-columns:minmax(0,1fr)!important;gap:16px!important;padding:16px!important;min-width:0}
+  #settings-form>*{min-width:0}
+  #upstream-tabs{margin:0!important;padding:0!important;min-width:0}
+  .upstream-bulk-actions{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px!important;min-width:0}
+  .upstream-bulk-actions>.button,.upstream-bulk-actions>.file-button{width:100%!important;min-width:0!important;flex:none!important}
+  .upstream-tab-list{max-width:100%;overflow-x:auto;overflow-y:hidden;padding:6px 2px 10px;scrollbar-width:thin}
+  .upstream-tab-wrap{flex:0 0 auto;min-width:max-content}
+  .upstream-tab{max-width:180px;overflow:hidden;text-overflow:ellipsis}
+  .upstream-tab-editor{margin-top:12px;padding:14px!important;min-width:0;overflow:hidden}
+  .upstream-tab-grid{grid-template-columns:minmax(0,1fr)!important;gap:14px!important;min-width:0}
+  .upstream-tab-grid>*{min-width:0}
+  .upstream-tab-grid input,.upstream-tab-grid textarea,.upstream-tab-grid select{min-width:0;max-width:100%}
+  .upstream-tab-grid details{min-width:0;overflow:hidden}
+  .upstream-tab-grid details>.upstream-tab-grid{padding-top:12px}
+  #connection-results{min-width:0;max-width:100%;overflow-x:auto}
+  #settings-form .form-footer{align-items:stretch;flex-wrap:wrap;gap:10px}
+  #settings-form .form-footer p{flex:1 1 100%;margin:0}
+  #settings-form .form-footer .button{width:100%}
+}
+
+@media (max-width:380px){
+  .upstream-bulk-actions{grid-template-columns:1fr}
+  .page[data-view="upstream"] .upstream-health-panel .health-controls{grid-template-columns:1fr!important}
+  .page[data-view="upstream"] .upstream-health-panel .health-controls>#save-health-settings{grid-column:auto}
+}
+
+@media (max-width:760px){
+  .topbar{gap:8px}
+  .topbar .search{width:auto;min-width:0;flex:1 1 auto}
+  .topbar-actions{flex:0 0 auto;gap:6px}
+  .topbar-actions>.icon-button{width:34px;height:34px}
+}
