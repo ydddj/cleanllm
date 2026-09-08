@@ -1642,8 +1642,25 @@ def weighted_virtual_upstreams(routes: list[dict[str, Any]], seed: str) -> list[
     return ordered
 
 
-def route_upstreams(settings: dict[str, Any], model: str, request: Request | None = None) -> list[dict[str, Any]]:
-    route_key = f"{model}|{request.url.path if request else ''}"
+def route_upstreams(
+    settings: dict[str, Any],
+    model: str,
+    request: Request | None = None,
+    *,
+    capability_path: str | None = None,
+    exclude_ollama_responses: bool = False,
+) -> list[dict[str, Any]]:
+    """Return ordered, currently routable upstreams for an endpoint.
+
+    ``capability_path`` lets the Responses compatibility fallback ask for
+    Chat-Completions capabilities while retaining the original request path
+    for token/path based virtual routing.  Native Responses probing can opt
+    out of Ollama, which exposes a Chat adapter but normally has no
+    ``/v1/responses`` endpoint.
+    """
+    request_path = request.url.path if request else ""
+    endpoint_path = capability_path or request_path
+    route_key = f"{model}|{request_path}|{endpoint_path}|{int(exclude_ollama_responses)}"
     cached_until = NO_ROUTE_CACHE.get(route_key, 0.0)
     if cached_until > time.time():
         return []
@@ -1688,11 +1705,13 @@ def route_upstreams(settings: dict[str, Any], model: str, request: Request | Non
     if MODEL_CACHE.get("data") and not any(item.get("id") == lookup_model for item in MODEL_CACHE["data"]):
         ordered.sort(key=upstream_looks_ollama)
     available = [item for item in ordered if upstream_is_routable(item["name"])]
+    if exclude_ollama_responses and endpoint_path == "/v1/responses":
+        available = [item for item in available if not upstream_looks_ollama(item)]
     # When discovery has explicitly declared endpoint support, avoid sending
     # an incompatible protocol to that upstream. Missing metadata remains
     # eligible so non-standard providers continue to work.
     if request is not None and MODEL_CACHE.get("data"):
-        endpoint = request.url.path.removeprefix("/")
+        endpoint = endpoint_path.removeprefix("/")
         lookup_model = resolved_model(settings, model)
         compatible = []
         declared_any = False
@@ -3379,7 +3398,13 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
     failures: list[str] = []
     requested_model = str(payload.get("model") or "")
     target_model = resolved_model(settings, requested_model)
-    candidates = route_upstreams(settings, requested_model, request)
+    candidates = route_upstreams(
+        settings,
+        requested_model,
+        request,
+        capability_path="/v1/responses",
+        exclude_ollama_responses=True,
+    )
     usage_id = getattr(request.state, "usage_id", None)
     attempts = 0
 
@@ -3684,7 +3709,12 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             chat_done = False
             stream_payload = {**chat_payload, "stream": True}
             attempts = 0
-            for upstream in route_upstreams(settings, requested_model, request):
+            for upstream in route_upstreams(
+                settings,
+                requested_model,
+                request,
+                capability_path="/v1/chat/completions",
+            ):
                 if not acquire_upstream(upstream["name"]):
                     continue
                 attempts += 1
@@ -3801,7 +3831,24 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
         return StreamingResponse(response_events(), media_type="text/event-stream", headers={"Cache-Control":"no-cache, no-transform", "X-Accel-Buffering":"no", "Connection":"keep-alive"})
     async with httpx.AsyncClient() as client:
         attempts = 0
-        for upstream in route_upstreams(settings, requested_model, request):
+        native_candidates = route_upstreams(
+            settings,
+            requested_model,
+            request,
+            capability_path="/v1/responses",
+            exclude_ollama_responses=True,
+        )
+        chat_candidates = route_upstreams(
+            settings,
+            requested_model,
+            request,
+            capability_path="/v1/chat/completions",
+        )
+        native_names = {candidate["name"] for candidate in native_candidates}
+        candidates = native_candidates + [
+            item for item in chat_candidates if item["name"] not in native_names
+        ]
+        for upstream in candidates:
             if not acquire_upstream(upstream["name"]):
                 continue
             attempts += 1
@@ -3809,10 +3856,17 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             headers = {"Content-Type": "application/json"}
             if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
             try:
-                responses_url = upstream["url"].replace("/chat/completions", "/responses")
-                logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
-                response = await client.post(responses_url, json={**payload, "model": target_model, "stream": False}, headers=headers, timeout=float(upstream["timeout"]))
-                if response.status_code in {404, 405}:
+                if upstream_looks_ollama(upstream):
+                    # Ollama's OpenAI adapter exposes Chat Completions, not
+                    # the native Responses endpoint.  Convert directly and
+                    # avoid a guaranteed /responses 404 on every request.
+                    logger.info("Responses chat fallback request: %s -> %s", upstream["name"], upstream["url"])
+                    response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
+                else:
+                    responses_url = upstream["url"].replace("/chat/completions", "/responses")
+                    logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
+                    response = await client.post(responses_url, json={**payload, "model": target_model, "stream": False}, headers=headers, timeout=float(upstream["timeout"]))
+                if response.status_code in {404, 405} and not upstream_looks_ollama(upstream):
                     response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code >= 400:
                     failures.append(f"{upstream['name']}: HTTP {response.status_code}")

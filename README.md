@@ -75,7 +75,7 @@ docker compose down
 
 响应清洗规则在网页中按“每行一条正则表达式”填写，匹配内容会被删除。默认规则兼容原有的 Channel、Think 和孤立标签清理；保存时会自动检查正则语法。
 
-流式响应使用按请求独立的增量清洗器：标签被拆到多个 SSE Chunk 时会跨 Chunk 识别，过滤推理内容期间按需发送 SSE 保活注释；Chat Completions 保留 `[DONE]`，Responses 仅在收到真实终止事件后结束，异常断流不会伪造完成事件。
+流式响应使用按请求独立的增量清洗器：标签被拆到多个 SSE Chunk 时会跨 Chunk 识别，过滤推理内容期间按需发送 SSE 保活注释；Chat Completions 保留 `[DONE]`，Responses 仅在收到真实终止事件后结束，异常断流不会伪造完成事件。Ollama 通常只提供 Chat Completions，收到 Responses 请求时会跳过对 Ollama 的原生 `/v1/responses` 探测并自动使用 Chat 兼容回退，避免无意义的 404 和熔断。
 
 管理中心可通过上游的 OpenAI 兼容 `/v1/models` 接口展示全部可用模型。默认地址由 Chat Completions 地址自动推导；非标准上游可通过网页或 `MODELS_API_URL` 单独指定。
 
@@ -100,7 +100,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.7`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.8`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，并可随时修改到期时间及可用模型白名单。模型规则支持精确名称和 `*`、`?` 通配符，留空允许全部模型；受限令牌访问 `/v1/models` 时也只会看到允许的模型。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。使用日志明细保留 400 天，清除明细不会改变调用次数、周期 Token 统计或令牌累计用量。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 

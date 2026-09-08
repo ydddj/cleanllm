@@ -32,6 +32,15 @@ def client_for(tmp_path: Path) -> TestClient:
     return TestClient(proxy.app, raise_server_exceptions=False)
 
 
+def configure_non_ollama_upstream() -> None:
+    settings = proxy.load_settings()
+    settings.update({
+        "target_api_url": "https://provider.example/v1/chat/completions",
+        "default_upstream_name": "provider",
+    })
+    proxy.save_settings(settings)
+
+
 def test_virtual_model_resolves_target_and_prioritizes_upstreams() -> None:
     settings = proxy.SettingsUpdate.model_validate({
         "target_api_url": "http://primary/v1",
@@ -53,6 +62,90 @@ def test_unknown_model_prefers_non_ollama_when_discovery_is_partial() -> None:
     assert [item["name"] for item in proxy.route_upstreams(settings, "gpt-5.6-sol")][:2] == ["pipio", "Ollama"]
     assert proxy.model_metadata({}, "local-model", ollama=True)["interfaces"] == ["v1/chat/completions"]
     proxy.MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+
+
+def test_native_responses_route_skips_ollama_but_chat_fallback_keeps_it() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "https://pipio.example/v1",
+        "default_upstream_name": "pipio",
+        "upstreams": [{"name": "Ollama", "url": "http://127.0.0.1:11434/v1"}],
+    }).model_dump(mode="json")
+    request = SimpleNamespace(
+        state=SimpleNamespace(api_token=None, usage_id="request-responses"),
+        url=SimpleNamespace(path="/v1/responses"),
+    )
+    native = proxy.route_upstreams(
+        settings,
+        "test-model",
+        request,
+        capability_path="/v1/responses",
+        exclude_ollama_responses=True,
+    )
+    fallback = proxy.route_upstreams(
+        settings,
+        "test-model",
+        request,
+        capability_path="/v1/chat/completions",
+    )
+    assert [item["name"] for item in native] == ["pipio"]
+    assert [item["name"] for item in fallback] == ["pipio", "Ollama"]
+
+
+def test_responses_route_cache_does_not_hide_ollama_chat_fallback() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://127.0.0.1:11434/v1",
+        "default_upstream_name": "Ollama",
+    }).model_dump(mode="json")
+    request = SimpleNamespace(
+        state=SimpleNamespace(api_token=None, usage_id="request-ollama"),
+        url=SimpleNamespace(path="/v1/responses"),
+    )
+    native = proxy.route_upstreams(
+        settings,
+        "test-model",
+        request,
+        capability_path="/v1/responses",
+        exclude_ollama_responses=True,
+    )
+    fallback = proxy.route_upstreams(
+        settings,
+        "test-model",
+        request,
+        capability_path="/v1/chat/completions",
+    )
+    assert native == []
+    assert [item["name"] for item in fallback] == ["Ollama"]
+
+
+def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/responses", json={"model": "test", "input": "hello"})
+    assert response.status_code == 200
+    assert calls and calls[0][0].endswith("/chat/completions")
+    assert "/responses" not in calls[0][0]
 
 
 def test_circuit_breaker_skips_open_upstream_and_recovers() -> None:
@@ -564,6 +657,7 @@ def test_api_token_filters_public_model_list(tmp_path: Path, monkeypatch) -> Non
 
 def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
+    configure_non_ollama_upstream()
     chunks = [
         b'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"ok"}\n\n',
         b'event: response.completed\ndata: {"type":"response.com',
@@ -604,6 +698,7 @@ def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path,
 
 def test_native_responses_stream_reports_failure_when_upstream_omits_terminal_event(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
+    configure_non_ollama_upstream()
 
     class FakeResponse:
         status_code = 200
@@ -638,6 +733,7 @@ def test_native_responses_stream_reports_failure_when_upstream_omits_terminal_ev
 
 def test_native_responses_stream_preserves_real_incomplete_terminal(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
+    configure_non_ollama_upstream()
 
     class FakeResponse:
         status_code = 200
