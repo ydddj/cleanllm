@@ -69,7 +69,7 @@ docker compose down
 
 客户端主要请求地址为 `http://你的主机:11515/v1/chat/completions` 和 `/v1/responses`。此外支持 `/v1/models`、`/v1/embeddings`、`/v1/completions`、`/v1/images/generations`、`/v1/audio/transcriptions`、`/v1/audio/translations`、`/v1/audio/speech`、`/v1/moderations` 和 `/v1/rerank`，这些地址会从所选上游的 `/v1` 基础地址自动推导，无需逐项配置。设置保存在 Docker 数据卷中，升级容器不会丢失。
 
-常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT`、`LOG_MAX_BYTES`、`CIRCUIT_BREAKER_FAILURES`、`CIRCUIT_BREAKER_COOLDOWN_SECONDS`、`ALERT_WEBHOOK_URL`、`ALERT_UPSTREAM_FAILURES`、`ALERT_ERROR_RATE_PERCENT`、`ALERT_BUDGET_PERCENT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
+常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT`、`THINKING_PROTOCOL`、`LOG_MAX_BYTES`、`CIRCUIT_BREAKER_FAILURES`、`CIRCUIT_BREAKER_COOLDOWN_SECONDS`、`ALERT_WEBHOOK_URL`、`ALERT_UPSTREAM_FAILURES`、`ALERT_ERROR_RATE_PERCENT`、`ALERT_BUDGET_PERCENT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
 
 `extra_hosts` 仅用于让 Linux 容器通过 `host.docker.internal` 访问宿主机。如果上游使用局域网 IP、公网地址或同一 Compose 中的服务名，可以删除这段配置；默认上游在宿主机时建议保留。
 
@@ -78,6 +78,8 @@ docker compose down
 流式响应使用按请求独立的增量清洗器：标签被拆到多个 SSE Chunk 时会跨 Chunk 识别，过滤推理内容期间按需发送 SSE 保活注释；Chat Completions 保留 `[DONE]`，Responses 仅在收到真实终止事件后结束，异常断流不会伪造完成事件。Ollama 通常只提供 Chat Completions，收到 Responses 请求时会跳过对 Ollama 的原生 `/v1/responses` 探测并自动使用 Chat 兼容回退，避免无意义的 404 和熔断。
 
 管理中心可通过上游的 OpenAI 兼容 `/v1/models` 接口展示全部可用模型。默认地址由 Chat Completions 地址自动推导；非标准上游可通过网页或 `MODELS_API_URL` 单独指定。
+
+“上游与清洗 → 代理设置 → 高级设置”可为每个上游选择思考控制协议；“模型列表 → 上游模型”可再按单个模型设置关闭、开启或低/中/高强度。策略以“上游名称 + 实际模型名”为键，因此不同上游中的同名模型可以独立配置。Ollama 使用原生 `think` 参数；LM Studio、llama.cpp、vLLM 与 SGLang 兼容模式使用 `chat_template_kwargs.enable_thinking`，并按请求接口补充标准推理强度字段。只有模型的聊天模板或服务端支持这些参数时才能真正关闭思考；不支持的模型会忽略参数。`自动识别` 只处理明确识别出的本地服务，普通云接口保持原请求；非标准自建服务应手动选择协议，完全不希望 CleanLLM 修改请求时选择“不修改请求”。`THINKING_PROTOCOL` 仅设置默认上游的首次默认协议，支持 `auto`、`ollama`、`local_openai`、`openai` 和 `none`。
 
 管理中心的“对话测试”会通过当前 Web 会话调用真实代理链路，可验证模型路由、熔断、Ollama 思考模式、普通/流式输出和清洗结果，并显示请求 ID、实际上游与耗时。浏览器不需要接触 API令牌；聊天正文仅保存在当前标签页的 `sessionStorage` 中，不写入服务端日志或 SQLite。
 
@@ -104,7 +106,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.14`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.15`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，并可随时修改到期时间及可用模型白名单。模型规则支持精确名称和 `*`、`?` 通配符，留空允许全部模型；受限令牌访问 `/v1/models` 时也只会看到允许的模型。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。使用日志明细保留 400 天，清除明细不会改变调用次数、周期 Token 统计或令牌累计用量。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 

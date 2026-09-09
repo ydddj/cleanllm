@@ -203,6 +203,139 @@ def test_ollama_model_thinking_override_takes_precedence_over_default() -> None:
     assert (url, native, native_payload["think"]) == ("http://ollama:11434/api/chat", True, "low")
 
 
+def test_local_openai_thinking_policy_merges_template_arguments() -> None:
+    upstream = {
+        "name": "LM Studio",
+        "url": "http://lmstudio:1234/v1/chat/completions",
+        "thinking_protocol": "local_openai",
+    }
+    settings = {
+        "model_thinking_policies": [
+            {"upstream": "LM Studio", "model": "qwen3-8b", "mode": "disabled"},
+        ],
+    }
+    payload = {
+        "model": "qwen3-8b",
+        "messages": [],
+        "chat_template_kwargs": {"custom_flag": "kept"},
+    }
+    url, prepared, native = proxy.prepare_chat_upstream_request(upstream, payload, settings)
+    assert url == upstream["url"]
+    assert native is False
+    assert prepared["reasoning_effort"] == "none"
+    assert prepared["chat_template_kwargs"] == {
+        "custom_flag": "kept", "enable_thinking": False,
+    }
+    assert payload["chat_template_kwargs"] == {"custom_flag": "kept"}
+
+
+def test_thinking_policy_isolated_by_upstream_and_unknown_auto_is_unchanged() -> None:
+    settings = {
+        "model_thinking_policies": [
+            {"upstream": "local-a", "model": "same-model", "mode": "disabled"},
+            {"upstream": "local-b", "model": "same-model", "mode": "high"},
+            {"upstream": "cloud", "model": "same-model", "mode": "disabled"},
+        ],
+    }
+    payload = {"model": "same-model", "messages": []}
+    local_a = {"name": "local-a", "url": "http://a/v1/chat/completions", "thinking_protocol": "local_openai"}
+    local_b = {"name": "local-b", "url": "http://b/v1/chat/completions", "thinking_protocol": "local_openai"}
+    cloud = {"name": "cloud", "url": "https://provider.example/v1/chat/completions", "thinking_protocol": "auto"}
+    assert proxy.prepare_chat_upstream_request(local_a, payload, settings)[1]["reasoning_effort"] == "none"
+    assert proxy.prepare_chat_upstream_request(local_b, payload, settings)[1]["reasoning_effort"] == "high"
+    assert proxy.prepare_chat_upstream_request(cloud, payload, settings)[1] == payload
+
+
+def test_responses_thinking_policy_preserves_existing_reasoning_fields() -> None:
+    upstream = {"name": "vLLM", "thinking_protocol": "local_openai"}
+    settings = {
+        "model_thinking_policies": [
+            {"upstream": "vLLM", "model": "qwen3", "mode": "low"},
+        ],
+    }
+    payload = {"model": "qwen3", "input": "hello", "reasoning": {"summary": "auto"}}
+    prepared = proxy.prepare_responses_upstream_payload(upstream, payload, settings)
+    assert prepared["reasoning"] == {"summary": "auto", "effort": "low"}
+    assert prepared["chat_template_kwargs"]["enable_thinking"] is True
+    assert payload["reasoning"] == {"summary": "auto"}
+
+
+def test_thinking_settings_validate_protocols_and_upstream_references() -> None:
+    valid = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "LM Studio",
+        "default_upstream_thinking_protocol": "local_openai",
+        "model_thinking_policies": [
+            {"upstream": "LM Studio", "model": "qwen3", "mode": "disabled"},
+        ],
+        "upstreams": [{
+            "name": "Ollama", "url": "http://ollama:11434/v1",
+            "thinking_protocol": "ollama",
+        }],
+    }).model_dump(mode="json")
+    assert valid["default_upstream_thinking_protocol"] == "local_openai"
+    assert valid["upstreams"][0]["thinking_protocol"] == "ollama"
+    assert valid["model_thinking_policies"][0]["mode"] == "disabled"
+
+    for changes in (
+        {"default_upstream_thinking_protocol": "unknown"},
+        {"upstreams": [{"name": "bad", "url": "http://bad/v1", "thinking_protocol": "unknown"}]},
+        {"model_thinking_policies": [{"upstream": "missing", "model": "qwen3", "mode": "disabled"}]},
+    ):
+        try:
+            proxy.SettingsUpdate.model_validate({"target_api_url": "http://primary/v1", **changes})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"Expected invalid thinking settings: {changes}")
+
+
+def test_chat_request_applies_lm_studio_model_policy(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = proxy.load_settings()
+    settings.update({
+        "target_api_url": "http://lmstudio:1234/v1/chat/completions",
+        "default_upstream_name": "LM Studio",
+        "default_upstream_thinking_protocol": "local_openai",
+        "model_thinking_policies": [
+            {"upstream": "LM Studio", "model": "qwen3", "mode": "disabled"},
+        ],
+    })
+    proxy.save_settings(settings)
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/chat/completions", json={
+        "model": "qwen3", "messages": [],
+        "chat_template_kwargs": {"keep": True},
+    })
+    assert response.status_code == 200
+    assert calls[0][0] == "http://lmstudio:1234/v1/chat/completions"
+    assert calls[0][1]["reasoning_effort"] == "none"
+    assert calls[0][1]["chat_template_kwargs"] == {"keep": True, "enable_thinking": False}
+
+
 def test_ollama_native_url_preserves_reverse_proxy_prefix() -> None:
     upstream = {
         "url": "https://models.example/gateway/v1/chat/completions",
@@ -548,8 +681,12 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
         "default_upstream_name": "本地 Ollama",
         "api_key": "secret",
         "timeout_seconds": 42,
+        "default_upstream_thinking_protocol": "ollama",
         "ollama_disable_thinking": True,
         "ollama_model_thinking": {"qwen3:8b": "disabled", "deepseek-r1:8b": "enabled"},
+        "model_thinking_policies": [
+            {"upstream": "本地 Ollama", "model": "qwen3:8b", "mode": "high"},
+        ],
         "clean_patterns": [r"(?is)<think>.*?</think>", r"<tag>"],
     }
     response = client.put("/api/settings", json=settings)
@@ -558,6 +695,8 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     assert loaded["default_upstream_name"] == settings["default_upstream_name"]
     assert loaded["clean_patterns"] == settings["clean_patterns"]
     assert loaded["ollama_model_thinking"] == settings["ollama_model_thinking"]
+    assert loaded["default_upstream_thinking_protocol"] == "ollama"
+    assert loaded["model_thinking_policies"] == settings["model_thinking_policies"]
     assert proxy.clean_content("A<think>hidden</think>B<tag>", loaded) == "AB"
     assert proxy.MODEL_CACHE["data"] is None
     assert proxy.ROUTE_AFFINITY == {}

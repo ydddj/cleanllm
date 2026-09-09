@@ -25,8 +25,9 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Treat `settings.json` as persistent user data. New settings must have safe defaults and remain compatible with older files.
 - Model discovery must continue working for non-Ollama OpenAI-compatible upstreams.
 - Ollama-only operations must fail gracefully when Ollama is unavailable; they must not break the normal model list or proxy.
-- Ollama 请求默认关闭思考模式以兼容旧版客户端；通过 `ollama_disable_thinking` 或 `OLLAMA_DISABLE_THINKING=false` 可恢复模型默认思考行为，思考参数不得发送给非 Ollama 上游。
-- Ollama 单模型思考模式保存在 `ollama_model_thinking`；键为实际模型名，值为 `disabled`、`enabled`、`low`、`medium` 或 `high`，并兼容读取旧布尔值。单模型设置优先于 `ollama_disable_thinking`，在模型列表中修改；需要覆盖思考模式时必须走原生 `/api/chat` 并转换回标准 OpenAI 普通/流式响应，避免兼容接口忽略 `think`。
+- Ollama 请求默认关闭思考模式以兼容旧版客户端；通过 `ollama_disable_thinking` 或 `OLLAMA_DISABLE_THINKING=false` 可恢复模型默认思考行为。只有上游明确选择或被保守识别为支持的思考协议时才能注入控制参数，未知云接口不得盲目注入。
+- 通用单模型思考策略保存在 `model_thinking_policies`，使用上游名称与实际模型名联合定位，值为 `disabled`、`enabled`、`low`、`medium` 或 `high`；同名模型在不同上游必须互相隔离。上游 `thinking_protocol` 支持 `auto`、`none`、`ollama`、`local_openai` 和 `openai`，默认上游使用 `default_upstream_thinking_protocol`。Chat 与 Responses 必须应用同一策略；本地 OpenAI 兼容协议合并现有 `chat_template_kwargs`，不得覆盖客户端其他模板参数。
+- 旧 Ollama 单模型思考模式 `ollama_model_thinking` 继续兼容读取；新通用策略优先。需要覆盖 Ollama 思考模式时必须走原生 `/api/chat` 并转换回标准 OpenAI 普通/流式响应，避免兼容接口忽略 `think`。
 - Long-running Ollama pulls must remain streamed. Do not replace them with a short fixed timeout.
 - Format Unix timestamps in the browser as local date/time and support both seconds and milliseconds.
 - Keep the log file capped at 5 MB and preserve `/data` volume compatibility.

@@ -63,8 +63,10 @@ DEFAULT_SETTINGS = {
     "timeout_seconds": int(os.getenv("REQUEST_TIMEOUT", "120")),
     "models_api_url": os.getenv("MODELS_API_URL", ""),
     "ollama_api_url": os.getenv("OLLAMA_API_URL", ""),
+    "default_upstream_thinking_protocol": os.getenv("THINKING_PROTOCOL", "auto").strip().lower(),
     "ollama_disable_thinking": os.getenv("OLLAMA_DISABLE_THINKING", "true").strip().lower() not in {"0", "false", "no", "off"},
     "ollama_model_thinking": {},
+    "model_thinking_policies": [],
     "clean_patterns": DEFAULT_PATTERNS,
     "upstreams": [],
     "default_upstream_enabled": True,
@@ -141,8 +143,10 @@ class SettingsUpdate(BaseModel):
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
     models_api_url: str = ""
     ollama_api_url: str = ""
+    default_upstream_thinking_protocol: str = Field(default="auto", pattern=r"^(auto|none|ollama|local_openai|openai)$")
     ollama_disable_thinking: bool = DEFAULT_SETTINGS["ollama_disable_thinking"]
     ollama_model_thinking: dict[str, str] = Field(default_factory=dict, max_length=200)
+    model_thinking_policies: list[dict[str, str]] = Field(default_factory=list, max_length=1000)
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
     log_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1 * 1024 * 1024, le=50 * 1024 * 1024)
     upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
@@ -211,6 +215,25 @@ class SettingsUpdate(BaseModel):
             cleaned[model] = mode
         return cleaned
 
+    @field_validator("model_thinking_policies")
+    @classmethod
+    def validate_model_thinking_policies(cls, values: list[dict[str, str]]) -> list[dict[str, str]]:
+        cleaned: dict[tuple[str, str], dict[str, str]] = {}
+        for index, item in enumerate(values, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"思考策略 {index} 必须是对象")
+            upstream = str(item.get("upstream") or "").strip()
+            model = str(item.get("model") or "").strip()
+            mode = normalize_ollama_thinking_mode(item.get("mode"))
+            if not upstream or len(upstream) > 80:
+                raise ValueError(f"思考策略 {index} 的上游名称无效")
+            if not model or len(model) > 200:
+                raise ValueError(f"思考策略 {index} 的模型名称无效")
+            if mode is None:
+                raise ValueError(f"思考策略 {index} 的模式无效")
+            cleaned[(upstream, model)] = {"upstream": upstream, "model": model, "mode": mode}
+        return list(cleaned.values())
+
     @field_validator("upstreams")
     @classmethod
     def validate_upstreams(cls, upstreams: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -235,6 +258,9 @@ class SettingsUpdate(BaseModel):
             ollama_url = cls.validate_models_url(str(item.get("ollama_url") or ""))
             patterns = cls.validate_patterns(item.get("clean_patterns") or [])
             routes = cls.validate_model_routes(item.get("model_routes") or [])
+            thinking_protocol = normalize_thinking_protocol(item.get("thinking_protocol"))
+            if thinking_protocol is None:
+                raise ValueError(f"上游 {name} 的思考控制协议无效")
             cleaned.append({
                 "name": name,
                 "url": url,
@@ -245,6 +271,7 @@ class SettingsUpdate(BaseModel):
                 "ollama_url": ollama_url,
                 "clean_patterns": patterns,
                 "model_routes": routes,
+                "thinking_protocol": thinking_protocol,
             })
         return cleaned
 
@@ -387,6 +414,9 @@ class SettingsUpdate(BaseModel):
             unknown = [name for name in referenced if name not in known]
             if unknown:
                 raise ValueError(f"虚拟模型 {item['alias']} 引用了不存在的上游：{', '.join(unknown)}")
+        for item in self.model_thinking_policies:
+            if item["upstream"] not in known:
+                raise ValueError(f"模型思考策略引用了不存在的上游：{item['upstream']}")
         self.default_upstream_name = names[0]
         return self
 
@@ -1183,6 +1213,24 @@ def load_settings() -> dict[str, Any]:
                     if str(model).strip()
                     if (mode := normalize_ollama_thinking_mode(enabled)) is not None
                 }
+            default_protocol = normalize_thinking_protocol(settings.get("default_upstream_thinking_protocol"))
+            settings["default_upstream_thinking_protocol"] = default_protocol or "auto"
+            policies = settings.get("model_thinking_policies")
+            if not isinstance(policies, list):
+                settings["model_thinking_policies"] = []
+            else:
+                normalized_policies: dict[tuple[str, str], dict[str, str]] = {}
+                for item in policies:
+                    if not isinstance(item, dict):
+                        continue
+                    upstream = str(item.get("upstream") or "").strip()
+                    model = str(item.get("model") or "").strip()
+                    mode = normalize_ollama_thinking_mode(item.get("mode"))
+                    if upstream and model and mode:
+                        normalized_policies[(upstream, model)] = {
+                            "upstream": upstream, "model": model, "mode": mode,
+                        }
+                settings["model_thinking_policies"] = list(normalized_policies.values())
             original_background = str(settings.get("appearance_background") or "")
             original_backgrounds = list(settings.get("appearance_backgrounds") or [])
             normalize_background_settings(settings)
@@ -1461,6 +1509,7 @@ def upstream_records(settings: dict[str, Any]) -> list[dict[str, Any]]:
         "timeout": int(settings.get("timeout_seconds") or 120),
         "models_url": str(settings.get("models_api_url") or ""),
         "ollama_url": str(settings.get("ollama_api_url") or ""),
+        "thinking_protocol": str(settings.get("default_upstream_thinking_protocol") or "auto"),
         "clean_patterns": list(settings.get("clean_patterns") or []),
         "model_routes": list(settings.get("model_routes") or []),
     }
@@ -1479,6 +1528,7 @@ def upstream_records(settings: dict[str, Any]) -> list[dict[str, Any]]:
             "timeout": max(1, min(int(item.get("timeout") or 120), 3600)),
             "models_url": str(item.get("models_url") or ""),
             "ollama_url": str(item.get("ollama_url") or ""),
+            "thinking_protocol": str(item.get("thinking_protocol") or "auto"),
             "clean_patterns": list(item.get("clean_patterns") or settings.get("clean_patterns") or []),
             "model_routes": list(item.get("model_routes") or []),
         })
@@ -1507,6 +1557,7 @@ def apply_upstream_records(settings: dict[str, Any], records: list[dict[str, Any
         "timeout_seconds": primary.get("timeout", 120),
         "models_api_url": primary.get("models_url", ""),
         "ollama_api_url": primary.get("ollama_url", ""),
+        "default_upstream_thinking_protocol": primary.get("thinking_protocol", "auto"),
         "clean_patterns": primary.get("clean_patterns", []),
         "model_routes": primary.get("model_routes", []),
         "upstreams": secondary,
@@ -1805,6 +1856,32 @@ def upstream_looks_ollama(upstream: dict[str, Any]) -> bool:
     return parsed.port == 11434 or parsed.path.rstrip("/").endswith("/ollama")
 
 
+def normalize_thinking_protocol(value: Any) -> str | None:
+    text = str(value or "auto").strip().lower().replace("-", "_")
+    aliases = {
+        "auto": "auto", "none": "none", "off": "none",
+        "ollama": "ollama", "lmstudio": "local_openai",
+        "lm_studio": "local_openai", "local": "local_openai",
+        "local_openai": "local_openai", "llama_cpp": "local_openai",
+        "vllm": "local_openai", "sglang": "local_openai",
+        "openai": "openai",
+    }
+    return aliases.get(text)
+
+
+def thinking_protocol_for_upstream(upstream: dict[str, Any]) -> str:
+    """Resolve explicit or conservatively inferred thinking controls."""
+    configured = normalize_thinking_protocol(upstream.get("thinking_protocol")) or "auto"
+    if configured != "auto":
+        return configured
+    if upstream_looks_ollama(upstream):
+        return "ollama"
+    marker = f"{upstream.get('name', '')} {upstream.get('url', '')}".lower()
+    if any(value in marker for value in ("lm studio", "lmstudio", "llama.cpp", "llama-cpp", "vllm", "sglang")):
+        return "local_openai"
+    return "none"
+
+
 def normalize_ollama_thinking_mode(value: Any) -> str | None:
     """Normalize old booleans and the modes accepted by Ollama's native API."""
     if isinstance(value, bool):
@@ -1818,11 +1895,29 @@ def normalize_ollama_thinking_mode(value: Any) -> str | None:
     return aliases.get(text)
 
 
-def ollama_thinking_value(payload: dict[str, Any], settings: dict[str, Any]) -> bool | str | None:
+def model_thinking_mode(
+    upstream: dict[str, Any], payload: dict[str, Any], settings: dict[str, Any]
+) -> str | None:
+    """Return an explicit per-upstream, per-model policy when configured."""
+    upstream_name = str(upstream.get("name") or "").strip()
+    model = str(payload.get("model") or "").strip()
+    for item in reversed(settings.get("model_thinking_policies") or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("upstream") or "").strip() == upstream_name and str(item.get("model") or "").strip() == model:
+            return normalize_ollama_thinking_mode(item.get("mode"))
+    return None
+
+
+def ollama_thinking_value(
+    payload: dict[str, Any], settings: dict[str, Any], upstream: dict[str, Any] | None = None
+) -> bool | str | None:
     """Return the native Ollama ``think`` value for this specific model."""
     model = str(payload.get("model") or "").strip()
+    policy_mode = model_thinking_mode(upstream, payload, settings) if upstream is not None else None
     overrides = settings.get("ollama_model_thinking")
-    mode = normalize_ollama_thinking_mode(overrides.get(model)) if isinstance(overrides, dict) and model in overrides else None
+    legacy_mode = normalize_ollama_thinking_mode(overrides.get(model)) if isinstance(overrides, dict) and model in overrides else None
+    mode = policy_mode or legacy_mode
     if mode == "disabled":
         return False
     if mode == "enabled":
@@ -1842,10 +1937,48 @@ def ollama_thinking_value(payload: dict[str, Any], settings: dict[str, Any]) -> 
 
 def ollama_request_payload(payload: dict[str, Any], upstream: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
     """Apply the per-model Ollama thinking mode without leaking it elsewhere."""
-    if not upstream_looks_ollama(upstream):
+    if thinking_protocol_for_upstream(upstream) != "ollama":
         return payload
-    value = ollama_thinking_value(payload, settings)
+    value = ollama_thinking_value(payload, settings, upstream)
     return {**payload, "think": value} if value is not None else payload
+
+
+def apply_openai_thinking_policy(
+    payload: dict[str, Any], upstream: dict[str, Any], settings: dict[str, Any], *, endpoint: str
+) -> dict[str, Any]:
+    """Apply opt-in thinking controls for local or OpenAI-compatible services.
+
+    Unknown ``auto`` upstreams are left byte-for-byte compatible. Local services
+    receive both the common reasoning effort and the template flag used by
+    LM Studio, llama.cpp, vLLM and SGLang when their chat template supports it.
+    """
+    protocol = thinking_protocol_for_upstream(upstream)
+    if protocol not in {"local_openai", "openai"}:
+        return payload
+    mode = model_thinking_mode(upstream, payload, settings)
+    if mode is None:
+        return payload
+    result = copy.deepcopy(payload)
+    effort = "none" if mode == "disabled" else mode if mode in {"low", "medium", "high"} else None
+    if endpoint == "responses":
+        if effort is not None:
+            reasoning = result.get("reasoning") if isinstance(result.get("reasoning"), dict) else {}
+            result["reasoning"] = {**reasoning, "effort": effort}
+    elif effort is not None:
+        result["reasoning_effort"] = effort
+    if protocol == "local_openai":
+        template = result.get("chat_template_kwargs") if isinstance(result.get("chat_template_kwargs"), dict) else {}
+        result["chat_template_kwargs"] = {
+            **template,
+            "enable_thinking": mode != "disabled",
+        }
+    return result
+
+
+def prepare_responses_upstream_payload(
+    upstream: dict[str, Any], payload: dict[str, Any], settings: dict[str, Any]
+) -> dict[str, Any]:
+    return apply_openai_thinking_policy(payload, upstream, settings, endpoint="responses")
 
 
 def ollama_native_chat_url(upstream: dict[str, Any]) -> str:
@@ -1905,14 +2038,16 @@ def ollama_native_messages(messages: Any) -> list[dict[str, Any]]:
     return result
 
 
-def ollama_native_request_payload(payload: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+def ollama_native_request_payload(
+    payload: dict[str, Any], settings: dict[str, Any], upstream: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """Translate an OpenAI Chat request into Ollama's native Chat shape."""
     result: dict[str, Any] = {
         "model": payload.get("model"),
         "messages": ollama_native_messages(payload.get("messages")),
         "stream": payload.get("stream") is True,
     }
-    value = ollama_thinking_value(payload, settings)
+    value = ollama_thinking_value(payload, settings, upstream)
     if value is not None:
         result["think"] = value
     if isinstance(payload.get("options"), dict):
@@ -1949,10 +2084,12 @@ def prepare_chat_upstream_request(
     upstream: dict[str, Any], payload: dict[str, Any], settings: dict[str, Any]
 ) -> tuple[str, dict[str, Any], bool]:
     """Choose the reliable native Ollama path when a thinking mode is controlled."""
-    native = upstream_looks_ollama(upstream) and ollama_thinking_value(payload, settings) is not None
+    protocol = thinking_protocol_for_upstream(upstream)
+    native = protocol == "ollama" and ollama_thinking_value(payload, settings, upstream) is not None
     if native:
-        return ollama_native_chat_url(upstream), ollama_native_request_payload(payload, settings), True
-    return str(upstream["url"]), ollama_request_payload(payload, upstream, settings), False
+        return ollama_native_chat_url(upstream), ollama_native_request_payload(payload, settings, upstream), True
+    prepared = apply_openai_thinking_policy(payload, upstream, settings, endpoint="chat")
+    return str(upstream["url"]), prepared, False
 
 
 def clean_stream_line(
@@ -3979,7 +4116,9 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             response = await client.send(
                 client.build_request(
                     "POST", responses_url,
-                    json={**payload, "model": target_model, "stream": True}, headers=headers,
+                    json=prepare_responses_upstream_payload(
+                        upstream, {**payload, "model": target_model, "stream": True}, settings
+                    ), headers=headers,
                 ),
                 stream=True,
             )
@@ -4494,9 +4633,17 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 else:
                     responses_url = upstream["url"].replace("/chat/completions", "/responses")
                     logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
-                    response = await client.post(responses_url, json={**payload, "model": target_model, "stream": False}, headers=headers, timeout=float(upstream["timeout"]))
+                    response = await client.post(
+                        responses_url,
+                        json=prepare_responses_upstream_payload(
+                            upstream, {**payload, "model": target_model, "stream": False}, settings
+                        ),
+                        headers=headers,
+                        timeout=float(upstream["timeout"]),
+                    )
                 if response.status_code in {404, 405} and not upstream_looks_ollama(upstream):
-                    response = await client.post(upstream["url"], json=ollama_request_payload(chat_payload, upstream, settings), headers=headers, timeout=float(upstream["timeout"]))
+                    chat_url, fallback_payload, _ = prepare_chat_upstream_request(upstream, chat_payload, settings)
+                    response = await client.post(chat_url, json=fallback_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code >= 400:
                     failures.append(f"{upstream['name']}: {await _ollama_response_error(response)}")
                     record_upstream_http_result(settings, upstream["name"], response.status_code)
