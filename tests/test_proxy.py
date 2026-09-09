@@ -42,6 +42,23 @@ def test_thinking_controls_are_model_scoped_in_admin_ui() -> None:
     assert 'chat:["工作台","对话测试"' in app_script
 
 
+def test_admin_shell_restores_hash_before_deferred_scripts() -> None:
+    index = (proxy.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
+    chat = (proxy.STATIC_DIR / "chat.js").read_text(encoding="utf-8")
+
+    assert "root.dataset.initialPage" in index
+    assert 'id="initial-page-placeholder"' in index
+    for page in ("analytics", "api-tokens", "diagnostics", "changelog"):
+        assert f'data-page="{page}"' in index
+    assert index.index('data-page="diagnostics"') < index.index('data-page="security"')
+    assert index.index('data-page="security"') < index.index('data-page="logs"')
+    assert 'setAttribute("aria-busy", "false")' in features
+    assert features.rfind('classList.add("js-ready")') > features.find('data-view="analytics"')
+    assert "window.cleanllmModelsReady = loadModels()" in features
+    assert "window.cleanllmModelsReady" in chat
+
+
 def client_for(tmp_path: Path) -> TestClient:
     proxy.DATA_DIR = tmp_path
     proxy.SETTINGS_FILE = tmp_path / "settings.json"
@@ -576,6 +593,34 @@ def test_circuit_breaker_skips_open_upstream_and_recovers() -> None:
     assert proxy.route_upstreams(settings, "model")[0]["name"] == "backup"
     proxy.record_upstream_success("primary")
     assert not proxy.circuit_is_open("primary")
+
+
+def test_model_scoped_503_does_not_open_provider_wide_circuit() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "https://pipio.example/v1",
+        "default_upstream_name": "pipio",
+        "upstreams": [{"name": "backup", "url": "https://backup.example/v1"}],
+        "circuit_breaker_failures": 1,
+    }).model_dump(mode="json")
+
+    proxy.record_upstream_http_result(
+        settings, "pipio", 503,
+        detail="分组 GPT 下模型 gpt-5.6-luna 无可用渠道（distributor）",
+    )
+
+    assert not proxy.circuit_is_open("pipio")
+    assert [item["name"] for item in proxy.route_upstreams(settings, "gpt-5.6-sol")][:2] == [
+        "pipio", "backup",
+    ]
+
+    proxy.record_upstream_stream_failure(
+        settings, "pipio", "no available channel for model gpt-5.6-luna"
+    )
+    assert not proxy.circuit_is_open("pipio")
+
+    proxy.record_upstream_http_result(settings, "pipio", 503, detail="Service unavailable")
+    assert proxy.circuit_is_open("pipio")
+    proxy.UPSTREAM_CIRCUITS.clear()
 
 
 def test_circuit_breaker_allows_only_one_half_open_probe() -> None:

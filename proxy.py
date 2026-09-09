@@ -1740,9 +1740,55 @@ def record_typed_upstream_failure(
         schedule_alert("upstream_offline", f"上游已熔断：{name}", f"连续失败 {state['failures']} 次，冷却 {cooldown} 秒；{state['last_error']}")
 
 
-def record_upstream_http_result(
-    settings: dict[str, Any], name: str, status_code: int, headers: Any = None
+def model_scoped_upstream_error(status_code: int, detail: str = "") -> bool:
+    """Return whether an HTTP error describes one model, not the provider.
+
+    Some OpenAI-compatible distributors use HTTP 5xx when a requested model
+    has no channel. Opening the provider-wide circuit for that response makes
+    unrelated models fail with zero attempts until the cooldown expires.
+    """
+    if status_code < 500:
+        return False
+    message = str(detail or "").casefold()
+    markers = (
+        "无可用渠道",
+        "没有可用渠道",
+        "模型不存在",
+        "模型未找到",
+        "model not found",
+        "model_not_found",
+        "no available channel",
+        "no available distributor",
+        "no distributor",
+    )
+    return any(marker in message for marker in markers)
+
+
+def record_upstream_stream_failure(
+    settings: dict[str, Any], name: str, detail: str
 ) -> None:
+    """Record a stream failure without making model errors provider-wide."""
+    if model_scoped_upstream_error(500, detail):
+        release_upstream_probe(name)
+        logger.info(
+            "Model-scoped stream error did not affect circuit: %s",
+            name,
+        )
+        return
+    record_typed_upstream_failure(settings, name, detail, "stream")
+
+
+def record_upstream_http_result(
+    settings: dict[str, Any], name: str, status_code: int, headers: Any = None,
+    detail: str = "",
+) -> None:
+    if model_scoped_upstream_error(status_code, detail):
+        release_upstream_probe(name)
+        logger.info(
+            "Model-scoped upstream error did not affect circuit: %s (HTTP %s)",
+            name, status_code,
+        )
+        return
     if status_code == 429:
         record_typed_upstream_failure(
             settings, name, "HTTP 429", "rate_limit", retry_after_seconds(headers)
@@ -4268,9 +4314,11 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             await client.aclose()
             return None
         if response.status_code >= 400:
-            failures.append(f"{upstream['name']}: {await _ollama_response_error(response)}")
+            failure_detail = await _ollama_response_error(response)
+            failures.append(f"{upstream['name']}: {failure_detail}")
             record_upstream_http_result(
-                settings, upstream["name"], response.status_code, getattr(response, "headers", None)
+                settings, upstream["name"], response.status_code,
+                getattr(response, "headers", None), failure_detail,
             )
             await response.aclose()
             await client.aclose()
@@ -4373,6 +4421,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                         if failed:
                             terminal = True
                             semantic_failure = True
+                            stream_error = stream_event_error(event) or "上游在业务输出前返回失败事件"
                             update_usage_record_safely(usage_id, termination_reason="response.failed")
                         elif successful:
                             terminal = True
@@ -4412,7 +4461,6 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                             failed, meaningful, successful = False, raw == "[DONE]", False
 
                     if semantic_failure and not output_started:
-                        stream_error = "上游在业务输出前返回失败事件"
                         break
                     if meaningful and not output_started:
                         output_started = True
@@ -4452,9 +4500,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                 return
             failure_message = stream_error or "上游响应流未正常结束"
             failures.append(f"{upstream['name']}: {failure_message}")
-            record_typed_upstream_failure(
-                settings, upstream["name"], failure_message, "stream"
-            )
+            record_upstream_stream_failure(settings, upstream["name"], failure_message)
             if output_started:
                 logger.warning(
                     "Responses stream from %s disconnected after output: %s",
@@ -4526,8 +4572,12 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
             async with httpx.AsyncClient(timeout=float(upstream["timeout"])) as client:
                 response = await client.post(url, content=outbound_body, headers=headers)
             if response.status_code >= 400:
-                failures.append(f"{upstream['name']}: {await _ollama_response_error(response)}")
-                record_upstream_http_result(settings, upstream["name"], response.status_code)
+                failure_detail = await _ollama_response_error(response)
+                failures.append(f"{upstream['name']}: {failure_detail}")
+                record_upstream_http_result(
+                    settings, upstream["name"], response.status_code,
+                    getattr(response, "headers", None), failure_detail,
+                )
                 continue
             remember_route(settings, str(payload.get("model") or endpoint), upstream["name"])
             record_upstream_success(upstream["name"])
@@ -4637,8 +4687,12 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         async with client.stream("POST", responses_url, json=outbound_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
-                                failures.append(f"{upstream['name']}: {await _ollama_response_error(upstream_response)}")
-                                record_upstream_http_result(settings, upstream["name"], upstream_response.status_code)
+                                failure_detail = await _ollama_response_error(upstream_response)
+                                failures.append(f"{upstream['name']}: {failure_detail}")
+                                record_upstream_http_result(
+                                    settings, upstream["name"], upstream_response.status_code,
+                                    getattr(upstream_response, "headers", None), failure_detail,
+                                )
                                 continue
                             selected_name = upstream["name"]
                             emitted = False
@@ -4742,7 +4796,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                     pass
                     if stream_error:
                         failures.append(f"{upstream['name']}: {stream_error}")
-                        record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                        record_upstream_stream_failure(settings, upstream["name"], stream_error)
                         if output_emitted:
                             logger.warning(
                                 "Responses chat fallback stream from %s disconnected after output: %s",
@@ -4762,7 +4816,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         break
                     stream_error = "上游响应流未正常结束"
                     failures.append(f"{upstream['name']}: {stream_error}")
-                    record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                    record_upstream_stream_failure(settings, upstream["name"], stream_error)
                     if output_emitted:
                         update_usage_record_safely(
                             getattr(request.state, "usage_id", None),
@@ -4782,7 +4836,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 except httpx.RequestError as exc:
                     stream_error = f"上游响应流意外中断：{exc}"
                     failures.append(f"{upstream['name']}: {stream_error}")
-                    record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                    record_upstream_stream_failure(settings, upstream["name"], stream_error)
                     if output_emitted:
                         update_usage_record_safely(
                             getattr(request.state, "usage_id", None),
@@ -4797,7 +4851,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 except Exception as exc:
                     stream_error = f"上游响应流处理失败：{exc}"
                     failures.append(f"{upstream['name']}: {stream_error}")
-                    record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                    record_upstream_stream_failure(settings, upstream["name"], stream_error)
                     if output_emitted:
                         update_usage_record_safely(
                             getattr(request.state, "usage_id", None),
@@ -4885,8 +4939,12 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     chat_url, fallback_payload, _ = prepare_chat_upstream_request(upstream, chat_payload, settings)
                     response = await client.post(chat_url, json=fallback_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code >= 400:
-                    failures.append(f"{upstream['name']}: {await _ollama_response_error(response)}")
-                    record_upstream_http_result(settings, upstream["name"], response.status_code)
+                    failure_detail = await _ollama_response_error(response)
+                    failures.append(f"{upstream['name']}: {failure_detail}")
+                    record_upstream_http_result(
+                        settings, upstream["name"], response.status_code,
+                        getattr(response, "headers", None), failure_detail,
+                    )
                     continue
                 data = response.json()
                 upstream_error = _ollama_payload_error(data)
@@ -4899,7 +4957,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     continue
                 if upstream_looks_ollama(upstream) and native_ollama and data.get("done") is not True:
                     failures.append(f"{upstream['name']}: Ollama 响应未正常结束")
-                    record_typed_upstream_failure(settings, upstream["name"], "Ollama 响应未正常结束", "stream")
+                    record_upstream_stream_failure(settings, upstream["name"], "Ollama 响应未正常结束")
                     continue
                 if upstream_looks_ollama(upstream) and native_ollama:
                     data = ollama_chat_to_openai(data, target_model)
@@ -4977,10 +5035,11 @@ async def proxy_chat_request(request: Request) -> Response:
                 candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
                 candidate = await candidate_client.send(candidate_client.build_request("POST", request_url, json=request_payload, headers=headers), stream=True)
                 if candidate.status_code >= 400:
-                    failures.append(f"{upstream['name']}: {await _ollama_response_error(candidate)}")
+                    failure_detail = await _ollama_response_error(candidate)
+                    failures.append(f"{upstream['name']}: {failure_detail}")
                     record_upstream_http_result(
                         settings, upstream["name"], candidate.status_code,
-                        getattr(candidate, "headers", None),
+                        getattr(candidate, "headers", None), failure_detail,
                     )
                     await candidate.aclose()
                     await candidate_client.aclose()
@@ -4992,8 +5051,12 @@ async def proxy_chat_request(request: Request) -> Response:
                 async with httpx.AsyncClient() as candidate_client:
                     candidate = await candidate_client.post(request_url, json=request_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if candidate.status_code >= 400:
-                    failures.append(f"{upstream['name']}: {await _ollama_response_error(candidate)}")
-                    record_upstream_http_result(settings, upstream["name"], candidate.status_code)
+                    failure_detail = await _ollama_response_error(candidate)
+                    failures.append(f"{upstream['name']}: {failure_detail}")
+                    record_upstream_http_result(
+                        settings, upstream["name"], candidate.status_code,
+                        getattr(candidate, "headers", None), failure_detail,
+                    )
                     continue
                 try:
                     candidate_data = candidate.json()
@@ -5008,7 +5071,7 @@ async def proxy_chat_request(request: Request) -> Response:
                     continue
                 if native_ollama and isinstance(candidate_data, dict) and candidate_data.get("done") is not True:
                     failures.append(f"{upstream['name']}: Ollama 响应未正常结束")
-                    record_typed_upstream_failure(settings, upstream["name"], "Ollama 响应未正常结束", "stream")
+                    record_upstream_stream_failure(settings, upstream["name"], "Ollama 响应未正常结束")
                     continue
                 if native_ollama and isinstance(candidate_data, dict):
                     candidate_data = ollama_chat_to_openai(candidate_data, target_model)
@@ -5151,7 +5214,7 @@ async def proxy_chat_request(request: Request) -> Response:
                     remember_route(settings, requested_model, current_upstream["name"])
                     update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="stream_completed", latency_ms=round((time.perf_counter() - stream_started) * 1000, 1))
                     return
-                record_typed_upstream_failure(settings, current_upstream["name"], stream_error, "stream")
+                record_upstream_stream_failure(settings, current_upstream["name"], stream_error)
                 failures_before_output.append(f"{current_upstream['name']}: {stream_error}")
                 if emitted_output:
                     logger.warning(
@@ -5194,7 +5257,10 @@ async def proxy_chat_request(request: Request) -> Response:
                         continue
                     if candidate_response.status_code >= 400:
                         detail = await _ollama_response_error(candidate_response)
-                        record_upstream_http_result(settings, candidate_upstream["name"], candidate_response.status_code, getattr(candidate_response, "headers", None))
+                        record_upstream_http_result(
+                            settings, candidate_upstream["name"], candidate_response.status_code,
+                            getattr(candidate_response, "headers", None), detail,
+                        )
                         failures_before_output.append(f"{candidate_upstream['name']}: {detail}")
                         await candidate_response.aclose(); await candidate_client.aclose()
                         continue

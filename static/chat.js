@@ -132,8 +132,13 @@
 
   async function loadModels() {
     const select = $("#chat-model");
+    const sharedModels = window.cleanllmModelsReady
+      ? Promise.resolve(window.cleanllmModelsReady).then(() => ({
+        data: window.cleanllmModelRecords?.() || [],
+      }))
+      : adminRequest("/api/models");
     const [modelResult, settingsResult] = await Promise.allSettled([
-      adminRequest("/api/models"),
+      sharedModels,
       adminRequest("/api/settings"),
     ]);
     const records = modelResult.status === "fulfilled" ? modelResult.value.data || [] : [];
