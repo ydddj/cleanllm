@@ -28,6 +28,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Ollama 请求默认关闭思考模式以兼容旧版客户端；通过 `ollama_disable_thinking` 或 `OLLAMA_DISABLE_THINKING=false` 可恢复模型默认思考行为。只有上游明确选择或被保守识别为支持的思考协议时才能注入控制参数，未知云接口不得盲目注入。
 - 通用单模型思考策略保存在 `model_thinking_policies`，使用上游名称与实际模型名联合定位，值为 `disabled`、`enabled`、`low`、`medium` 或 `high`；同名模型在不同上游必须互相隔离。上游 `thinking_protocol` 支持 `auto`、`none`、`ollama`、`local_openai` 和 `openai`，默认上游使用 `default_upstream_thinking_protocol`。Chat 与 Responses 必须应用同一策略；本地 OpenAI 兼容协议合并现有 `chat_template_kwargs`，不得覆盖客户端其他模板参数。
 - 旧 Ollama 单模型思考模式 `ollama_model_thinking` 继续兼容读取；新通用策略优先。需要覆盖 Ollama 思考模式时必须走原生 `/api/chat` 并转换回标准 OpenAI 普通/流式响应，避免兼容接口忽略 `think`。
+- 代理设置不再显示 `ollama_disable_thinking` 全局开关；该字段仅为旧配置和环境变量兼容保留，保存其他代理设置不得擅自改写它。新的思考模式调整统一放在模型列表。
 - Long-running Ollama pulls must remain streamed. Do not replace them with a short fixed timeout.
 - Format Unix timestamps in the browser as local date/time and support both seconds and milliseconds.
 - Keep the log file capped at 5 MB and preserve `/data` volume compatibility.
@@ -42,6 +43,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Default both login and admin pages to dark mode before application scripts run, avoiding a light-theme flash; log level colors must use theme variables.
 - Theme selection must persist both `dark` and `light` values across refreshes; never treat a saved light choice as missing.
 - All `<select>` and numeric inputs must hide native browser arrows and use the shared CSS-drawn control styling.
+- 全站布尔设置使用统一的主题色滑动开关，批量选择等多选操作使用方形勾选框；必须保持文字与控件垂直居中并兼容窄屏。
 - Keep each release under its own `##` heading in `CHANGELOG.md`; never append new release bullets to an older version section.
 - The UI language is Simplified Chinese and follows the visual style established by `notify-router`.
 - 多上游设置使用有序选项卡数组，数组首项始终是默认上游；默认上游名称可编辑，拖拽排序后保存顺序必须保持。

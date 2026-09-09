@@ -97,7 +97,7 @@ docker compose up -d --build
 
 “导出压缩包”会把 Ollama manifest 与模型 blobs 打包为 `.ollama.tar.gz`。由于 Ollama HTTP API 不提供完整权重导出接口，Compose 需要将宿主机模型目录只读挂载到 `/ollama-models`；通过 `OLLAMA_MODELS_PATH` 指定宿主机路径（Linux 默认 `/root/.ollama/models`）。这个挂载只用于 CleanLLM 导出，模型的实际下载和加载仍由 Ollama 服务负责；如果 Ollama 在另一个容器中运行，两个容器必须共享同一个模型卷，不能只给 CleanLLM 挂载一份目录。如果宿主机目录权限受限，请将 `.env` 中的 `PUID`、`PGID` 设置为该目录所有者的 UID/GID（例如 `1000`），然后重建容器。如果未挂载，仍可使用“导出定义”导出 JSON，但不能生成权重压缩包。
 
-进入 Web 管理中心的“模型列表”，可查看 Ollama 状态、拉取模型并查看实时进度，也可删除已安装模型。拉取完成必须收到 Ollama 的 `success` 事件，并会调用 `/api/show` 做可用性校验；如果校验报告 `unable to load model` 或 `blobs/sha256-…`，说明 Ollama 使用的模型目录缺少 blob 或文件不完整，应在 Ollama 所在环境重新拉取该模型并确认 `OLLAMA_MODELS` 指向同一目录。上游设置中默认开启“默认关闭思考模式”；“模型列表 → Ollama 模型管理”的“思考模式”列可以直接为单个模型选择关闭、开启或低/中/高强度，单模型设置优先。需要控制思考模式时，CleanLLM 会调用 Ollama 原生 `/api/chat`，再把普通响应、NDJSON 流和工具调用转换为 OpenAI Chat/Responses 格式，避免部分 Ollama 版本的 OpenAI 兼容接口忽略 `think:false`。GPT-OSS 不支持完全关闭思考，应选择低强度。也可通过环境变量 `OLLAMA_DISABLE_THINKING=false` 修改实例初始默认值。若 Ollama 使用反向代理或非标准端口，应填写对应上游的“Ollama 管理地址”，以便 CleanLLM 准确识别并推导原生接口。`OLLAMA_API_URL` 留空时，CleanLLM 会从 `TARGET_API_URL` 自动提取地址；例如 `http://host.docker.internal:11434/v1/chat/completions` 会使用 `http://host.docker.internal:11434`。如果上游不是 Ollama，OpenAI 兼容模型列表仍可正常使用，管理区会提示 Ollama 不可用。
+进入 Web 管理中心的“模型列表”，可查看 Ollama 状态、拉取模型并查看实时进度，也可删除已安装模型。拉取完成必须收到 Ollama 的 `success` 事件，并会调用 `/api/show` 做可用性校验；如果校验报告 `unable to load model` 或 `blobs/sha256-…`，说明 Ollama 使用的模型目录缺少 blob 或文件不完整，应在 Ollama 所在环境重新拉取该模型并确认 `OLLAMA_MODELS` 指向同一目录。“模型列表 → Ollama 模型管理”的“思考模式”列可以直接为单个模型选择关闭、开启或低/中/高强度；代理设置不再显示重复的全局开关。需要控制思考模式时，CleanLLM 会调用 Ollama 原生 `/api/chat`，再把普通响应、NDJSON 流和工具调用转换为 OpenAI Chat/Responses 格式，避免部分 Ollama 版本的 OpenAI 兼容接口忽略 `think:false`。GPT-OSS 不支持完全关闭思考，应选择低强度。旧实例的 `ollama_disable_thinking` 配置及环境变量 `OLLAMA_DISABLE_THINKING` 继续兼容。若 Ollama 使用反向代理或非标准端口，应填写对应上游的“Ollama 管理地址”，以便 CleanLLM 准确识别并推导原生接口。`OLLAMA_API_URL` 留空时，CleanLLM 会从 `TARGET_API_URL` 自动提取地址；例如 `http://host.docker.internal:11434/v1/chat/completions` 会使用 `http://host.docker.internal:11434`。如果上游不是 Ollama，OpenAI 兼容模型列表仍可正常使用，管理区会提示 Ollama 不可用。
 
 ## 自动发布到 Docker Hub
 
@@ -106,7 +106,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.15`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.16`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，并可随时修改到期时间及可用模型白名单。模型规则支持精确名称和 `*`、`?` 通配符，留空允许全部模型；受限令牌访问 `/v1/models` 时也只会看到允许的模型。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。使用日志明细保留 400 天，清除明细不会改变调用次数、周期 Token 统计或令牌累计用量。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 

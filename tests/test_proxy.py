@@ -23,6 +23,12 @@ def test_application_version_comes_from_version_file() -> None:
     assert proxy.app.version == proxy.APP_VERSION
 
 
+def test_thinking_controls_are_model_scoped_in_admin_ui() -> None:
+    features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
+    assert 'id="ollama-disable-thinking"' not in features
+    assert "model-thinking-select" in features
+
+
 def client_for(tmp_path: Path) -> TestClient:
     proxy.DATA_DIR = tmp_path
     proxy.SETTINGS_FILE = tmp_path / "settings.json"
