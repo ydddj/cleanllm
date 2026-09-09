@@ -30,6 +30,15 @@ function syncThemeIcon() {
 const savedPalette = localStorage.getItem("cleanllm-palette");
 applyPalette(savedPalette === null ? 2 : Number(savedPalette));
 syncThemeIcon();
+const cachedBackground = localStorage.getItem("cleanllm-background") || "";
+if (/^\/api\/appearance\/background\/[0-9a-f]{64}\.(?:png|jpg|webp|gif|avif)$/.test(cachedBackground)) {
+  document.querySelector(".login-view").style.setProperty(
+    "background-image",
+    `linear-gradient(rgba(11,13,18,.5),rgba(11,13,18,.72)),url("${cachedBackground}")`,
+    "important",
+  );
+}
+document.body.style.visibility = "visible";
 themeButton.addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
   document.documentElement.dataset.theme = next;
@@ -84,6 +93,10 @@ async function initializeAppearance() {
         `linear-gradient(rgba(11,13,18,.5),rgba(11,13,18,.72)),url("${data.background}")`,
         "important",
       );
+      localStorage.setItem("cleanllm-background", data.background);
+    } else {
+      localStorage.removeItem("cleanllm-background");
+      document.querySelector(".login-view").style.removeProperty("background-image");
     }
   } catch (_) {
     // The form remains usable with the default background.
@@ -92,7 +105,6 @@ async function initializeAppearance() {
   }
 }
 initializeAppearance();
-setTimeout(() => { document.body.style.visibility = "visible"; }, 900);
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();

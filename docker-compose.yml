@@ -33,8 +33,6 @@ services:
     volumes:
       - cleanllm-data:/data
       - ${OLLAMA_MODELS_PATH:-/root/.ollama/models}:/ollama-models:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 volumes:
   cleanllm-data:

@@ -48,6 +48,8 @@ def client_for(tmp_path: Path) -> TestClient:
     proxy.MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
     proxy.ROUTE_AFFINITY.clear()
     proxy.UPSTREAM_CIRCUITS.clear()
+    proxy.NO_ROUTE_CACHE.clear()
+    proxy.LOGIN_FAILURES.clear()
     return TestClient(proxy.app, raise_server_exceptions=False)
 
 
@@ -1248,6 +1250,46 @@ def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path,
     assert '"id":"resp_test"' in response.text
 
 
+def test_native_responses_stream_translates_chat_sse_compatibility_response(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    configure_non_ollama_upstream()
+    proxy.invalidate_proxy_runtime()
+    chunks = [
+        b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":null}]}\n\n',
+        b'data: [DONE]\n\n',
+    ]
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            for chunk in chunks:
+                yield chunk
+
+        async def aclose(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/responses", json={"model": "test", "input": "hello", "stream": True})
+    assert response.status_code == 200
+    assert '"type":"response.output_text.delta"' in response.text
+    assert response.text.count("event: response.completed") == 1
+    assert "event: response.failed" not in response.text
+
+
 def test_native_responses_stream_reports_failure_when_upstream_omits_terminal_event(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     configure_non_ollama_upstream()
@@ -1751,6 +1793,31 @@ def test_connectivity_uses_models_url_and_recovers_expired_circuit(tmp_path: Pat
     assert "primary" not in proxy.UPSTREAM_CIRCUITS
 
 
+def test_manual_connectivity_success_immediately_recovers_open_circuit(tmp_path: Path, monkeypatch) -> None:
+    client_for(tmp_path)
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "primary",
+        "circuit_breaker_failures": 1,
+    }).model_dump(mode="json")
+    proxy.record_upstream_failure(settings, "primary", "HTTP 503")
+    assert proxy.circuit_is_open("primary")
+
+    class FakeResponse:
+        def raise_for_status(self): return None
+
+    class FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return None
+        async def get(self, *args, **kwargs): return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    result = asyncio.run(proxy.run_connectivity_test(settings, manual=True))
+
+    assert result["results"][0]["ok"] is True
+    assert "primary" not in proxy.UPSTREAM_CIRCUITS
+
+
 def test_capped_log_handler_never_keeps_an_oversized_file(tmp_path: Path) -> None:
     path = tmp_path / "capped.log"
     handler = proxy.CappedFileHandler(path, max_bytes=512)
@@ -1965,3 +2032,138 @@ def test_responses_event_state_distinguishes_failure_and_output() -> None:
     assert proxy.responses_event_state({"type": "response.created"}) == (False, False, False)
     assert proxy.responses_event_state({"type": "response.failed", "error": {"message": "down"}})[0]
     assert proxy.responses_event_state({"type": "response.output_text.delta", "delta": "hello"})[1]
+
+
+def test_client_disconnect_releases_half_open_probe_without_penalizing_upstream() -> None:
+    proxy.UPSTREAM_CIRCUITS["provider"] = {
+        "failures": 3,
+        "open_until": time.time() - 1,
+        "phase": "open",
+        "probe_in_flight": False,
+    }
+    assert proxy.acquire_upstream("provider") is True
+    assert proxy.UPSTREAM_CIRCUITS["provider"]["probe_in_flight"] is True
+
+    proxy.record_client_disconnect(None, "provider")
+
+    assert proxy.UPSTREAM_CIRCUITS["provider"]["probe_in_flight"] is False
+    assert proxy.UPSTREAM_CIRCUITS["provider"]["failures"] == 3
+    proxy.UPSTREAM_CIRCUITS.clear()
+
+
+def test_runtime_invalidation_clears_negative_routes_and_circuits() -> None:
+    proxy.MODEL_CACHE.update({"at": time.time(), "data": [{"id": "stale"}], "source": "old"})
+    proxy.ROUTE_AFFINITY["model"] = ("provider", time.time() + 60)
+    proxy.NO_ROUTE_CACHE["model|path"] = time.time() + 30
+    proxy.UPSTREAM_CIRCUITS["provider"] = {"failures": 1}
+
+    proxy.invalidate_proxy_runtime()
+
+    assert proxy.MODEL_CACHE["data"] is None
+    assert proxy.MODEL_CACHE["failed_upstreams"] == []
+    assert proxy.ROUTE_AFFINITY == {}
+    assert proxy.NO_ROUTE_CACHE == {}
+    assert proxy.UPSTREAM_CIRCUITS == {}
+
+
+def test_failed_model_discovery_upstream_remains_inference_fallback() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "https://primary.example/v1",
+        "default_upstream_name": "primary",
+        "upstreams": [{"name": "uncertain", "url": "https://uncertain.example/v1"}],
+    }).model_dump(mode="json")
+    proxy.MODEL_CACHE.update({
+        "data": [{"id": "shared", "upstream": "primary", "interfaces": ["v1/chat/completions"]}],
+        "at": time.time(),
+        "source": "test",
+        "failed_upstreams": ["uncertain"],
+    })
+    request = SimpleNamespace(
+        state=SimpleNamespace(api_token=None, usage_id="route-test"),
+        url=SimpleNamespace(path="/v1/chat/completions"),
+    )
+
+    candidates = proxy.route_upstreams(settings, "shared", request)
+
+    assert [item["name"] for item in candidates] == ["primary", "uncertain"]
+    proxy.invalidate_proxy_runtime()
+
+
+def test_route_model_interface_paths_ignore_leading_slash() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "primary",
+        "upstreams": [{"name": "backup", "url": "http://backup/v1"}],
+    }).model_dump(mode="json")
+    proxy.MODEL_CACHE.update({
+        "data": [{
+            "id": "shared",
+            "upstream": "primary",
+            "interfaces": ["v1/chat/completions", "v1/responses"],
+        }],
+        "at": time.time(),
+        "source": "test",
+        "failed_upstreams": [],
+    })
+    request = SimpleNamespace(
+        state=SimpleNamespace(api_token=None, usage_id="route-interface"),
+        url=SimpleNamespace(path="/v1/responses"),
+    )
+    candidates = proxy.route_upstreams(
+        settings, "shared", request, capability_path="/v1/responses"
+    )
+    assert [item["name"] for item in candidates] == ["primary"]
+    proxy.invalidate_proxy_runtime()
+
+
+def test_token_cipher_is_authenticated_and_reads_legacy_records() -> None:
+    token_id = "token-id"
+    token = "cln_test-secret"
+    cipher = proxy.token_cipher(token, token_id)
+    assert cipher.startswith("v2.")
+    assert proxy.token_plain(cipher, token_id) == token
+
+    payload = bytearray(proxy.base64.urlsafe_b64decode(cipher[3:].encode()))
+    payload[-1] ^= 1
+    damaged = "v2." + proxy.base64.urlsafe_b64encode(payload).decode()
+    try:
+        proxy.token_plain(damaged, token_id)
+        assert False, "tampered token ciphertext must be rejected"
+    except ValueError:
+        pass
+
+    key = proxy.hashlib.sha256(proxy.session_secret() + token_id.encode()).digest()
+    legacy = bytes(value ^ key[index % len(key)] for index, value in enumerate(token.encode()))
+    assert proxy.token_plain(proxy.base64.urlsafe_b64encode(legacy).decode(), token_id) == token
+
+
+def test_usage_logs_support_real_pagination(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    now = int(time.time())
+    with proxy.database_connection() as database:
+        database.executemany(
+            """INSERT INTO api_usage
+               (id, token_id, token_name, at, path, method, model, total_tokens)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, ?)""",
+            [(f"page-{index}", "分页客户端", now + index, "/v1/responses", "POST", "test", index)
+             for index in range(20)],
+        )
+
+    first = client.get("/api/usage?log_limit=8&log_offset=0").json()
+    second = client.get("/api/usage?log_limit=8&log_offset=8").json()
+
+    assert len(first["logs"]) == 8
+    assert len(second["logs"]) == 8
+    assert first["log_total"] == 20
+    assert first["has_more_logs"] is True
+    assert {item["id"] for item in first["logs"]}.isdisjoint(item["id"] for item in second["logs"])
+
+
+def test_login_failures_are_rate_limited(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    for _ in range(proxy.LOGIN_RATE_MAX_FAILURES):
+        assert client.post("/api/login", json={"username": "admin", "password": "wrong"}).status_code == 401
+    limited = client.post("/api/login", json={"username": "admin", "password": "wrong"})
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) > 0

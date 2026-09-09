@@ -129,6 +129,8 @@ Add regression tests for changed authentication, settings persistence, response 
 - Tags matching `v*.*.*` also publish semantic-version tags.
 - Every user-visible release change must update the API/UI version, `CHANGELOG.md`, and the README's current version reference together.
 - `VERSION` is the canonical release version. Update it for every release; GitHub Actions and the FastAPI application read it directly.
+- 每次用户可见修复或功能变更都必须同步更新 `VERSION`、`CHANGELOG.md`、README 当前版本、静态资源 query 版本和侧栏版本号；页面 shell 必须先显示当前 URL hash 对应页面，不得等待慢接口阻塞首屏。
+- 流式代理异常必须保持合法 OpenAI SSE/Responses 终止语义；客户端取消时释放上游连接和半开放熔断探测，不得伪造 `response.completed`。
 - Model discovery may use the persistent `model_cache_ttl` setting (seconds; 0 disables caching). API tokens retain a SHA-256 digest for authentication and an instance-key-encrypted copy for administrator re-copy; never log tokens or expose them outside authenticated management APIs. Status streaming uses the authenticated SSE endpoint `/api/system/events`.
 - Never place Docker Hub credentials in source files. Publishing uses the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN`.
 - After publishing, verify the GitHub Actions job before reporting the Docker image as available.

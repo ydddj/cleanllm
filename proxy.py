@@ -115,7 +115,9 @@ app = FastAPI(title="CleanLLM", version=APP_VERSION, lifespan=app_lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 OLLAMA_TASKS: dict[str, dict[str, Any]] = {}
 OLLAMA_HANDLES: dict[str, asyncio.Task] = {}
-MODEL_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "source": ""}
+MODEL_CACHE: dict[str, Any] = {
+    "at": 0.0, "data": None, "source": "", "failed_upstreams": []
+}
 CONNECTIVITY_STATE: dict[str, Any] = {"checked_at": None, "results": [], "availability_percent": None}
 CONNECTIVITY_LOCK = asyncio.Lock()
 CONNECTIVITY_TASK: asyncio.Task | None = None
@@ -127,6 +129,12 @@ NO_ROUTE_CACHE: dict[str, float] = {}
 ALERT_COOLDOWNS: dict[str, float] = {}
 INITIALIZED_DATABASES: set[str] = set()
 DATABASE_INIT_LOCK = threading.Lock()
+LOGIN_FAILURES: dict[str, list[float]] = {}
+LOGIN_RATE_LOCK = threading.Lock()
+LOGIN_RATE_WINDOW_SECONDS = 5 * 60
+LOGIN_RATE_MAX_FAILURES = 5
+ERROR_RATE_ALERT_LOCK = threading.Lock()
+ERROR_RATE_ALERT_LAST_CHECK = 0.0
 
 
 class LoginRequest(BaseModel):
@@ -643,6 +651,38 @@ def credentials_valid(username: str, password: str) -> bool:
     return username_ok and password_ok
 
 
+def login_retry_after(source_ip: str, now: float | None = None) -> int:
+    current = time.time() if now is None else now
+    with LOGIN_RATE_LOCK:
+        recent = [
+            value for value in LOGIN_FAILURES.get(source_ip, [])
+            if current - value < LOGIN_RATE_WINDOW_SECONDS
+        ]
+        if recent:
+            LOGIN_FAILURES[source_ip] = recent
+        else:
+            LOGIN_FAILURES.pop(source_ip, None)
+        if len(recent) < LOGIN_RATE_MAX_FAILURES:
+            return 0
+        return max(1, int(LOGIN_RATE_WINDOW_SECONDS - (current - recent[0])))
+
+
+def record_login_failure(source_ip: str, now: float | None = None) -> None:
+    current = time.time() if now is None else now
+    with LOGIN_RATE_LOCK:
+        recent = [
+            value for value in LOGIN_FAILURES.get(source_ip, [])
+            if current - value < LOGIN_RATE_WINDOW_SECONDS
+        ]
+        recent.append(current)
+        LOGIN_FAILURES[source_ip] = recent[-LOGIN_RATE_MAX_FAILURES:]
+
+
+def clear_login_failures(source_ip: str) -> None:
+    with LOGIN_RATE_LOCK:
+        LOGIN_FAILURES.pop(source_ip, None)
+
+
 def session_secret() -> bytes:
     value = os.getenv("SESSION_SECRET") or admin_password()
     return value.encode("utf-8")
@@ -685,14 +725,49 @@ def token_digest(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def token_cipher_keys(token_id: str) -> tuple[bytes, bytes]:
+    """Derive independent encryption and authentication keys for one token."""
+    root = hmac.new(
+        session_secret(), f"cleanllm-token:{token_id}".encode(), hashlib.sha256
+    ).digest()
+    return (
+        hmac.new(root, b"encryption", hashlib.sha256).digest(),
+        hmac.new(root, b"authentication", hashlib.sha256).digest(),
+    )
+
+
+def token_cipher_stream(key: bytes, nonce: bytes, length: int) -> bytes:
+    blocks = []
+    for counter in range((length + 31) // 32):
+        blocks.append(hmac.new(key, nonce + counter.to_bytes(4, "big"), hashlib.sha256).digest())
+    return b"".join(blocks)[:length]
+
+
 def token_cipher(token: str, token_id: str) -> str:
-    key = hashlib.sha256(session_secret() + token_id.encode()).digest()
+    encryption_key, authentication_key = token_cipher_keys(token_id)
+    nonce = secrets.token_bytes(16)
     raw = token.encode()
-    encrypted = bytes(value ^ key[index % len(key)] for index, value in enumerate(raw))
-    return base64.urlsafe_b64encode(encrypted).decode()
+    stream = token_cipher_stream(encryption_key, nonce, len(raw))
+    encrypted = bytes(value ^ stream[index] for index, value in enumerate(raw))
+    tag = hmac.new(authentication_key, b"v2" + nonce + encrypted, hashlib.sha256).digest()
+    return "v2." + base64.urlsafe_b64encode(nonce + encrypted + tag).decode()
 
 
 def token_plain(cipher: str, token_id: str) -> str:
+    if cipher.startswith("v2."):
+        payload = base64.urlsafe_b64decode(cipher[3:].encode())
+        if len(payload) < 48:
+            raise ValueError("令牌密文已损坏")
+        nonce, encrypted, supplied_tag = payload[:16], payload[16:-32], payload[-32:]
+        encryption_key, authentication_key = token_cipher_keys(token_id)
+        expected_tag = hmac.new(
+            authentication_key, b"v2" + nonce + encrypted, hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(supplied_tag, expected_tag):
+            raise ValueError("令牌密文校验失败")
+        stream = token_cipher_stream(encryption_key, nonce, len(encrypted))
+        return bytes(value ^ stream[index] for index, value in enumerate(encrypted)).decode()
+    # Read legacy records and upgrade them when the administrator next lists tokens.
     key = hashlib.sha256(session_secret() + token_id.encode()).digest()
     encrypted = base64.urlsafe_b64decode(cipher.encode())
     return bytes(value ^ key[index % len(key)] for index, value in enumerate(encrypted)).decode()
@@ -850,6 +925,14 @@ def record_audit(actor: str, source_ip: str, action: str, resource: str, status_
 def database_tokens() -> list[dict[str, Any]]:
     with database_connection() as database:
         return [row_dict(row) for row in database.execute("SELECT * FROM api_tokens ORDER BY created_at DESC")]
+
+
+def database_token_for_digest(digest: str) -> tuple[bool, dict[str, Any] | None]:
+    """Return whether token authentication is enabled and one exact digest match."""
+    with database_connection() as database:
+        configured = bool(database.execute("SELECT 1 FROM api_tokens LIMIT 1").fetchone())
+        row = database.execute("SELECT * FROM api_tokens WHERE hash = ?", (digest,)).fetchone() if digest else None
+    return configured, row_dict(row) if row is not None else None
 
 
 def database_usage(since: int = 0) -> list[dict[str, Any]]:
@@ -1028,21 +1111,13 @@ def token_limit_error(item: dict[str, Any], now: int, estimated_tokens: int, mod
 
 async def require_api_token(request: Request) -> None:
     now = int(time.time())
-    configured = database_tokens()
     matched = None
+    header = request.headers.get("authorization", "")
+    supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
+    digest = token_digest(supplied) if supplied else ""
+    configured, candidate = database_token_for_digest(digest)
     if configured:
-        header = request.headers.get("authorization", "")
-        supplied = header[7:].strip() if header.lower().startswith("bearer ") else ""
-        digest = token_digest(supplied) if supplied else ""
-        matched = next(
-            (
-                item
-                for item in configured
-                if secrets.compare_digest(digest, str(item.get("hash")))
-                and token_is_active(item, now)
-            ),
-            None,
-        )
+        matched = candidate if candidate and token_is_active(candidate, now) else None
         if not matched:
             raise HTTPException(status_code=401, detail="API 访问令牌无效或缺失")
         source_ip = request.client.host if request.client else ""
@@ -1146,9 +1221,15 @@ def update_usage_record_safely(usage_id: str | None, **values: Any) -> None:
 
 
 def check_error_rate_alert() -> None:
+    global ERROR_RATE_ALERT_LAST_CHECK
     settings = load_settings()
     if not settings.get("webhook_url"):
         return
+    current = time.monotonic()
+    with ERROR_RATE_ALERT_LOCK:
+        if current - ERROR_RATE_ALERT_LAST_CHECK < 30:
+            return
+        ERROR_RATE_ALERT_LAST_CHECK = current
     with database_connection() as database:
         row = database.execute(
             """SELECT COUNT(*) calls,
@@ -1270,7 +1351,7 @@ def save_settings(settings: dict[str, Any]) -> None:
         for handler in logger.handlers:
             if isinstance(handler, CappedFileHandler):
                 handler.max_bytes = configured_limit
-            logger.setLevel(getattr(logging, str(settings.get("log_level", "WARNING")).upper(), logging.WARNING))
+        logger.setLevel(getattr(logging, str(settings.get("log_level", "WARNING")).upper(), logging.WARNING))
     except OSError as exc:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -1549,6 +1630,15 @@ def circuit_is_open(name: str, now: float | None = None) -> bool:
     return float(state.get("open_until") or 0) > (time.time() if now is None else now)
 
 
+def invalidate_proxy_runtime(*, clear_circuits: bool = True) -> None:
+    """Drop all routing decisions derived from persisted upstream settings."""
+    MODEL_CACHE.update({"at": 0.0, "data": None, "source": "", "failed_upstreams": []})
+    ROUTE_AFFINITY.clear()
+    NO_ROUTE_CACHE.clear()
+    if clear_circuits:
+        UPSTREAM_CIRCUITS.clear()
+
+
 def record_upstream_success(name: str) -> None:
     if name:
         UPSTREAM_CIRCUITS.pop(name, None)
@@ -1559,6 +1649,13 @@ def release_upstream_probe(name: str) -> None:
     state = UPSTREAM_CIRCUITS.get(name)
     if state and state.get("phase") == "half_open":
         state["probe_in_flight"] = False
+
+
+def record_client_disconnect(usage_id: str | None, upstream_name: str) -> None:
+    """Release routing state without treating a client cancellation as an upstream fault."""
+    release_upstream_probe(upstream_name)
+    update_usage_record_safely(usage_id, termination_reason="client_disconnected")
+    logger.info("Client disconnected while streaming from %s", upstream_name)
 
 
 def acquire_upstream(name: str, now: float | None = None) -> bool:
@@ -1783,7 +1880,17 @@ def route_upstreams(
         # endpoint that cannot load it and then disconnects.
         if model_records:
             known_upstreams = {str(item["upstream"]) for item in model_records}
-            available = [item for item in available if item["name"] in known_upstreams]
+            uncertain_upstreams = {
+                str(name) for name in MODEL_CACHE.get("failed_upstreams", [])
+            }
+            # A failed discovery request is not proof that the inference
+            # endpoint lacks this model. Keep uncertain upstreams as fallbacks,
+            # while excluding upstreams that successfully reported it absent.
+            available = [
+                item for item in available
+                if item["name"] in known_upstreams or item["name"] in uncertain_upstreams
+            ]
+            available.sort(key=lambda item: item["name"] not in known_upstreams)
         lookup_model = resolved_model(settings, model)
         compatible = []
         declared_any = False
@@ -1791,7 +1898,8 @@ def route_upstreams(
             records = [record for record in MODEL_CACHE["data"] if record.get("id") == lookup_model and record.get("upstream") == item["name"]]
             declared = [interface for record in records for interface in (record.get("interfaces") or [])]
             declared_any = declared_any or bool(declared)
-            if declared and endpoint not in {str(value).lstrip("/") for value in declared}:
+            normalized_endpoint = str(endpoint or "").lstrip("/")
+            if declared and normalized_endpoint not in {str(value).lstrip("/") for value in declared}:
                 continue
             compatible.append(item)
         if declared_any:
@@ -2191,12 +2299,22 @@ async def appearance_background(filename: str) -> FileResponse:
 
 
 @app.post("/api/login")
-async def login(login_data: LoginRequest) -> JSONResponse:
+async def login(login_data: LoginRequest, request: Request) -> JSONResponse:
+    source_ip = request.client.host if request.client else "unknown"
+    retry_after = login_retry_after(source_ip)
+    if retry_after:
+        raise HTTPException(
+            status_code=429,
+            detail="登录失败次数过多，请稍后重试",
+            headers={"Retry-After": str(retry_after)},
+        )
     _, password_hash = configured_credentials()
     if not password_hash and not admin_password():
         raise HTTPException(status_code=503, detail="尚未配置初始 ADMIN_PASSWORD")
     if not credentials_valid(login_data.username, login_data.password):
+        record_login_failure(source_ip)
         raise HTTPException(status_code=401, detail="用户名或密码错误")
+    clear_login_failures(source_ip)
     response = JSONResponse({"message": "登录成功"})
     response.set_cookie(
         SESSION_COOKIE,
@@ -2299,9 +2417,7 @@ async def update_settings(
     create_config_snapshot_safely("自动：保存设置前", settings)
     settings.update(update.model_dump(mode="json"))
     save_settings(settings)
-    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
-    ROUTE_AFFINITY.clear()
-    UPSTREAM_CIRCUITS.clear()
+    invalidate_proxy_runtime()
     CONNECTIVITY_WAKEUP.set()
     return {"message": "设置已保存"}
 
@@ -2370,9 +2486,7 @@ async def restore_config_snapshot(snapshot_id: str, _: None = Depends(require_ad
     current = load_settings()
     current.update(restored.model_dump(mode="json"))
     save_settings(current)
-    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
-    ROUTE_AFFINITY.clear()
-    UPSTREAM_CIRCUITS.clear()
+    invalidate_proxy_runtime()
     CONNECTIVITY_WAKEUP.set()
     return {"message": "配置已恢复"}
 
@@ -2445,25 +2559,41 @@ def connectivity_metrics(
     }
 
 
-async def run_connectivity_test(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+async def run_connectivity_test(
+    settings: dict[str, Any] | None = None, *, manual: bool = False
+) -> dict[str, Any]:
     """Run one shared connectivity sample for every configured upstream."""
     settings = settings or load_settings()
-    results = []
+    upstreams = configured_upstreams(settings)
     async with CONNECTIVITY_LOCK:
+        semaphore = asyncio.Semaphore(6)
         async with httpx.AsyncClient() as client:
-            for upstream in configured_upstreams(settings):
+            async def probe(upstream: dict[str, Any]) -> dict[str, Any]:
                 headers = {"Authorization": f"Bearer {upstream['api_key']}"} if upstream["api_key"] else {}
-                started = time.perf_counter()
-                try:
-                    probe = await client.get(upstream["models_url"], headers=headers, timeout=8.0)
-                    probe.raise_for_status()
-                    detail = "模型列表接口可达（不代表流式生成兼容）"
-                    results.append({"name": upstream["name"], "ok": True, "latency_ms": round((time.perf_counter()-started)*1000), "detail": detail})
-                    state = UPSTREAM_CIRCUITS.get(upstream["name"]) or {}
-                    if state.get("failures") and float(state.get("open_until") or 0) <= time.time():
-                        record_upstream_success(upstream["name"])
-                except Exception as exc:
-                    results.append({"name": upstream["name"], "ok": False, "latency_ms": round((time.perf_counter()-started)*1000), "detail": str(exc)})
+                async with semaphore:
+                    started = time.perf_counter()
+                    try:
+                        response = await client.get(upstream["models_url"], headers=headers, timeout=8.0)
+                        response.raise_for_status()
+                        state = UPSTREAM_CIRCUITS.get(upstream["name"]) or {}
+                        if manual or (
+                            state.get("failures")
+                            and float(state.get("open_until") or 0) <= time.time()
+                        ):
+                            record_upstream_success(upstream["name"])
+                        return {
+                            "name": upstream["name"], "ok": True,
+                            "latency_ms": round((time.perf_counter() - started) * 1000),
+                            "detail": "模型列表接口可达（不代表流式生成兼容）",
+                        }
+                    except Exception as exc:
+                        return {
+                            "name": upstream["name"], "ok": False,
+                            "latency_ms": round((time.perf_counter() - started) * 1000),
+                            "detail": str(exc),
+                        }
+
+            results = list(await asyncio.gather(*(probe(upstream) for upstream in upstreams)))
         checked = len(results)
         healthy = sum(1 for item in results if item.get("ok"))
         checked_at = time.time()
@@ -2481,7 +2611,7 @@ async def run_connectivity_test(settings: dict[str, Any] | None = None) -> dict[
 
 @app.post("/api/settings/test")
 async def test_connections(_: None = Depends(require_admin)) -> dict[str, Any]:
-    return await run_connectivity_test()
+    return await run_connectivity_test(manual=True)
 
 
 async def connectivity_scheduler() -> None:
@@ -2568,9 +2698,7 @@ async def import_settings(update: ConfigImportRequest, _: None = Depends(require
         raise HTTPException(status_code=422, detail=f"导入配置无效：{exc}") from exc
     current.update(validated)
     save_settings(current)
-    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
-    ROUTE_AFFINITY.clear()
-    UPSTREAM_CIRCUITS.clear()
+    invalidate_proxy_runtime()
     CONNECTIVITY_WAKEUP.set()
     return {"message": "配置已导入"}
 
@@ -2615,8 +2743,7 @@ async def import_upstreams(update: UpstreamImportRequest, _: None = Depends(requ
     settings.update(validated)
     create_config_snapshot_safely("自动：导入上游前")
     save_settings(settings)
-    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
-    ROUTE_AFFINITY.clear()
+    invalidate_proxy_runtime()
     CONNECTIVITY_WAKEUP.set()
     return {"message": f"已导入 {len(imported)} 个上游", "count": len(normalized)}
 
@@ -2641,8 +2768,7 @@ async def update_upstream_status(update: UpstreamBatchStatusRequest, _: None = D
     settings.update(validated)
     create_config_snapshot_safely("自动：批量修改上游前")
     save_settings(settings)
-    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
-    ROUTE_AFFINITY.clear()
+    invalidate_proxy_runtime()
     CONNECTIVITY_WAKEUP.set()
     return {"message": f"已{('启用' if update.enabled else '停用')} {matched} 个上游"}
 
@@ -2654,9 +2780,7 @@ async def reset_settings(_: None = Depends(require_admin)) -> dict[str, str]:
     reset = copy.deepcopy(DEFAULT_SETTINGS)
     reset.update(preserved)
     save_settings(reset)
-    MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
-    ROUTE_AFFINITY.clear()
-    UPSTREAM_CIRCUITS.clear()
+    invalidate_proxy_runtime()
     CONNECTIVITY_WAKEUP.set()
     return {"message": "代理设置已恢复默认值"}
 
@@ -2704,13 +2828,17 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
     items = database_tokens()
     now = int(time.time())
     result = []
+    cipher_upgrades: list[tuple[str, str]] = []
     for item in items:
         if not isinstance(item, dict):
             continue
         token = ""
         try:
-            token = token_plain(str(item.get("cipher") or ""), str(item.get("id"))) if item.get("cipher") else ""
-        except (ValueError, UnicodeDecodeError):
+            stored_cipher = str(item.get("cipher") or "")
+            token = token_plain(stored_cipher, str(item.get("id"))) if stored_cipher else ""
+            if token and not stored_cipher.startswith("v2."):
+                cipher_upgrades.append((token_cipher(token, str(item.get("id"))), str(item.get("id"))))
+        except (ValueError, UnicodeDecodeError, base64.binascii.Error):
             pass
         token_id = str(item.get("id"))
         expires_at = item.get("expires_at")
@@ -2734,6 +2862,9 @@ async def list_api_tokens(_: None = Depends(require_admin)) -> dict[str, Any]:
             "note": str(item.get("note") or ""),
             "ip_allowlist": token_ip_rules(item),
         })
+    if cipher_upgrades:
+        with database_connection() as database:
+            database.executemany("UPDATE api_tokens SET cipher = ? WHERE id = ?", cipher_upgrades)
     return {"data": result}
 
 
@@ -2795,7 +2926,11 @@ async def revoke_api_token(token_id: str, _: None = Depends(require_admin)) -> d
 
 @app.get("/api/usage")
 async def api_usage(
-    token_id: str = "", token_name: str = "", _: None = Depends(require_admin)
+    token_id: str = "",
+    token_name: str = "",
+    log_limit: int = 8,
+    log_offset: int = 0,
+    _: None = Depends(require_admin),
 ) -> dict[str, Any]:
     local_now = datetime.now().astimezone()
     today_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -2818,6 +2953,10 @@ async def api_usage(
     elif token_name:  # Backward compatibility for older admin clients.
         where += " AND token_name = ?"
         params.append(token_name)
+    log_limit = max(0, min(log_limit, 200))
+    log_offset = max(0, log_offset)
+    log_where = where
+    log_params = [int(time.time()) - 400 * 86400, *params[1:]]
     with database_connection() as database:
         summary = database.execute(
             f"""SELECT COUNT(*) AS total,
@@ -2836,10 +2975,15 @@ async def api_usage(
                 bounds["today"], bounds["week"], bounds["month"], *params,
             ),
         ).fetchone()
+        log_total = int(database.execute(
+            f"SELECT COUNT(*) FROM api_usage WHERE {log_where} AND visible = 1",
+            log_params,
+        ).fetchone()[0])
         log_rows = database.execute(
-            f"SELECT * FROM api_usage WHERE {where} AND visible = 1 ORDER BY at DESC LIMIT 100",
-            params,
-        ).fetchall()
+            f"SELECT * FROM api_usage WHERE {log_where} AND visible = 1 "
+            "ORDER BY at DESC, rowid DESC LIMIT ? OFFSET ?",
+            (*log_params, log_limit, log_offset),
+        ).fetchall() if log_limit else []
         by_token_rows = database.execute(
             """SELECT COALESCE(token_id, '') AS token_id, token_name, COUNT(*) AS calls
                FROM api_usage WHERE at >= ? GROUP BY token_id, token_name""",
@@ -2862,6 +3006,9 @@ async def api_usage(
         "tokens_month": int(values.get("tokens_month") or 0),
         "by_token": by_token,
         "logs": [row_dict(row) for row in log_rows],
+        "log_total": log_total,
+        "log_offset": log_offset,
+        "has_more_logs": log_offset + len(log_rows) < log_total,
     }
 
 
@@ -2870,7 +3017,10 @@ async def clear_usage_logs(_: None = Depends(require_admin)) -> dict[str, str]:
     with database_connection() as database:
         database.execute(
             """UPDATE api_usage
-               SET visible = 0, path = '', method = '', model = '', latency_ms = NULL
+               SET visible = 0,
+                   path = '', method = '', model = '', resolved_model = '', upstream = '',
+                   latency_ms = NULL, first_byte_ms = NULL, attempts = 0,
+                   status_code = NULL, error = '', termination_reason = ''
                WHERE visible = 1"""
         )
     return {"message": "使用日志已清除，调用与 Token 统计不受影响"}
@@ -3214,28 +3364,48 @@ async def get_models(refresh: bool = False, _: None = Depends(require_admin)) ->
         return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(MODEL_CACHE["data"]), "cached": True, "data": MODEL_CACHE["data"], "upstreams": upstream_names}
     models: list[dict[str, Any]] = []
     failures: list[str] = []
+    failed_upstreams: list[str] = []
+    semaphore = asyncio.Semaphore(6)
     async with httpx.AsyncClient() as client:
-        for upstream in upstreams:
+        async def discover(upstream: dict[str, Any]) -> tuple[list[dict[str, Any]], str]:
             headers = {"Accept": "application/json"}
             if upstream["api_key"]:
                 headers["Authorization"] = f"Bearer {upstream['api_key']}"
-            try:
-                response = await client.get(upstream["models_url"], headers=headers, timeout=min(float(upstream["timeout"]), 30.0))
-                response.raise_for_status(); payload = response.json()
-            except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
-                failures.append(f"{upstream['name']}: {exc}"); continue
+            async with semaphore:
+                try:
+                    response = await client.get(
+                        upstream["models_url"], headers=headers,
+                        timeout=min(float(upstream["timeout"]), 30.0),
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+                    return [], f"{upstream['name']}: {exc}"
             raw_models = payload.get("data", []) if isinstance(payload, dict) else []
-            if not raw_models and isinstance(payload, dict): raw_models = payload.get("models", [])
+            if not raw_models and isinstance(payload, dict):
+                raw_models = payload.get("models", [])
+            discovered: list[dict[str, Any]] = []
             for item in raw_models if isinstance(raw_models, list) else []:
                 model_id = item if isinstance(item, str) else item.get("id") or item.get("name") or item.get("model") if isinstance(item, dict) else None
                 if model_id:
                     details = item if isinstance(item, dict) else {}
-                    models.append({"id": str(model_id), "owned_by": str(details.get("owned_by") or details.get("owner") or "upstream"), "created": details.get("created") or details.get("modified_at"), "upstream": upstream["name"], **model_metadata(details, str(model_id), ollama=upstream_looks_ollama(upstream))})
+                    discovered.append({"id": str(model_id), "owned_by": str(details.get("owned_by") or details.get("owner") or "upstream"), "created": details.get("created") or details.get("modified_at"), "upstream": upstream["name"], **model_metadata(details, str(model_id), ollama=upstream_looks_ollama(upstream))})
+            return discovered, ""
+
+        discovered_results = await asyncio.gather(*(discover(upstream) for upstream in upstreams))
+    for upstream, (discovered, failure) in zip(upstreams, discovered_results):
+        models.extend(discovered)
+        if failure:
+            failures.append(failure)
+            failed_upstreams.append(upstream["name"])
     if not models and failures:
         raise HTTPException(status_code=502, detail="获取上游模型失败：" + "；".join(failures))
     upstream_order = {item["name"]: index for index, item in enumerate(upstreams)}
     models.sort(key=lambda item: (upstream_order.get(item["upstream"], len(upstreams)), item["id"].lower()))
-    MODEL_CACHE.update({"at": time.time(), "data": models, "source": sources})
+    MODEL_CACHE.update({
+        "at": time.time(), "data": models, "source": sources,
+        "failed_upstreams": failed_upstreams,
+    })
     logger.info("Discovered %d models from %d upstreams", len(models), len(upstreams))
     return {"source": "多个上游" if len(upstreams) > 1 else upstreams[0]["models_url"], "count": len(models), "cached": False, "data": models, "failures": failures, "upstreams": upstream_names}
 
@@ -4070,7 +4240,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
         if upstream["api_key"]:
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
         client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
-        responses_url = upstream["url"].replace("/chat/completions", "/responses")
+        responses_url = endpoint_url_for_target(upstream["url"], "responses")
         started = time.perf_counter()
         try:
             logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
@@ -4083,7 +4253,16 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                 ),
                 stream=True,
             )
+        except asyncio.CancelledError:
+            await client.aclose()
+            record_client_disconnect(usage_id, upstream["name"])
+            raise
         except httpx.RequestError as exc:
+            failures.append(f"{upstream['name']}: {exc}")
+            record_typed_upstream_failure(settings, upstream["name"], str(exc), "transient")
+            await client.aclose()
+            return None
+        except Exception as exc:
             failures.append(f"{upstream['name']}: {exc}")
             record_typed_upstream_failure(settings, upstream["name"], str(exc), "transient")
             await client.aclose()
@@ -4115,6 +4294,10 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
     async def relay() -> Any:
         connection = first_connection
         output_started = False
+        chat_compat = False
+        compat_response_id = f"resp-{secrets.token_hex(12)}"
+        compat_item_id = f"msg-{secrets.token_hex(8)}"
+        compat_sequence = 0
         for index in range(first_index, len(candidates)):
             upstream = candidates[index]
             if index != first_index:
@@ -4140,12 +4323,35 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     if frame is None:
                         yield b": cleanllm-keepalive\n\n"
                         continue
-                    if not first_byte_recorded:
-                        update_usage_record_safely(
-                            usage_id, first_byte_ms=round((time.perf_counter() - started) * 1000, 1)
-                        )
-                        first_byte_recorded = True
                     raw, event = sse_frame_payload(frame)
+                    # A few compatibility gateways accept /responses but
+                    # return Chat Completions SSE. Translate that explicit
+                    # shape instead of buffering it until an EOF failure.
+                    if (
+                        isinstance(event, dict)
+                        and not event.get("type")
+                        and isinstance(event.get("choices"), list)
+                    ):
+                        choice = event["choices"][0] if event["choices"] else {}
+                        delta = choice.get("delta") if isinstance(choice, dict) else {}
+                        delta = delta if isinstance(delta, dict) else {}
+                        content = delta.get("content")
+                        if isinstance(content, str) or delta.get("tool_calls") or delta.get("function_call"):
+                            compat_sequence += 1
+                            event = {
+                                "type": "response.output_text.delta",
+                                "delta": content if isinstance(content, str) else "",
+                                "item_id": compat_item_id,
+                                "output_index": 0,
+                                "content_index": 0,
+                                "response_id": compat_response_id,
+                                "sequence_number": compat_sequence,
+                            }
+                            if delta.get("tool_calls") or delta.get("function_call"):
+                                event["tool_calls"] = delta.get("tool_calls") or delta.get("function_call")
+                            chat_compat = True
+                        elif isinstance(choice, dict) and choice.get("finish_reason") is not None:
+                            chat_compat = True
                     if event is not None:
                         event_type = str(event.get("type") or "")
                         response_data = event.get("response") if isinstance(event.get("response"), dict) else {}
@@ -4158,6 +4364,12 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                         elif event_type == "response.output_text.done":
                             event["text"] = clean_content(str(event.get("text") or ""), response_settings)
                         failed, meaningful, successful = responses_event_state(event)
+                        if meaningful and not successful and not first_byte_recorded:
+                            update_usage_record_safely(
+                                usage_id,
+                                first_byte_ms=round((time.perf_counter() - started) * 1000, 1),
+                            )
+                            first_byte_recorded = True
                         if failed:
                             terminal = True
                             semantic_failure = True
@@ -4172,7 +4384,32 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                             )
                         frame = rewrite_sse_payload(frame, event)
                     else:
-                        failed, meaningful, successful = False, raw == "[DONE]", False
+                        if raw == "[DONE]" and chat_compat:
+                            compat_sequence += 1
+                            event = {
+                                "type": "response.completed",
+                                "response": {
+                                    "id": compat_response_id,
+                                    "object": "response",
+                                    "created_at": int(time.time()),
+                                    "model": requested_model,
+                                    "status": "completed",
+                                },
+                                "sequence_number": compat_sequence,
+                            }
+                            raw = ""
+                            frame = (
+                                "event: response.completed\n"
+                                f"data: {json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+                            ).encode()
+                            failed, meaningful, successful = False, True, True
+                            terminal = True
+                            successful_terminal = True
+                            update_usage_record_safely(
+                                usage_id, termination_reason="response.completed"
+                            )
+                        else:
+                            failed, meaningful, successful = False, raw == "[DONE]", False
 
                     if semantic_failure and not output_started:
                         stream_error = "上游在业务输出前返回失败事件"
@@ -4190,8 +4427,17 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                         if buffered_size > SSE_PREOUTPUT_LIMIT:
                             stream_error = "业务输出前事件超过缓冲上限"
                             break
+            except asyncio.CancelledError:
+                record_client_disconnect(usage_id, upstream["name"])
+                raise
             except httpx.RequestError as exc:
                 stream_error = f"上游响应流意外中断：{exc}"
+            except Exception as exc:
+                # A provider can terminate an HTTP stream with a protocol or
+                # decoding exception that is not an httpx.RequestError. Keep
+                # the OpenAI stream contract valid and record a bounded error
+                # instead of aborting the ASGI generator silently.
+                stream_error = f"上游响应流处理失败：{exc}"
             finally:
                 await response.aclose()
                 await client.aclose()
@@ -4210,6 +4456,10 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                 settings, upstream["name"], failure_message, "stream"
             )
             if output_started:
+                logger.warning(
+                    "Responses stream from %s disconnected after output: %s",
+                    upstream["name"], failure_message,
+                )
                 update_usage_record_safely(
                     usage_id, status_code=502, error=failure_message,
                     termination_reason="stream_disconnected" if stream_error else "missing_terminal_event",
@@ -4297,6 +4547,11 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
                 media_type=response.headers.get("content-type", "application/octet-stream"),
                 headers=response_headers,
             )
+        except asyncio.CancelledError:
+            record_client_disconnect(
+                getattr(request.state, "usage_id", None), upstream["name"]
+            )
+            raise
         except httpx.RequestError as exc:
             record_upstream_failure(settings, upstream["name"], str(exc))
             failures.append(f"{upstream['name']}: {exc}")
@@ -4489,6 +4744,10 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         failures.append(f"{upstream['name']}: {stream_error}")
                         record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
                         if output_emitted:
+                            logger.warning(
+                                "Responses chat fallback stream from %s disconnected after output: %s",
+                                upstream["name"], stream_error,
+                            )
                             update_usage_record_safely(
                                 getattr(request.state, "usage_id", None),
                                 status_code=502, error=stream_error,
@@ -4515,8 +4774,28 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         return
                     selected_name = None
                     continue
+                except asyncio.CancelledError:
+                    record_client_disconnect(
+                        getattr(request.state, "usage_id", None), upstream["name"]
+                    )
+                    raise
                 except httpx.RequestError as exc:
                     stream_error = f"上游响应流意外中断：{exc}"
+                    failures.append(f"{upstream['name']}: {stream_error}")
+                    record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                    if output_emitted:
+                        update_usage_record_safely(
+                            getattr(request.state, "usage_id", None),
+                            status_code=502, error=stream_error,
+                            termination_reason="stream_disconnected",
+                        )
+                        failed = {**base, "status": "failed", "error": {"message": stream_error, "type": "upstream_error"}}
+                        yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
+                        return
+                    selected_name = None
+                    continue
+                except Exception as exc:
+                    stream_error = f"上游响应流处理失败：{exc}"
                     failures.append(f"{upstream['name']}: {stream_error}")
                     record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
                     if output_emitted:
@@ -4592,7 +4871,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     logger.info("Responses chat fallback request: %s -> %s", upstream["name"], chat_url)
                     response = await client.post(chat_url, json=outbound_payload, headers=headers, timeout=float(upstream["timeout"]))
                 else:
-                    responses_url = upstream["url"].replace("/chat/completions", "/responses")
+                    responses_url = endpoint_url_for_target(upstream["url"], "responses")
                     logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
                     response = await client.post(
                         responses_url,
@@ -4644,6 +4923,11 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                         yield f"event: response.completed\ndata: {json.dumps(result, ensure_ascii=False)}\n\n"
                     return StreamingResponse(events(), media_type="text/event-stream")
                 return JSONResponse(status_code=response.status_code, content=result)
+            except asyncio.CancelledError:
+                record_client_disconnect(
+                    getattr(request.state, "usage_id", None), upstream["name"]
+                )
+                raise
             except (httpx.RequestError, ValueError) as exc:
                 logger.warning("Responses upstream %s failed: %s", upstream["name"], exc)
                 record_upstream_failure(settings, upstream["name"], str(exc))
@@ -4684,6 +4968,7 @@ async def proxy_chat_request(request: Request) -> Response:
         headers = {"Content-Type": "application/json"}
         if upstream["api_key"]:
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
+        candidate_client = None
         try:
             request_url, request_payload, native_ollama = prepare_chat_upstream_request(
                 upstream, upstream_payload, settings
@@ -4732,6 +5017,13 @@ async def proxy_chat_request(request: Request) -> Response:
                 selected_data = candidate_data
                 selected_index = index
             break
+        except asyncio.CancelledError:
+            if candidate_client is not None:
+                await candidate_client.aclose()
+            record_client_disconnect(
+                getattr(request.state, "usage_id", None), upstream["name"]
+            )
+            raise
         except httpx.RequestError as exc:
             record_upstream_failure(settings, upstream["name"], str(exc))
             failures.append(f"{upstream['name']}: {exc}")
@@ -4842,8 +5134,15 @@ async def proxy_chat_request(request: Request) -> Response:
                             completed = True
                     if not stream_error and not completed:
                         stream_error = "上游响应流未正常结束"
+                except asyncio.CancelledError:
+                    record_client_disconnect(
+                        getattr(request.state, "usage_id", None), current_upstream["name"]
+                    )
+                    raise
                 except httpx.RequestError as exc:
                     stream_error = f"上游响应流意外中断：{exc}"
+                except Exception as exc:
+                    stream_error = f"上游响应流处理失败：{exc}"
                 finally:
                     await current_response.aclose()
                     await current_client.aclose()
@@ -4855,6 +5154,10 @@ async def proxy_chat_request(request: Request) -> Response:
                 record_typed_upstream_failure(settings, current_upstream["name"], stream_error, "stream")
                 failures_before_output.append(f"{current_upstream['name']}: {stream_error}")
                 if emitted_output:
+                    logger.warning(
+                        "Chat stream from %s disconnected after output: %s",
+                        current_upstream["name"], stream_error,
+                    )
                     update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=stream_error, termination_reason="stream_disconnected")
                     yield chat_stream_failure_event(stream_error)
                     return
@@ -4873,7 +5176,18 @@ async def proxy_chat_request(request: Request) -> Response:
                             candidate_upstream, upstream_payload, settings
                         )
                         candidate_response = await candidate_client.send(candidate_client.build_request("POST", candidate_url, json=candidate_payload, headers=headers), stream=True)
+                    except asyncio.CancelledError:
+                        await candidate_client.aclose()
+                        record_client_disconnect(
+                            getattr(request.state, "usage_id", None), candidate_upstream["name"]
+                        )
+                        raise
                     except httpx.RequestError as exc:
+                        await candidate_client.aclose()
+                        record_typed_upstream_failure(settings, candidate_upstream["name"], str(exc), "transient")
+                        failures_before_output.append(f"{candidate_upstream['name']}: {exc}")
+                        continue
+                    except Exception as exc:
                         await candidate_client.aclose()
                         record_typed_upstream_failure(settings, candidate_upstream["name"], str(exc), "transient")
                         failures_before_output.append(f"{candidate_upstream['name']}: {exc}")

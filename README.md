@@ -37,8 +37,6 @@ services:
       - cleanllm-data:/data
       # 用于“导出压缩包”；请改成宿主机实际 Ollama models 目录
       - /root/.ollama/models:/ollama-models:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
 volumes:
@@ -71,7 +69,7 @@ docker compose down
 
 常用环境变量：`ADMIN_USERNAME`（初始用户名）、`ADMIN_PASSWORD`（初始密码）、`SESSION_SECRET`（会话签名密钥）、`COOKIE_SECURE`（使用 HTTPS 时设为 `true`）、`HOST_PORT`（映射端口）、`TARGET_API_URL`、`UPSTREAM_API_KEY`、`REQUEST_TIMEOUT`、`THINKING_PROTOCOL`、`LOG_MAX_BYTES`、`CIRCUIT_BREAKER_FAILURES`、`CIRCUIT_BREAKER_COOLDOWN_SECONDS`、`ALERT_WEBHOOK_URL`、`ALERT_UPSTREAM_FAILURES`、`ALERT_ERROR_RATE_PERCENT`、`ALERT_BUDGET_PERCENT` 和 `DOCKER_IMAGE`。环境变量作为首次默认值，网页保存账户后以数据卷中的用户名和密码哈希为准。
 
-`extra_hosts` 仅用于让 Linux 容器通过 `host.docker.internal` 访问宿主机。如果上游使用局域网 IP、公网地址或同一 Compose 中的服务名，可以删除这段配置；默认上游在宿主机时建议保留。
+`extra_hosts` 默认不启用。仅当 Linux 容器需要通过 `host.docker.internal` 访问宿主机上游时，才在 `cleanllm` 服务下补充 `extra_hosts: ["host.docker.internal:host-gateway"]`；局域网 IP、公网地址和同一 Compose 服务名都不需要它。
 
 响应清洗规则在网页中按“每行一条正则表达式”填写，匹配内容会被删除。默认规则兼容原有的 Channel、Think 和孤立标签清理；保存时会自动检查正则语法。
 
@@ -106,7 +104,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.18`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.19`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，并可随时修改到期时间及可用模型白名单。模型规则支持精确名称和 `*`、`?` 通配符，留空允许全部模型；受限令牌访问 `/v1/models` 时也只会看到允许的模型。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。使用日志明细保留 400 天，清除明细不会改变调用次数、周期 Token 统计或令牌累计用量。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 

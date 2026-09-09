@@ -540,3 +540,64 @@
     flex: 1;
   }
 }
+
+/* Shared custom controls are rendered above scrolling tables and expose one
+   keyboard-focusable control instead of the hidden native select. */
+.custom-select-native {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  margin: -1px !important;
+  padding: 0 !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  clip-path: inset(50%) !important;
+  white-space: nowrap !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.custom-select-menu {
+  position: fixed !important;
+  top: auto;
+  left: auto;
+  z-index: 260 !important;
+  min-width: 160px;
+}
+
+.usage-log-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.usage-log-heading h3 { margin: 0 0 4px; font-size: 14px; }
+.usage-log-heading small { color: var(--muted); }
+.usage-log-frame {
+  margin-top: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--soft);
+}
+.usage-log-frame .table-wrap { max-height: 420px; overflow: auto; }
+.usage-log-frame .data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface);
+  box-shadow: 0 1px 0 var(--border);
+}
+.usage-log-actions { justify-content: flex-start; margin-top: 12px; }
+
+@media (max-width: 1120px) and (min-width: 761px) {
+  .topbar { padding-inline: 20px; }
+  .search { width: min(330px, 38vw); }
+  .search kbd,
+  .service-pill span { display: none; }
+  .service-pill { width: 38px; height: 38px; justify-content: center; padding: 0; }
+  .topbar-actions { gap: 6px; }
+  .user-button small { display: none; }
+}
