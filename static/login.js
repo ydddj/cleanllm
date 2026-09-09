@@ -9,7 +9,7 @@ const palettes = [
 ];
 
 function applyPalette(index) {
-  const palette = palettes[index] || palettes[0];
+  const palette = palettes[index] || palettes[2];
   document.documentElement.style.setProperty("--primary", palette[1]);
   document.documentElement.style.setProperty("--primary2", palette[2]);
   document.documentElement.style.setProperty("--primary-soft", `${palette[1]}26`);
@@ -27,7 +27,8 @@ function syncThemeIcon() {
     : '<svg viewBox="0 0 24 24"><path d="M20 15A8 8 0 0 1 9 4a9 9 0 1 0 11 11"/></svg>';
 }
 
-applyPalette(Number(localStorage.getItem("cleanllm-palette")) || 0);
+const savedPalette = localStorage.getItem("cleanllm-palette");
+applyPalette(savedPalette === null ? 2 : Number(savedPalette));
 syncThemeIcon();
 themeButton.addEventListener("click", () => {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";

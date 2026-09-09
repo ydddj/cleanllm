@@ -35,6 +35,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - 代理设置在移动端必须使用单列布局；健康检测、批量操作和上游编辑控件不得挤压或溢出，密集选项卡仅保留横向滚动。
 - Keep navigation state in the URL hash so refresh and direct links restore the same page; release notes are a separate page from runtime logs.
 - The UI provides approximately ten persisted Morandi color palettes; new palette changes must remain CSS-variable based and work in light/dark mode.
+- 全站在没有本地配色记录时默认使用青色；已有用户主动选择的配色必须继续保留，登录页和管理页的首屏 CSS 默认值必须同步，避免加载时闪现旧配色。
 - Keep hover hints limited to important icon-only controls; do not add redundant tooltips to ordinary labeled buttons.
 - Default both login and admin pages to dark mode before application scripts run, avoiding a light-theme flash; log level colors must use theme variables.
 - Theme selection must persist both `dark` and `light` values across refreshes; never treat a saved light choice as missing.
