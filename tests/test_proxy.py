@@ -635,6 +635,140 @@ def test_proxy_settings_save_preserves_account_hash(tmp_path: Path) -> None:
     assert proxy.load_settings()["admin_password_hash"] == original_hash
 
 
+def test_admin_note_requires_login_and_persists_without_logging_content(tmp_path: Path) -> None:
+    client = client_for(tmp_path)
+    assert client.get("/api/account/note").status_code == 401
+    assert client.put("/api/account/note", json={"note": "private"}).status_code == 401
+
+    login(client)
+    assert client.put("/api/account/note", json={"note": "x" * 10_001}).status_code == 422
+    note = "临时维护：晚间验证备用上游"
+    saved = client.put("/api/account/note", json={"note": note})
+    assert saved.status_code == 200
+    assert client.get("/api/account/note").json() == {"note": note}
+    assert proxy.load_settings()["admin_note"] == note
+
+    current = client.get("/api/settings").json()
+    assert client.put("/api/settings", json=current).status_code == 200
+    assert client.get("/api/account/note").json()["note"] == note
+    audit = client.get("/api/audit/logs").json()["data"]
+    assert any(item["action"] == "更新管理员备注" for item in audit)
+    assert note not in json.dumps(audit, ensure_ascii=False)
+
+
+def test_admin_chat_uses_web_session_and_public_chat_routing(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    payload = {"model": "coding-best", "messages": [{"role": "user", "content": "hello"}]}
+    assert client.post("/api/chat/completions", json=payload).status_code == 401
+    login(client)
+    saved = client.put("/api/settings", json={
+        "target_api_url": "http://primary/v1",
+        "default_upstream_name": "primary",
+        "upstreams": [{"name": "backup", "url": "http://backup/v1"}],
+        "virtual_models": [{
+            "alias": "coding-best",
+            "target": "gpt-real",
+            "routes": [{
+                "upstream": "backup",
+                "priority": 0,
+                "weight": 1,
+                "path_patterns": ["/v1/chat/completions"],
+            }],
+        }],
+    })
+    assert saved.status_code == 200, saved.text
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/api/chat/completions", json=payload)
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+    assert calls == [("http://backup/v1/chat/completions", {
+        "model": "gpt-real",
+        "messages": [{"role": "user", "content": "hello"}],
+    })]
+    request_id = response.headers.get("X-Request-ID")
+    assert request_id
+    trace = client.get("/api/traces", params={"request_id": request_id}).json()["data"][0]
+    assert trace["token_name"] == "Web 对话"
+    assert trace["path"] == "/api/chat/completions"
+    assert trace["resolved_model"] == "gpt-real"
+    assert trace["upstream"] == "backup"
+
+
+def test_admin_chat_stream_preserves_done_and_records_first_byte(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = proxy.load_settings()
+    settings.update({
+        "target_api_url": "https://provider.example/v1/chat/completions",
+        "default_upstream_name": "provider",
+    })
+    proxy.save_settings(settings)
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def aiter_bytes(self):
+            yield b'data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n'
+            yield b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        async def aclose(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/api/chat/completions", json={
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "stream": True,
+    })
+    assert response.status_code == 200
+    assert response.text.count("data: [DONE]") == 1
+    assert '"content": "hello"' in response.text
+    request_id = response.headers["X-Request-ID"]
+    trace = client.get("/api/traces", params={"request_id": request_id}).json()["data"][0]
+    assert trace["first_byte_ms"] is not None
+    assert trace["termination_reason"] == "stream_completed"
+
+
 def test_save_permission_error_is_json(tmp_path: Path) -> None:
     blocked_path = tmp_path / "not-a-directory"
     blocked_path.write_text("file", encoding="utf-8")

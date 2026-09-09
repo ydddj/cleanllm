@@ -11,6 +11,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - `proxy.py`: FastAPI routes, authentication, settings, proxy logic, logging, and Ollama integration.
 - `static/index.html`, `static/app.js`, `static/style.css`: dependency-free admin UI.
 - `static/login.html`, `static/login.js`: login page and Web session creation.
+- `static/chat.js`: administrator note dialog and lightweight management chat client.
 - `tests/test_proxy.py`: backend and integration tests.
 - `docker-compose.yml`, `Dockerfile`, `.env.example`: container configuration.
 - `.github/workflows/docker-publish.yml`: tests and multi-architecture Docker Hub publishing.
@@ -73,6 +74,8 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - 状态 SSE 必须为每个浏览器连接使用独立队列并广播事件，不得让多个管理页面竞争消费同一个全局队列。
 - 熔断冷却结束后只允许一个真实请求进入半开放探测；未实际尝试的备用上游不得提前占用探测名额，非 429 的 4xx 兼容性错误不得计入熔断。
 - 接口兼容性测试必须分别报告基础接口和流式接口，并验证 Chat 的 `[DONE]` 与 Responses 的标准终止事件，不能只以 HTTP 200 判断流式兼容。
+- 管理员备注保存到 `settings.json` 并限制为 10000 字；运行日志、操作审计和请求追踪不得记录备注正文。
+- 管理端对话只能通过 Web 会话鉴权的 `/api/chat/completions` 调用现有 Chat 代理核心，不得向浏览器暴露 API令牌；聊天正文只保存在浏览器当前标签页，不得写入服务端。
 
 ## Configuration rules
 
@@ -101,6 +104,7 @@ Run these checks before committing:
 python -m py_compile proxy.py tests/test_proxy.py
 node --check static/app.js
 node --check static/login.js
+node --check static/chat.js
 .\.venv\Scripts\python.exe -m pytest -q
 git diff --check
 ```

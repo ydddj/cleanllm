@@ -88,6 +88,7 @@ DEFAULT_SETTINGS = {
     "appearance_glass_brightness": 45,
     "appearance_glass_blur": 10,
     "appearance_mask_opacity": 50,
+    "admin_note": "",
 }
 RUNTIME_SETTINGS_KEYS = {"connectivity_history", "api_tokens", "export_history", "api_usage"}
 
@@ -165,6 +166,7 @@ class SettingsUpdate(BaseModel):
     appearance_glass_brightness: int = Field(default=45, ge=0, le=100)
     appearance_glass_blur: int = Field(default=10, ge=0, le=100)
     appearance_mask_opacity: int = Field(default=50, ge=0, le=100)
+    admin_note: str = Field(default="", max_length=10_000)
 
     @field_validator("models_api_url", "ollama_api_url")
     @classmethod
@@ -393,6 +395,10 @@ class AccountUpdate(BaseModel):
     current_password: str
     username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     new_password: str = Field(min_length=8, max_length=128)
+
+
+class AdminNoteUpdate(BaseModel):
+    note: str = Field(default="", max_length=10_000)
 
 
 class OllamaModelRequest(BaseModel):
@@ -1691,7 +1697,10 @@ def route_upstreams(
     out of Ollama, which exposes a Chat adapter but normally has no
     ``/v1/responses`` endpoint.
     """
-    request_path = request.url.path if request else ""
+    request_path = (
+        str(getattr(request.state, "route_path_override", "") or request.url.path)
+        if request else ""
+    )
     endpoint_path = capability_path or request_path
     route_key = f"{model}|{request_path}|{endpoint_path}|{int(exclude_ollama_responses)}"
     cached_until = NO_ROUTE_CACHE.get(route_key, 0.0)
@@ -1707,7 +1716,7 @@ def route_upstreams(
         token = getattr(request.state, "api_token", None) if request else None
         token_name = str((token or {}).get("name") or "")
         token_id = str((token or {}).get("id") or "")
-        path = request.url.path if request else ""
+        path = request_path
         routes = [route for route in virtual.get("routes", []) if virtual_route_matches(route, token_name, token_id, path, datetime.now().astimezone())]
         seed = str(getattr(request.state, "usage_id", "") if request else model)
         route_names = weighted_virtual_upstreams(routes, seed) if routes else []
@@ -2045,6 +2054,8 @@ def audit_event_for(method: str, path: str) -> tuple[str, str] | None:
         return ({"POST": "执行模型操作", "DELETE": "删除模型"}.get(method, "修改模型"), "Ollama 模型")
     if path == "/api/account":
         return "更新管理员账户", "账户安全"
+    if path == "/api/account/note":
+        return "更新管理员备注", "管理员备注"
     if path == "/api/system/restart":
         return "重启服务", "系统"
     if path in {"/api/logs", "/api/usage/logs"} and method == "DELETE":
@@ -2573,6 +2584,21 @@ async def update_account(
     response = JSONResponse({"message": "账户已更新，请重新登录"})
     response.delete_cookie(SESSION_COOKIE, path="/")
     return response
+
+
+@app.get("/api/account/note")
+async def get_admin_note(_: None = Depends(require_admin)) -> dict[str, str]:
+    return {"note": str(load_settings().get("admin_note") or "")}
+
+
+@app.put("/api/account/note")
+async def update_admin_note(
+    update: AdminNoteUpdate, _: None = Depends(require_admin)
+) -> dict[str, str]:
+    settings = load_settings()
+    settings["admin_note"] = update.note
+    save_settings(settings)
+    return {"message": "备注已保存"}
 
 
 @app.get("/api/tokens")
@@ -4519,8 +4545,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
     return JSONResponse(status_code=502, content={"error": {"message": detail, "type": "upstream_error"}})
 
 
-@app.post("/v1/chat/completions")
-async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> Response:
+async def proxy_chat_request(request: Request) -> Response:
     proxy_started = time.perf_counter()
     try:
         payload = await request.json()
@@ -4621,6 +4646,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
             }
             current_cleaner = StreamTextCleaner(current_settings)
             emitted_output = False
+            first_byte_recorded = False
             failures_before_output = []
             while current_upstream is not None:
                 completed = False
@@ -4683,6 +4709,12 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                                 has_output = True
                                 emitted_output = True
                         if has_output:
+                            if not first_byte_recorded:
+                                update_usage_record_safely(
+                                    getattr(request.state, "usage_id", None),
+                                    first_byte_ms=round((time.perf_counter() - stream_started) * 1000, 1),
+                                )
+                                first_byte_recorded = True
                             meaningful = True
                             emitted_output = True
                             for pending_frame in buffered:
@@ -4786,6 +4818,56 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     remember_route(settings, requested_model, selected["name"])
     update_usage_record_safely(getattr(request.state, "usage_id", None), termination_reason="http_completed")
     return JSONResponse(status_code=response.status_code, content=data)
+
+
+@app.post("/api/chat/completions")
+async def admin_chat_api(
+    request: Request, _: None = Depends(require_admin)
+) -> Response:
+    """Run a real proxy request from the admin test chat without exposing an API token."""
+    try:
+        raw_body = await request.body()
+        payload = json.loads(raw_body) if raw_body else {}
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="请求体不是有效 JSON") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体必须是 JSON 对象")
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        raise HTTPException(status_code=422, detail="请选择模型")
+
+    now = int(time.time())
+    usage_id = uuid.uuid4().hex
+    estimated_input_tokens = max(0, len(raw_body) // 4)
+    request.state.api_token = None
+    request.state.usage_id = usage_id
+    # Test the public Chat Completions route exactly, including virtual-model
+    # path rules, while keeping authentication behind the Web session.
+    request.state.route_path_override = "/v1/chat/completions"
+    with database_connection() as database:
+        database.execute(
+            """INSERT INTO api_usage
+               (id, token_id, token_name, at, path, method, model, latency_ms,
+                input_tokens, output_tokens, total_tokens)
+               VALUES (?, NULL, ?, ?, ?, ?, ?, NULL, ?, 0, ?)""",
+            (
+                usage_id,
+                "Web 对话",
+                now,
+                "/api/chat/completions",
+                "POST",
+                model,
+                estimated_input_tokens,
+                estimated_input_tokens,
+            ),
+        )
+        database.execute("DELETE FROM api_usage WHERE at < ?", (now - 400 * 86400,))
+    return await proxy_chat_request(request)
+
+
+@app.post("/v1/chat/completions")
+async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> Response:
+    return await proxy_chat_request(request)
 
 
 if __name__ == "__main__":
