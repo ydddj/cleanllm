@@ -64,8 +64,6 @@ DEFAULT_SETTINGS = {
     "models_api_url": os.getenv("MODELS_API_URL", ""),
     "ollama_api_url": os.getenv("OLLAMA_API_URL", ""),
     "default_upstream_thinking_protocol": os.getenv("THINKING_PROTOCOL", "auto").strip().lower(),
-    "ollama_disable_thinking": os.getenv("OLLAMA_DISABLE_THINKING", "true").strip().lower() not in {"0", "false", "no", "off"},
-    "ollama_model_thinking": {},
     "model_thinking_policies": [],
     "clean_patterns": DEFAULT_PATTERNS,
     "upstreams": [],
@@ -144,8 +142,6 @@ class SettingsUpdate(BaseModel):
     models_api_url: str = ""
     ollama_api_url: str = ""
     default_upstream_thinking_protocol: str = Field(default="auto", pattern=r"^(auto|none|ollama|local_openai|openai)$")
-    ollama_disable_thinking: bool = DEFAULT_SETTINGS["ollama_disable_thinking"]
-    ollama_model_thinking: dict[str, str] = Field(default_factory=dict, max_length=200)
     model_thinking_policies: list[dict[str, str]] = Field(default_factory=list, max_length=1000)
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
     log_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1 * 1024 * 1024, le=50 * 1024 * 1024)
@@ -199,22 +195,6 @@ class SettingsUpdate(BaseModel):
             cleaned.append(pattern)
         return cleaned
 
-    @field_validator("ollama_model_thinking", mode="before")
-    @classmethod
-    def validate_ollama_model_thinking(cls, values: Any) -> dict[str, str]:
-        if not isinstance(values, dict):
-            raise ValueError("Ollama 单模型思考模式必须是对象")
-        cleaned: dict[str, str] = {}
-        for raw_model, enabled in values.items():
-            model = str(raw_model).strip()
-            if not model or len(model) > 200:
-                raise ValueError("Ollama 思考模式的模型名称无效")
-            mode = normalize_ollama_thinking_mode(enabled)
-            if mode is None:
-                raise ValueError(f"Ollama 思考模式无效：{model}")
-            cleaned[model] = mode
-        return cleaned
-
     @field_validator("model_thinking_policies")
     @classmethod
     def validate_model_thinking_policies(cls, values: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -224,7 +204,7 @@ class SettingsUpdate(BaseModel):
                 raise ValueError(f"思考策略 {index} 必须是对象")
             upstream = str(item.get("upstream") or "").strip()
             model = str(item.get("model") or "").strip()
-            mode = normalize_ollama_thinking_mode(item.get("mode"))
+            mode = normalize_thinking_mode(item.get("mode"))
             if not upstream or len(upstream) > 80:
                 raise ValueError(f"思考策略 {index} 的上游名称无效")
             if not model or len(model) > 200:
@@ -1200,19 +1180,6 @@ def load_settings() -> dict[str, Any]:
         if SETTINGS_FILE.exists():
             saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             settings.update({key: value for key, value in saved.items() if key not in RUNTIME_SETTINGS_KEYS})
-            thinking_setting = settings.get("ollama_disable_thinking", DEFAULT_SETTINGS["ollama_disable_thinking"])
-            if isinstance(thinking_setting, str):
-                settings["ollama_disable_thinking"] = thinking_setting.strip().lower() not in {"0", "false", "no", "off"}
-            model_thinking = settings.get("ollama_model_thinking")
-            if not isinstance(model_thinking, dict):
-                settings["ollama_model_thinking"] = {}
-            else:
-                settings["ollama_model_thinking"] = {
-                    str(model).strip(): mode
-                    for model, enabled in model_thinking.items()
-                    if str(model).strip()
-                    if (mode := normalize_ollama_thinking_mode(enabled)) is not None
-                }
             default_protocol = normalize_thinking_protocol(settings.get("default_upstream_thinking_protocol"))
             settings["default_upstream_thinking_protocol"] = default_protocol or "auto"
             policies = settings.get("model_thinking_policies")
@@ -1225,7 +1192,7 @@ def load_settings() -> dict[str, Any]:
                         continue
                     upstream = str(item.get("upstream") or "").strip()
                     model = str(item.get("model") or "").strip()
-                    mode = normalize_ollama_thinking_mode(item.get("mode"))
+                    mode = normalize_thinking_mode(item.get("mode"))
                     if upstream and model and mode:
                         normalized_policies[(upstream, model)] = {
                             "upstream": upstream, "model": model, "mode": mode,
@@ -1882,8 +1849,8 @@ def thinking_protocol_for_upstream(upstream: dict[str, Any]) -> str:
     return "none"
 
 
-def normalize_ollama_thinking_mode(value: Any) -> str | None:
-    """Normalize old booleans and the modes accepted by Ollama's native API."""
+def normalize_thinking_mode(value: Any) -> str | None:
+    """Normalize the thinking modes accepted by supported upstream protocols."""
     if isinstance(value, bool):
         return "enabled" if value else "disabled"
     text = str(value or "").strip().lower()
@@ -1905,7 +1872,7 @@ def model_thinking_mode(
         if not isinstance(item, dict):
             continue
         if str(item.get("upstream") or "").strip() == upstream_name and str(item.get("model") or "").strip() == model:
-            return normalize_ollama_thinking_mode(item.get("mode"))
+            return normalize_thinking_mode(item.get("mode"))
     return None
 
 
@@ -1913,19 +1880,13 @@ def ollama_thinking_value(
     payload: dict[str, Any], settings: dict[str, Any], upstream: dict[str, Any] | None = None
 ) -> bool | str | None:
     """Return the native Ollama ``think`` value for this specific model."""
-    model = str(payload.get("model") or "").strip()
-    policy_mode = model_thinking_mode(upstream, payload, settings) if upstream is not None else None
-    overrides = settings.get("ollama_model_thinking")
-    legacy_mode = normalize_ollama_thinking_mode(overrides.get(model)) if isinstance(overrides, dict) and model in overrides else None
-    mode = policy_mode or legacy_mode
+    mode = model_thinking_mode(upstream, payload, settings) if upstream is not None else None
     if mode == "disabled":
         return False
     if mode == "enabled":
         return True
     if mode in {"low", "medium", "high"}:
         return mode
-    if bool(settings.get("ollama_disable_thinking", True)):
-        return False
     client_value = payload.get("think")
     if isinstance(client_value, bool) or str(client_value or "").strip().lower() in {"low", "medium", "high"}:
         return client_value

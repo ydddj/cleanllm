@@ -11,3 +11,4 @@ venv/
 .button-test-data/
 .pytest-run/
 .pytest-cleanllm*/
+.ui-test-*/

@@ -79,9 +79,9 @@ docker compose down
 
 管理中心可通过上游的 OpenAI 兼容 `/v1/models` 接口展示全部可用模型。默认地址由 Chat Completions 地址自动推导；非标准上游可通过网页或 `MODELS_API_URL` 单独指定。
 
-“上游与清洗 → 代理设置 → 高级设置”可为每个上游选择思考控制协议；“模型列表 → 上游模型”可再按单个模型设置关闭、开启或低/中/高强度。策略以“上游名称 + 实际模型名”为键，因此不同上游中的同名模型可以独立配置。Ollama 使用原生 `think` 参数；LM Studio、llama.cpp、vLLM 与 SGLang 兼容模式使用 `chat_template_kwargs.enable_thinking`，并按请求接口补充标准推理强度字段。只有模型的聊天模板或服务端支持这些参数时才能真正关闭思考；不支持的模型会忽略参数。`自动识别` 只处理明确识别出的本地服务，普通云接口保持原请求；非标准自建服务应手动选择协议，完全不希望 CleanLLM 修改请求时选择“不修改请求”。`THINKING_PROTOCOL` 仅设置默认上游的首次默认协议，支持 `auto`、`ollama`、`local_openai`、`openai` 和 `none`。
+“上游与清洗 → 代理设置”可直接为每个上游选择思考控制协议，该选项位于请求超时之前；“模型列表 → 上游模型”可再按单个模型设置关闭、开启或低/中/高强度。策略以“上游名称 + 实际模型名”为键，因此不同上游中的同名模型可以独立配置。Ollama 使用原生 `think` 参数；LM Studio、llama.cpp、vLLM 与 SGLang 兼容模式使用 `chat_template_kwargs.enable_thinking`，并按请求接口补充标准推理强度字段。只有模型的聊天模板或服务端支持这些参数时才能真正关闭思考；不支持的模型会忽略参数。`自动识别` 只处理明确识别出的本地服务，普通云接口保持原请求；非标准自建服务应手动选择协议，完全不希望 CleanLLM 修改请求时选择“不修改请求”。`THINKING_PROTOCOL` 仅设置默认上游的首次默认协议，支持 `auto`、`ollama`、`local_openai`、`openai` 和 `none`。
 
-管理中心的“对话测试”会通过当前 Web 会话调用真实代理链路，可验证模型路由、熔断、Ollama 思考模式、普通/流式输出和清洗结果，并显示请求 ID、实际上游与耗时。浏览器不需要接触 API令牌；聊天正文仅保存在当前标签页的 `sessionStorage` 中，不写入服务端日志或 SQLite。
+工作台中“概览”下方的“对话测试”会通过当前 Web 会话调用真实代理链路，可验证模型路由、熔断、Ollama 思考模式、普通/流式输出和清洗结果，并显示请求 ID、实际上游与耗时。浏览器不需要接触 API令牌；聊天正文仅保存在当前标签页的 `sessionStorage` 中，不写入服务端日志或 SQLite。
 
 右上角管理员菜单提供实例“备注”，适合临时记录维护安排、待测试模型或上游说明。备注保存在 `/data/settings.json`，同一实例跨设备可见；操作审计只记录备注被更新，不记录正文。
 
@@ -97,7 +97,7 @@ docker compose up -d --build
 
 “导出压缩包”会把 Ollama manifest 与模型 blobs 打包为 `.ollama.tar.gz`。由于 Ollama HTTP API 不提供完整权重导出接口，Compose 需要将宿主机模型目录只读挂载到 `/ollama-models`；通过 `OLLAMA_MODELS_PATH` 指定宿主机路径（Linux 默认 `/root/.ollama/models`）。这个挂载只用于 CleanLLM 导出，模型的实际下载和加载仍由 Ollama 服务负责；如果 Ollama 在另一个容器中运行，两个容器必须共享同一个模型卷，不能只给 CleanLLM 挂载一份目录。如果宿主机目录权限受限，请将 `.env` 中的 `PUID`、`PGID` 设置为该目录所有者的 UID/GID（例如 `1000`），然后重建容器。如果未挂载，仍可使用“导出定义”导出 JSON，但不能生成权重压缩包。
 
-进入 Web 管理中心的“模型列表”，可查看 Ollama 状态、拉取模型并查看实时进度，也可删除已安装模型。拉取完成必须收到 Ollama 的 `success` 事件，并会调用 `/api/show` 做可用性校验；如果校验报告 `unable to load model` 或 `blobs/sha256-…`，说明 Ollama 使用的模型目录缺少 blob 或文件不完整，应在 Ollama 所在环境重新拉取该模型并确认 `OLLAMA_MODELS` 指向同一目录。“模型列表 → Ollama 模型管理”的“思考模式”列可以直接为单个模型选择关闭、开启或低/中/高强度；代理设置不再显示重复的全局开关。需要控制思考模式时，CleanLLM 会调用 Ollama 原生 `/api/chat`，再把普通响应、NDJSON 流和工具调用转换为 OpenAI Chat/Responses 格式，避免部分 Ollama 版本的 OpenAI 兼容接口忽略 `think:false`。GPT-OSS 不支持完全关闭思考，应选择低强度。旧实例的 `ollama_disable_thinking` 配置及环境变量 `OLLAMA_DISABLE_THINKING` 继续兼容。若 Ollama 使用反向代理或非标准端口，应填写对应上游的“Ollama 管理地址”，以便 CleanLLM 准确识别并推导原生接口。`OLLAMA_API_URL` 留空时，CleanLLM 会从 `TARGET_API_URL` 自动提取地址；例如 `http://host.docker.internal:11434/v1/chat/completions` 会使用 `http://host.docker.internal:11434`。如果上游不是 Ollama，OpenAI 兼容模型列表仍可正常使用，管理区会提示 Ollama 不可用。
+进入 Web 管理中心的“模型列表”，可查看 Ollama 状态、拉取模型并查看实时进度，也可删除已安装模型。拉取完成必须收到 Ollama 的 `success` 事件，并会调用 `/api/show` 做可用性校验；如果校验报告 `unable to load model` 或 `blobs/sha256-…`，说明 Ollama 使用的模型目录缺少 blob 或文件不完整，应在 Ollama 所在环境重新拉取该模型并确认 `OLLAMA_MODELS` 指向同一目录。思考模式统一在“模型列表 → 上游模型”中按上游和模型设置，可选择承上游、关闭、开启或低/中/高强度；“承上游”不会改写请求。需要覆盖 Ollama 思考模式时，CleanLLM 会调用 Ollama 原生 `/api/chat`，再把普通响应、NDJSON 流和工具调用转换为 OpenAI Chat/Responses 格式，避免部分 Ollama 版本的 OpenAI 兼容接口忽略 `think:false`。GPT-OSS 不支持完全关闭思考，应选择低强度。若 Ollama 使用反向代理或非标准端口，应填写对应上游的“Ollama 管理地址”，以便 CleanLLM 准确识别并推导原生接口。`OLLAMA_API_URL` 留空时，CleanLLM 会从 `TARGET_API_URL` 自动提取地址；例如 `http://host.docker.internal:11434/v1/chat/completions` 会使用 `http://host.docker.internal:11434`。如果上游不是 Ollama，OpenAI 兼容模型列表仍可正常使用，管理区会提示 Ollama 不可用。
 
 ## 自动发布到 Docker Hub
 
@@ -106,7 +106,7 @@ docker compose up -d --build
 - `DOCKERHUB_USERNAME`：Docker Hub 用户名
 - `DOCKERHUB_TOKEN`：Docker Hub Access Token（不要使用账户密码）
 
-根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.16`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
+根目录 `VERSION` 是唯一发布版本来源。推送到 `main` 或手动运行 workflow 后，会自动读取该文件并发布 `用户名/cleanllm:latest` 和当前版本号标签（当前为 `1.3.18`），不再发布 `sha-*` 标签；推送 `v1.0.0` 形式的 Git 标签还会发布对应版本号。镜像同时支持 `linux/amd64` 和 `linux/arm64`。
 
 模型列表默认缓存 60 秒，可在页面调整或设为 0 关闭缓存；“刷新模型”会强制从上游读取。上游连通性默认每 10 分钟检测一次，可在代理设置页调整，并保存 24 小时与 7 天采样结果。API令牌页支持创建、显示、复制、停用、启用和删除令牌，并可随时修改到期时间及可用模型白名单。模型规则支持精确名称和 `*`、`?` 通配符，留空允许全部模型；受限令牌访问 `/v1/models` 时也只会看到允许的模型。令牌以实例密钥加密保存，启用且未过期的令牌才能通过 `Authorization: Bearer <token>` 调用代理接口。使用日志明细保留 400 天，清除明细不会改变调用次数、周期 Token 统计或令牌累计用量。系统状态通过 SSE `/api/system/events` 实时推送，模型压缩包导出记录会保存在导出历史中。
 

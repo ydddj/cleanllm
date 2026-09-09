@@ -25,8 +25,21 @@ def test_application_version_comes_from_version_file() -> None:
 
 def test_thinking_controls_are_model_scoped_in_admin_ui() -> None:
     features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
+    app_script = (proxy.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    index = (proxy.STATIC_DIR / "index.html").read_text(encoding="utf-8")
     assert 'id="ollama-disable-thinking"' not in features
+    assert "ollama-thinking-select" not in features
     assert "model-thinking-select" in features
+    assert "承上游" in app_script
+    assert "ollama_disable_thinking" not in proxy.DEFAULT_SETTINGS
+    assert "ollama_model_thinking" not in proxy.DEFAULT_SETTINGS
+    editor_markup = features[features.index("editor.innerHTML="):features.index("const keyInput=", features.index("editor.innerHTML="))]
+    assert editor_markup.index('id="upstream-tab-thinking"') < editor_markup.index('id="upstream-tab-timeout"')
+    assert editor_markup.index('id="upstream-tab-thinking"') < editor_markup.index('<details class="wide">')
+    assert 'id="upstream-tab-key-reveal"' in editor_markup
+    assert "proxy-settings-actions" in features
+    assert index.index('data-page="dashboard"') < index.index('data-page="chat"') < index.index('<p class="nav-label">代理管理</p>')
+    assert 'chat:["工作台","对话测试"' in app_script
 
 
 def client_for(tmp_path: Path) -> TestClient:
@@ -139,7 +152,7 @@ def test_discovered_ollama_only_model_skips_other_upstreams() -> None:
     proxy.MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
 
 
-def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(tmp_path: Path, monkeypatch) -> None:
+def test_non_stream_responses_uses_ollama_chat_compatibility_without_responses_probe(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     calls = []
 
@@ -147,7 +160,10 @@ def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(t
         status_code = 200
 
         def json(self):
-            return {"model": "test", "message": {"role": "assistant", "content": "ok"}, "done": True}
+            return {
+                "model": "test",
+                "choices": [{"message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            }
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -166,43 +182,48 @@ def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(t
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
     response = client.post("/v1/responses", json={"model": "test", "input": "hello"})
     assert response.status_code == 200
-    assert calls and calls[0][0].endswith("/api/chat")
+    assert calls and calls[0][0].endswith("/v1/chat/completions")
     assert "/responses" not in calls[0][0]
-    assert calls[0][1]["think"] is False
+    assert "think" not in calls[0][1]
 
 
-def test_ollama_thinking_switch_is_applied_only_to_ollama_requests() -> None:
-    ollama = {"url": "http://ollama:11434/v1/chat/completions"}
+def test_ollama_model_thinking_policy_is_applied_only_to_ollama_requests() -> None:
+    ollama = {"name": "Ollama", "url": "http://ollama:11434/v1/chat/completions"}
     proxied_ollama = {
         "url": "https://models.example/v1/chat/completions",
         "ollama_url": "https://models.example/ollama-api",
     }
-    provider = {"url": "https://provider.example/v1/chat/completions"}
+    provider = {"name": "provider", "url": "https://provider.example/v1/chat/completions"}
     payload = {"model": "qwen3", "messages": []}
-    assert proxy.ollama_request_payload(payload, ollama, {"ollama_disable_thinking": True})["think"] is False
-    assert "think" not in proxy.ollama_request_payload(payload, provider, {"ollama_disable_thinking": True})
-    assert "think" not in proxy.ollama_request_payload(payload, ollama, {"ollama_disable_thinking": False})
+    settings = {"model_thinking_policies": [{"upstream": "Ollama", "model": "qwen3", "mode": "disabled"}]}
+    assert proxy.ollama_request_payload(payload, ollama, settings)["think"] is False
+    assert "think" not in proxy.ollama_request_payload(payload, provider, settings)
+    assert "think" not in proxy.ollama_request_payload(payload, ollama, {})
     assert proxy.upstream_looks_ollama(proxied_ollama) is True
 
 
-def test_ollama_model_thinking_override_takes_precedence_over_default() -> None:
-    ollama = {"url": "http://ollama:11434/v1/chat/completions"}
+def test_ollama_model_thinking_policy_controls_native_request() -> None:
+    ollama = {"name": "Ollama", "url": "http://ollama:11434/v1/chat/completions"}
     qwen = {"model": "qwen3:8b", "messages": []}
     deepseek = {"model": "deepseek-r1:8b", "messages": []}
     settings = {
-        "ollama_disable_thinking": True,
-        "ollama_model_thinking": {"qwen3:8b": "enabled"},
+        "model_thinking_policies": [
+            {"upstream": "Ollama", "model": "qwen3:8b", "mode": "enabled"},
+        ],
     }
     assert proxy.ollama_request_payload(qwen, ollama, settings)["think"] is True
-    assert proxy.ollama_request_payload(deepseek, ollama, settings)["think"] is False
+    assert "think" not in proxy.ollama_request_payload(deepseek, ollama, settings)
     settings = {
-        "ollama_disable_thinking": False,
-        "ollama_model_thinking": {"qwen3:8b": "disabled"},
+        "model_thinking_policies": [
+            {"upstream": "Ollama", "model": "qwen3:8b", "mode": "disabled"},
+        ],
     }
     assert proxy.ollama_request_payload(qwen, ollama, settings)["think"] is False
     assert "think" not in proxy.ollama_request_payload(deepseek, ollama, settings)
 
-    settings["ollama_model_thinking"] = {"gpt-oss:20b": "low"}
+    settings["model_thinking_policies"] = [
+        {"upstream": "Ollama", "model": "gpt-oss:20b", "mode": "low"},
+    ]
     gpt_oss = {"model": "gpt-oss:20b", "messages": []}
     assert proxy.ollama_request_payload(gpt_oss, ollama, settings)["think"] == "low"
     url, native_payload, native = proxy.prepare_chat_upstream_request(ollama, gpt_oss, settings)
@@ -374,7 +395,9 @@ def test_chat_stream_uses_native_ollama_and_keeps_openai_contract(tmp_path: Path
     settings.update({
         "target_api_url": "http://ollama:11434/v1/chat/completions",
         "default_upstream_name": "Ollama",
-        "ollama_disable_thinking": True,
+        "model_thinking_policies": [
+            {"upstream": "Ollama", "model": "qwen3", "mode": "disabled"},
+        ],
     })
     proxy.save_settings(settings)
     calls = []
@@ -414,14 +437,16 @@ def test_chat_stream_uses_native_ollama_and_keeps_openai_contract(tmp_path: Path
     assert response.text.count("data: [DONE]") == 1
 
 
-def test_chat_request_forwards_ollama_thinking_switch(tmp_path: Path, monkeypatch) -> None:
+def test_chat_request_forwards_ollama_thinking_policy(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     login(client)
     settings = proxy.load_settings()
     settings.update({
         "target_api_url": "http://ollama:11434/v1/chat/completions",
         "default_upstream_name": "Ollama",
-        "ollama_disable_thinking": True,
+        "model_thinking_policies": [
+            {"upstream": "Ollama", "model": "qwen3", "mode": "disabled"},
+        ],
     })
     proxy.save_settings(settings)
     calls = []
@@ -688,8 +713,6 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
         "api_key": "secret",
         "timeout_seconds": 42,
         "default_upstream_thinking_protocol": "ollama",
-        "ollama_disable_thinking": True,
-        "ollama_model_thinking": {"qwen3:8b": "disabled", "deepseek-r1:8b": "enabled"},
         "model_thinking_policies": [
             {"upstream": "本地 Ollama", "model": "qwen3:8b", "mode": "high"},
         ],
@@ -700,7 +723,6 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     loaded = client.get("/api/settings").json()
     assert loaded["default_upstream_name"] == settings["default_upstream_name"]
     assert loaded["clean_patterns"] == settings["clean_patterns"]
-    assert loaded["ollama_model_thinking"] == settings["ollama_model_thinking"]
     assert loaded["default_upstream_thinking_protocol"] == "ollama"
     assert loaded["model_thinking_policies"] == settings["model_thinking_policies"]
     assert proxy.clean_content("A<think>hidden</think>B<tag>", loaded) == "AB"
