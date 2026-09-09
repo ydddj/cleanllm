@@ -117,6 +117,22 @@ def test_responses_route_cache_does_not_hide_ollama_chat_fallback() -> None:
     assert [item["name"] for item in fallback] == ["Ollama"]
 
 
+def test_discovered_ollama_only_model_skips_other_upstreams() -> None:
+    settings = proxy.SettingsUpdate.model_validate({
+        "target_api_url": "https://pipio.example/v1",
+        "default_upstream_name": "pipio",
+        "upstreams": [{"name": "Ollama", "url": "http://127.0.0.1:11434/v1"}],
+    }).model_dump(mode="json")
+    proxy.MODEL_CACHE.update({
+        "data": [{"id": "local-model", "upstream": "Ollama", "interfaces": ["v1/chat/completions"]}],
+        "at": time.time(), "source": "",
+    })
+    request = SimpleNamespace(state=SimpleNamespace(api_token=None, usage_id="route-test"), url=SimpleNamespace(path="/v1/responses"))
+    candidates = proxy.route_upstreams(settings, "local-model", request, capability_path="/v1/chat/completions")
+    assert [item["name"] for item in candidates] == ["Ollama"]
+    proxy.MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+
+
 def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     calls = []
@@ -146,6 +162,135 @@ def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(t
     assert response.status_code == 200
     assert calls and calls[0][0].endswith("/chat/completions")
     assert "/responses" not in calls[0][0]
+
+
+def test_ollama_thinking_switch_is_applied_only_to_ollama_requests() -> None:
+    ollama = {"url": "http://ollama:11434/v1/chat/completions"}
+    provider = {"url": "https://provider.example/v1/chat/completions"}
+    payload = {"model": "qwen3", "messages": []}
+    assert proxy.ollama_request_payload(payload, ollama, {"ollama_disable_thinking": True})["think"] is False
+    assert "think" not in proxy.ollama_request_payload(payload, provider, {"ollama_disable_thinking": True})
+    assert "think" not in proxy.ollama_request_payload(payload, ollama, {"ollama_disable_thinking": False})
+
+
+def test_chat_request_forwards_ollama_thinking_switch(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = proxy.load_settings()
+    settings.update({
+        "target_api_url": "http://ollama:11434/v1/chat/completions",
+        "default_upstream_name": "Ollama",
+        "ollama_disable_thinking": True,
+    })
+    proxy.save_settings(settings)
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"choices": [{"message": {"content": "ok"}}]}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/chat/completions", json={"model": "qwen3", "messages": []})
+    assert response.status_code == 200
+    assert calls[0][1]["think"] is False
+
+
+def test_responses_non_stream_ollama_error_is_not_returned_as_success(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = proxy.load_settings()
+    settings.update({
+        "target_api_url": "http://ollama:11434/v1/chat/completions",
+        "default_upstream_name": "Ollama",
+    })
+    proxy.save_settings(settings)
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"error": "unable to load model: missing blob"}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, *args, **kwargs):
+            return FakeResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/responses", json={"model": "qwen3", "input": "hello"})
+    assert response.status_code == 502
+    assert "unable to load model: missing blob" in response.json()["error"]["message"]
+
+
+def test_responses_stream_ollama_error_event_is_reported_without_fake_completion(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = proxy.load_settings()
+    settings.update({
+        "target_api_url": "http://ollama:11434/v1/chat/completions",
+        "default_upstream_name": "Ollama",
+    })
+    proxy.save_settings(settings)
+
+    class StreamResponse:
+        status_code = 200
+        headers = {"content-type": "text/event-stream"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def aiter_bytes(self):
+            yield b'data: {"error":"unable to load model: missing blob"}\n\n'
+
+        async def aclose(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, *args, **kwargs):
+            return StreamResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/responses", json={"model": "qwen3", "input": "hello", "stream": True})
+    assert response.status_code == 200
+    assert "unable to load model: missing blob" in response.text
+    assert '"type": "response.failed"' in response.text
+    assert '"status": "completed"' not in response.text
 
 
 def test_circuit_breaker_skips_open_upstream_and_recovers() -> None:
@@ -955,6 +1100,9 @@ def test_ollama_models_and_delete(tmp_path: Path, monkeypatch) -> None:
             return {"models": [{"name": "qwen3:8b", "size": 100, "modified_at": "2026-01-02T03:04:05Z"}]}
 
     class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
         async def __aenter__(self):
             return self
 
@@ -980,6 +1128,91 @@ def test_ollama_models_and_delete(tmp_path: Path, monkeypatch) -> None:
         "http://host.docker.internal:11434/api/delete",
         {"name": "qwen3:8b"},
     ) in calls
+
+
+def test_ollama_pull_surfaces_stream_errors_instead_of_reporting_success(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+
+    class PullResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def aiter_bytes(self):
+            yield b'{"status":"pulling manifest"}\n'
+            yield b'{"error":"unable to load model: missing blob"}\n'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, *args, **kwargs):
+            return PullResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/api/ollama/pull", json={"model": "broken:latest"})
+    assert response.status_code == 200
+    assert "unable to load model: missing blob" in response.text
+    assert "拉取失败" in response.text
+
+
+def test_ollama_pull_task_requires_success_and_verifies_model(tmp_path: Path, monkeypatch) -> None:
+    client_for(tmp_path)
+    proxy.OLLAMA_TASKS.clear()
+    proxy.OLLAMA_HANDLES.clear()
+    task_id = "pull-test"
+    proxy.OLLAMA_TASKS[task_id] = {"id": task_id, "model": "qwen3:8b", "status": "queued", "message": "等待开始", "completed": 0, "total": 0, "created_at": 1, "updated_at": 1}
+
+    class ShowResponse:
+        status_code = 200
+
+        def json(self):
+            return {"name": "qwen3:8b"}
+
+    class PullResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def aiter_lines(self):
+            yield '{"status":"pulling manifest"}'
+            yield '{"status":"success"}'
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, *args, **kwargs):
+            return PullResponse()
+
+        async def post(self, *args, **kwargs):
+            return ShowResponse()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    asyncio.run(proxy.run_ollama_pull(task_id, "qwen3:8b"))
+    assert proxy.OLLAMA_TASKS[task_id]["status"] == "completed"
+    assert "已校验" in proxy.OLLAMA_TASKS[task_id]["message"]
 
 
 def test_ollama_archive_export_reads_manifest_and_blobs(tmp_path: Path) -> None:

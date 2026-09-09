@@ -63,6 +63,7 @@ DEFAULT_SETTINGS = {
     "timeout_seconds": int(os.getenv("REQUEST_TIMEOUT", "120")),
     "models_api_url": os.getenv("MODELS_API_URL", ""),
     "ollama_api_url": os.getenv("OLLAMA_API_URL", ""),
+    "ollama_disable_thinking": os.getenv("OLLAMA_DISABLE_THINKING", "true").strip().lower() not in {"0", "false", "no", "off"},
     "clean_patterns": DEFAULT_PATTERNS,
     "upstreams": [],
     "default_upstream_enabled": True,
@@ -138,6 +139,7 @@ class SettingsUpdate(BaseModel):
     timeout_seconds: int = Field(default=120, ge=1, le=3600)
     models_api_url: str = ""
     ollama_api_url: str = ""
+    ollama_disable_thinking: bool = DEFAULT_SETTINGS["ollama_disable_thinking"]
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
     log_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1 * 1024 * 1024, le=50 * 1024 * 1024)
     upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
@@ -1144,6 +1146,9 @@ def load_settings() -> dict[str, Any]:
         if SETTINGS_FILE.exists():
             saved = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
             settings.update({key: value for key, value in saved.items() if key not in RUNTIME_SETTINGS_KEYS})
+            thinking_setting = settings.get("ollama_disable_thinking", DEFAULT_SETTINGS["ollama_disable_thinking"])
+            if isinstance(thinking_setting, str):
+                settings["ollama_disable_thinking"] = thinking_setting.strip().lower() not in {"0", "false", "no", "off"}
             original_background = str(settings.get("appearance_background") or "")
             original_backgrounds = list(settings.get("appearance_backgrounds") or [])
             normalize_background_settings(settings)
@@ -1712,6 +1717,18 @@ def route_upstreams(
     # eligible so non-standard providers continue to work.
     if request is not None and MODEL_CACHE.get("data"):
         endpoint = endpoint_path.removeprefix("/")
+        model_records = [
+            item for item in MODEL_CACHE["data"]
+            if item.get("id") == lookup_model and item.get("upstream")
+        ]
+        # Once discovery has positively identified a model, do not probe every
+        # other upstream just because it happens to be enabled.  This is
+        # especially important for Responses requests: an Ollama-only model
+        # must go straight to the Chat adapter instead of a native Responses
+        # endpoint that cannot load it and then disconnects.
+        if model_records:
+            known_upstreams = {str(item["upstream"]) for item in model_records}
+            available = [item for item in available if item["name"] in known_upstreams]
         lookup_model = resolved_model(settings, model)
         compatible = []
         declared_any = False
@@ -1747,6 +1764,13 @@ def upstream_looks_ollama(upstream: dict[str, Any]) -> bool:
     """Identify the local Ollama OpenAI adapter without adding provider config."""
     parsed = urlsplit(str(upstream.get("url") or ""))
     return parsed.port == 11434 or parsed.path.rstrip("/").endswith("/ollama")
+
+
+def ollama_request_payload(payload: dict[str, Any], upstream: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    """Add Ollama's thinking switch without leaking it to other providers."""
+    if not upstream_looks_ollama(upstream) or not bool(settings.get("ollama_disable_thinking", True)):
+        return payload
+    return {**payload, "think": False}
 
 
 def clean_stream_line(
@@ -2981,6 +3005,94 @@ async def get_ollama_models(_: None = Depends(require_admin)) -> dict[str, Any]:
     return {"source": base_url, "count": len(data), "data": data}
 
 
+def _ollama_payload_error(payload: Any) -> str:
+    """Return a short, useful error from an Ollama JSON response.
+
+    Ollama often returns HTTP 200 for ``/api/pull`` and puts the actual error
+    in one of the newline-delimited JSON events.  Keep this parser in one
+    place so the interactive and background pull paths report the same error.
+    """
+    if isinstance(payload, dict):
+        value = payload.get("error")
+        if isinstance(value, dict):
+            value = value.get("message") or value.get("detail")
+        if value:
+            return str(value).strip()[:1000]
+        detail = payload.get("detail")
+        if detail:
+            return str(detail).strip()[:1000]
+    return ""
+
+
+async def _ollama_response_error(response: Any) -> str:
+    """Read an Ollama error body without ever raising a JSON decoding error."""
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    body = b""
+    try:
+        reader = getattr(response, "aread", None)
+        if reader is not None:
+            body = await reader()
+    except Exception:
+        body = b""
+    if not body:
+        text = getattr(response, "text", "") or ""
+    else:
+        text = body.decode("utf-8", errors="replace") if isinstance(body, (bytes, bytearray)) else str(body)
+    if not isinstance(text, str):
+        text = str(text)
+    text = text.strip()
+    if text:
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = None
+        detail = _ollama_payload_error(parsed)
+        if detail:
+            text = detail
+    lowered = text.lower()
+    if "unable to load model" in lowered and "blob" in lowered:
+        text += "；请在 Ollama 所在环境检查模型目录，并重新拉取该模型"
+    # Error responses can contain a whole HTML page or a stack trace.  It is
+    # enough to retain the first part for the UI and request diagnostics.
+    return f"HTTP {status_code}: {text[:1000]}" if text else f"HTTP {status_code}"
+
+
+async def _verify_ollama_model(base_url: str, model: str) -> tuple[bool, str]:
+    """Verify that Ollama can read a model manifest after a pull.
+
+    ``/api/show`` is available on supported Ollama versions and catches the
+    common case where a pull stream ended with ``success`` but a referenced
+    blob was removed or is unreadable.  A third-party Ollama-compatible
+    server may not implement this endpoint; 404/405 is therefore treated as
+    an unsupported optional check rather than a failed pull.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(f"{base_url}/api/show", json={"name": model})
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code in {404, 405}:
+                return True, ""
+            if status_code >= 400:
+                return False, await _ollama_response_error(response)
+            try:
+                payload = response.json()
+            except (TypeError, ValueError):
+                payload = None
+            detail = _ollama_payload_error(payload)
+            return (False, detail) if detail else (True, "")
+    except httpx.RequestError as exc:
+        # The model was already downloaded; a transient verification failure
+        # should not turn a successful pull into a false failure.  The next
+        # model list/inference request will surface the connectivity problem.
+        logger.warning("Could not verify Ollama model %s: %s", model, exc)
+        return True, ""
+    except Exception as exc:
+        # Keep compatibility with lightweight Ollama clones (and older
+        # clients) that do not expose ``/api/show`` in their HTTP adapter.
+        logger.warning("Optional Ollama model verification unavailable for %s: %s", model, exc)
+        return True, ""
+
+
 @app.post("/api/ollama/pull")
 async def pull_ollama_model(
     update: OllamaModelRequest, _: None = Depends(require_admin)
@@ -2989,17 +3101,61 @@ async def pull_ollama_model(
     logger.info("Pulling Ollama model %s", update.model)
 
     async def stream():
+        saw_success = False
+        stream_error = ""
         try:
             async with httpx.AsyncClient(timeout=None) as client:
                 async with client.stream(
                     "POST", f"{base_url}/api/pull", json={"name": update.model, "stream": True}
                 ) as response:
-                    response.raise_for_status()
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
+                    if response.status_code >= 400:
+                        stream_error = await _ollama_response_error(response)
+                    else:
+                        pending = b""
+                        async for chunk in response.aiter_bytes():
+                            pending += chunk
+                            while b"\n" in pending:
+                                raw, pending = pending.split(b"\n", 1)
+                                if not raw.strip():
+                                    continue
+                                try:
+                                    item = json.loads(raw)
+                                except (TypeError, ValueError):
+                                    stream_error = "Ollama 返回了无效的拉取进度数据"
+                                    yield (json.dumps({"error": stream_error}, ensure_ascii=False) + "\n").encode()
+                                    continue
+                                error = _ollama_payload_error(item)
+                                if error:
+                                    stream_error = error
+                                status_value = str(item.get("status") or "").strip().lower() if isinstance(item, dict) else ""
+                                if status_value == "success":
+                                    saw_success = True
+                                yield (json.dumps(item, ensure_ascii=False) + "\n").encode()
+                        if pending.strip() and not stream_error:
+                            try:
+                                item = json.loads(pending)
+                            except (TypeError, ValueError):
+                                item = {"error": "Ollama 返回了无效的拉取进度数据"}
+                            error = _ollama_payload_error(item)
+                            if error:
+                                stream_error = error
+                            if isinstance(item, dict) and str(item.get("status") or "").strip().lower() == "success":
+                                saw_success = True
+                            yield (json.dumps(item, ensure_ascii=False) + "\n").encode()
+                    if not stream_error and not saw_success:
+                        stream_error = "Ollama 拉取未完成（未收到 success 状态）"
+                    if stream_error:
+                        yield (json.dumps({"error": f"拉取失败：{stream_error}"}, ensure_ascii=False) + "\n").encode()
+                    elif saw_success:
+                        verified, detail = await _verify_ollama_model(base_url, update.model)
+                        if not verified:
+                            yield (json.dumps({"error": f"模型校验失败：{detail}"}, ensure_ascii=False) + "\n").encode()
+                        else:
+                            MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
         except Exception as exc:
             logger.warning("Ollama pull failed for %s: %s", update.model, exc)
-            yield (json.dumps({"error": f"拉取失败：{exc}"}, ensure_ascii=False) + "\n").encode()
+            if not stream_error:
+                yield (json.dumps({"error": f"拉取失败：{exc}"}, ensure_ascii=False) + "\n").encode()
 
     return StreamingResponse(stream(), media_type="application/x-ndjson")
 
@@ -3007,16 +3163,34 @@ async def pull_ollama_model(
 async def run_ollama_pull(task_id: str, model: str) -> None:
     task = OLLAMA_TASKS[task_id]
     task.update(status="running", updated_at=int(time.time()))
+    base_url = ollama_base_url(load_settings())
+    saw_success = False
     try:
         async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST", f"{ollama_base_url(load_settings())}/api/pull", json={"name": model, "stream": True}) as response:
-                response.raise_for_status()
+            async with client.stream("POST", f"{base_url}/api/pull", json={"name": model, "stream": True}) as response:
+                if response.status_code >= 400:
+                    raise RuntimeError(await _ollama_response_error(response))
                 async for line in response.aiter_lines():
                     if not line:
                         continue
-                    item = json.loads(line)
+                    try:
+                        item = json.loads(line)
+                    except (TypeError, ValueError) as exc:
+                        raise RuntimeError("Ollama 返回了无效的拉取进度数据") from exc
+                    if not isinstance(item, dict):
+                        raise RuntimeError("Ollama 返回了无效的拉取进度数据")
+                    error = _ollama_payload_error(item)
+                    if error:
+                        raise RuntimeError(error)
+                    saw_success = str(item.get("status") or "").strip().lower() == "success" or saw_success
                     task.update(message=item.get("status", "处理中"), completed=item.get("completed", 0), total=item.get("total", 0), updated_at=int(time.time()))
-        task.update(status="completed", message="拉取完成", updated_at=int(time.time()))
+        if not saw_success:
+            raise RuntimeError("Ollama 拉取未完成（未收到 success 状态）")
+        verified, detail = await _verify_ollama_model(base_url, model)
+        if not verified:
+            raise RuntimeError(f"模型校验失败：{detail}")
+        MODEL_CACHE.update({"at": 0.0, "data": None, "source": ""})
+        task.update(status="completed", message="拉取完成并已校验", updated_at=int(time.time()))
     except asyncio.CancelledError:
         task.update(status="cancelled", message="已取消", updated_at=int(time.time()))
     except Exception as exc:
@@ -3118,9 +3292,12 @@ async def show_ollama_model(model: str, _: None = Depends(require_admin)) -> dic
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(f"{ollama_base_url(load_settings())}/api/show", json={"name": model}, timeout=20.0)
-            response.raise_for_status()
+            if response.status_code >= 400:
+                raise HTTPException(status_code=502, detail=f"获取模型详情失败：{await _ollama_response_error(response)}")
             return response.json()
-        except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+        except HTTPException:
+            raise
+        except (httpx.RequestError, ValueError) as exc:
             raise HTTPException(status_code=502, detail=f"获取模型详情失败：{exc}") from exc
 
 
@@ -3129,8 +3306,9 @@ async def copy_ollama_model(update: OllamaCopyRequest, _: None = Depends(require
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(f"{ollama_base_url(load_settings())}/api/copy", json={"source": update.source, "destination": update.destination}, timeout=30.0)
-            response.raise_for_status()
-        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            if int(getattr(response, "status_code", 200) or 200) >= 400:
+                raise RuntimeError(await _ollama_response_error(response))
+        except (httpx.RequestError, RuntimeError) as exc:
             raise HTTPException(status_code=502, detail=f"复制模型失败：{exc}") from exc
     return {"message": f"已复制为 {update.destination}"}
 
@@ -3140,8 +3318,9 @@ async def keep_alive_ollama_model(update: OllamaKeepAliveRequest, _: None = Depe
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(f"{ollama_base_url(load_settings())}/api/generate", json={"model": update.model, "keep_alive": update.keep_alive, "stream": False}, timeout=30.0)
-            response.raise_for_status()
-        except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            if int(getattr(response, "status_code", 200) or 200) >= 400:
+                raise RuntimeError(await _ollama_response_error(response))
+        except (httpx.RequestError, RuntimeError) as exc:
             raise HTTPException(status_code=502, detail=f"模型加载状态修改失败：{exc}") from exc
     return {"message": "模型已卸载" if update.keep_alive == "0" else "模型已加载"}
 
@@ -3167,8 +3346,9 @@ async def import_ollama_model(update: OllamaImportRequest, _: None = Depends(req
         async with httpx.AsyncClient(timeout=None) as client:
             modelfile = update.modelfile.strip() or f"FROM {update.name}\n"
             response = await client.post(f"{ollama_base_url(load_settings())}/api/create", json={"model": update.name, "modelfile": modelfile, "stream": False})
-            response.raise_for_status()
-    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            if int(getattr(response, "status_code", 200) or 200) >= 400:
+                raise RuntimeError(await _ollama_response_error(response))
+    except (httpx.RequestError, RuntimeError) as exc:
         raise HTTPException(status_code=502, detail=f"导入模型定义失败：{exc}") from exc
     return {"message": f"模型 {update.name} 已导入"}
 
@@ -3224,8 +3404,9 @@ async def delete_ollama_model(
             response = await client.request(
                 "DELETE", f"{base_url}/api/delete", json={"name": update.model}, timeout=30.0
             )
-            response.raise_for_status()
-    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
+            if int(getattr(response, "status_code", 200) or 200) >= 400:
+                raise RuntimeError(await _ollama_response_error(response))
+    except (httpx.RequestError, RuntimeError) as exc:
         raise HTTPException(status_code=502, detail=f"删除 Ollama 模型失败：{exc}") from exc
     logger.info("Deleted Ollama model %s", update.model)
     return {"message": f"模型 {update.model} 已删除"}
@@ -3376,6 +3557,19 @@ def chat_event_state(raw: str, payload: dict[str, Any] | None) -> tuple[bool, bo
     return failed, meaningful, terminal
 
 
+def stream_event_error(payload: dict[str, Any] | None) -> str:
+    """Extract an upstream SSE error without retaining the full event body."""
+    if not isinstance(payload, dict):
+        return ""
+    detail = _ollama_payload_error(payload)
+    if detail:
+        return detail
+    error = payload.get("response", {}).get("error") if isinstance(payload.get("response"), dict) else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("code") or "").strip()[:1000]
+    return ""
+
+
 def stream_failure_event(model: str, message: str) -> bytes:
     failed = {
         "type": "response.failed",
@@ -3437,7 +3631,7 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             await client.aclose()
             return None
         if response.status_code >= 400:
-            failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+            failures.append(f"{upstream['name']}: {await _ollama_response_error(response)}")
             record_upstream_http_result(
                 settings, upstream["name"], response.status_code, getattr(response, "headers", None)
             )
@@ -3624,7 +3818,7 @@ async def compatible_api(request: Request, _: None = Depends(require_api_token))
             async with httpx.AsyncClient(timeout=float(upstream["timeout"])) as client:
                 response = await client.post(url, content=outbound_body, headers=headers)
             if response.status_code >= 400:
-                failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+                failures.append(f"{upstream['name']}: {await _ollama_response_error(response)}")
                 record_upstream_http_result(settings, upstream["name"], response.status_code)
                 continue
             remember_route(settings, str(payload.get("model") or endpoint), upstream["name"])
@@ -3725,13 +3919,16 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     responses_url = upstream["url"]
                     logger.info("Responses chat fallback request: %s -> %s", upstream["name"], responses_url)
                     async with httpx.AsyncClient(timeout=upstream_stream_timeout(upstream)) as client:
-                        async with client.stream("POST", responses_url, json=stream_payload, headers=headers) as upstream_response:
+                        async with client.stream("POST", responses_url, json=ollama_request_payload(stream_payload, upstream, settings), headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
+                                failures.append(f"{upstream['name']}: {await _ollama_response_error(upstream_response)}")
                                 record_upstream_http_result(settings, upstream["name"], upstream_response.status_code)
                                 continue
                             selected_name = upstream["name"]
                             emitted = False
+                            output_emitted = False
+                            stream_error = ""
                             event_name = "message"
                             fallback_settings = {
                                 **settings,
@@ -3750,10 +3947,29 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                     "message",
                                 )
                                 raw, chunk = sse_frame_payload(frame)
+                                # Some Ollama-compatible servers return a
+                                # plain JSON error body even when ``stream``
+                                # was requested.  It has no ``data:`` SSE
+                                # prefix, so inspect the frame explicitly.
+                                if chunk is None and not raw and frame.strip():
+                                    try:
+                                        plain_payload = json.loads(frame.decode("utf-8", errors="replace"))
+                                    except (TypeError, ValueError):
+                                        plain_payload = None
+                                    plain_error = _ollama_payload_error(plain_payload)
+                                    if plain_error:
+                                        stream_error = plain_error
+                                        break
+                                if isinstance(chunk, dict):
+                                    failed, _, _ = chat_event_state(raw, chunk)
+                                    if failed:
+                                        stream_error = stream_event_error(chunk) or "上游返回错误事件"
+                                        break
                                 if raw == "[DONE]":
                                     tail = fallback_cleaner.flush()
                                     if tail:
                                         complete_text += tail
+                                        output_emitted = True
                                         sequence_number += 1
                                         yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','item_id':item_id,'output_index':0,'content_index':0,'delta':tail,'response_id':response_id,'sequence_number':sequence_number}, ensure_ascii=False)}\n\n"
                                     chat_done = True
@@ -3766,6 +3982,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                         delta = fallback_cleaner.feed(str(chunk.get("delta") or ""))
                                         chunk["delta"] = delta
                                         complete_text += delta
+                                        output_emitted = output_emitted or bool(delta)
                                         if not delta and time.monotonic() - last_keepalive >= SSE_KEEPALIVE_SECONDS:
                                             yield ": cleanllm-keepalive\n\n"
                                             last_keepalive = time.monotonic()
@@ -3788,6 +4005,7 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                     continue
                                 complete_text += delta
                                 emitted = True
+                                output_emitted = True
                                 sequence_number += 1
                                 event = {"type": "response.output_text.delta", "item_id": item_id, "output_index": 0, "content_index": 0, "delta": delta, "response_id": response_id, "sequence_number": sequence_number}
                                 yield f"event: response.output_text.delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -3801,17 +4019,59 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                         yield f"event: response.output_text.delta\ndata: {json.dumps({'type':'response.output_text.delta','item_id':item_id,'output_index':0,'content_index':0,'delta':complete_text,'response_id':response_id,'sequence_number':sequence_number}, ensure_ascii=False)}\n\n"
                                 except (ValueError, IndexError, AttributeError):
                                     pass
-                    break
+                    if stream_error:
+                        failures.append(f"{upstream['name']}: {stream_error}")
+                        record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                        if output_emitted:
+                            update_usage_record_safely(
+                                getattr(request.state, "usage_id", None),
+                                status_code=502, error=stream_error,
+                                termination_reason="stream_disconnected",
+                            )
+                            failed = {**base, "status": "failed", "error": {"message": stream_error, "type": "upstream_error"}}
+                            yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
+                            return
+                        selected_name = None
+                        continue
+                    if native_completed or chat_done:
+                        break
+                    stream_error = "上游响应流未正常结束"
+                    failures.append(f"{upstream['name']}: {stream_error}")
+                    record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                    if output_emitted:
+                        update_usage_record_safely(
+                            getattr(request.state, "usage_id", None),
+                            status_code=502, error=stream_error,
+                            termination_reason="missing_terminal_event",
+                        )
+                        failed = {**base, "status": "failed", "error": {"message": stream_error, "type": "upstream_error"}}
+                        yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
+                        return
+                    selected_name = None
+                    continue
                 except httpx.RequestError as exc:
-                    record_upstream_failure(settings, upstream["name"], str(exc))
+                    stream_error = f"上游响应流意外中断：{exc}"
+                    failures.append(f"{upstream['name']}: {stream_error}")
+                    record_typed_upstream_failure(settings, upstream["name"], stream_error, "stream")
+                    if output_emitted:
+                        update_usage_record_safely(
+                            getattr(request.state, "usage_id", None),
+                            status_code=502, error=stream_error,
+                            termination_reason="stream_disconnected",
+                        )
+                        failed = {**base, "status": "failed", "error": {"message": stream_error, "type": "upstream_error"}}
+                        yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
+                        return
+                    selected_name = None
                     continue
             if native_completed:
                 record_upstream_success(str(selected_name or ""))
                 remember_route(settings, str(payload["model"]), str(selected_name or ""))
                 return
             if selected_name is None:
-                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="所有上游均不可用", termination_reason="no_upstream_available")
-                failed = {**base, "status": "failed", "error": {"message": "所有上游均不可用", "type": "upstream_error"}}
+                detail = "所有上游均不可用" + ("：" + "；".join(failures) if failures else "")
+                update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
+                failed = {**base, "status": "failed", "error": {"message": detail, "type": "upstream_error"}}
                 yield f"event: response.failed\ndata: {json.dumps({'type':'response.failed','response':failed}, ensure_ascii=False)}\n\n"
                 return
             if not chat_done:
@@ -3861,18 +4121,27 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     # the native Responses endpoint.  Convert directly and
                     # avoid a guaranteed /responses 404 on every request.
                     logger.info("Responses chat fallback request: %s -> %s", upstream["name"], upstream["url"])
-                    response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
+                    response = await client.post(upstream["url"], json=ollama_request_payload(chat_payload, upstream, settings), headers=headers, timeout=float(upstream["timeout"]))
                 else:
                     responses_url = upstream["url"].replace("/chat/completions", "/responses")
                     logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
                     response = await client.post(responses_url, json={**payload, "model": target_model, "stream": False}, headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code in {404, 405} and not upstream_looks_ollama(upstream):
-                    response = await client.post(upstream["url"], json=chat_payload, headers=headers, timeout=float(upstream["timeout"]))
+                    response = await client.post(upstream["url"], json=ollama_request_payload(chat_payload, upstream, settings), headers=headers, timeout=float(upstream["timeout"]))
                 if response.status_code >= 400:
-                    failures.append(f"{upstream['name']}: HTTP {response.status_code}")
+                    failures.append(f"{upstream['name']}: {await _ollama_response_error(response)}")
                     record_upstream_http_result(settings, upstream["name"], response.status_code)
                     continue
-                data = response.json(); text = data.get("output_text", "")
+                data = response.json()
+                upstream_error = _ollama_payload_error(data)
+                if upstream_error:
+                    failures.append(f"{upstream['name']}: {upstream_error}")
+                    # A provider may return a model-specific error with HTTP
+                    # 200.  It is not evidence that the whole upstream is
+                    # unhealthy, so do not trip the circuit breaker.
+                    release_upstream_probe(upstream["name"])
+                    continue
+                text = data.get("output_text", "")
                 if not text:
                     output = data.get("output", [])
                     text = "".join(part.get("text", "") for item in output if isinstance(item, dict) for part in item.get("content", []) if isinstance(part, dict))
@@ -3934,9 +4203,9 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         try:
             if streaming:
                 candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
-                candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=upstream_payload, headers=headers), stream=True)
+                candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=ollama_request_payload(upstream_payload, upstream, settings), headers=headers), stream=True)
                 if candidate.status_code >= 400:
-                    failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
+                    failures.append(f"{upstream['name']}: {await _ollama_response_error(candidate)}")
                     record_upstream_http_result(
                         settings, upstream["name"], candidate.status_code,
                         getattr(candidate, "headers", None),
@@ -3948,10 +4217,21 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 selected_index = index
             else:
                 async with httpx.AsyncClient() as candidate_client:
-                    candidate = await candidate_client.post(upstream["url"], json=upstream_payload, headers=headers, timeout=float(upstream["timeout"]))
+                    candidate = await candidate_client.post(upstream["url"], json=ollama_request_payload(upstream_payload, upstream, settings), headers=headers, timeout=float(upstream["timeout"]))
                 if candidate.status_code >= 400:
-                    failures.append(f"{upstream['name']}: HTTP {candidate.status_code}")
+                    failures.append(f"{upstream['name']}: {await _ollama_response_error(candidate)}")
                     record_upstream_http_result(settings, upstream["name"], candidate.status_code)
+                    continue
+                try:
+                    candidate_data = candidate.json()
+                except (TypeError, ValueError):
+                    candidate_data = None
+                upstream_error = _ollama_payload_error(candidate_data)
+                if upstream_error:
+                    failures.append(f"{upstream['name']}: {upstream_error}")
+                    # HTTP 200 error envelopes are often model-specific
+                    # (e.g. a missing Ollama blob), not an upstream outage.
+                    release_upstream_probe(upstream["name"])
                     continue
                 response, selected = candidate, upstream
                 selected_index = index
@@ -3997,7 +4277,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                             update_usage_record_safely(getattr(request.state, "usage_id", None), **usage_values(chunk.get("usage")))
                         failed, has_output, terminal = chat_event_state(raw, chunk)
                         if failed:
-                            stream_error = "上游返回错误事件"
+                            stream_error = stream_event_error(chunk) or "上游返回错误事件"
                             break
                         cleaned = frame
                         flush_frame: bytes | None = None
@@ -4083,15 +4363,16 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                         headers["Authorization"] = f"Bearer {candidate_upstream['api_key']}"
                     candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(candidate_upstream))
                     try:
-                        candidate_response = await candidate_client.send(candidate_client.build_request("POST", candidate_upstream["url"], json=upstream_payload, headers=headers), stream=True)
+                        candidate_response = await candidate_client.send(candidate_client.build_request("POST", candidate_upstream["url"], json=ollama_request_payload(upstream_payload, candidate_upstream, settings), headers=headers), stream=True)
                     except httpx.RequestError as exc:
                         await candidate_client.aclose()
                         record_typed_upstream_failure(settings, candidate_upstream["name"], str(exc), "transient")
                         failures_before_output.append(f"{candidate_upstream['name']}: {exc}")
                         continue
                     if candidate_response.status_code >= 400:
+                        detail = await _ollama_response_error(candidate_response)
                         record_upstream_http_result(settings, candidate_upstream["name"], candidate_response.status_code, getattr(candidate_response, "headers", None))
-                        failures_before_output.append(f"{candidate_upstream['name']}: HTTP {candidate_response.status_code}")
+                        failures_before_output.append(f"{candidate_upstream['name']}: {detail}")
                         await candidate_response.aclose(); await candidate_client.aclose()
                         continue
                     current_client, current_response, current_upstream, current_index = candidate_client, candidate_response, candidate_upstream, next_index

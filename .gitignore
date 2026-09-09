@@ -10,3 +10,4 @@ venv/
 .tmp-local-*/
 .button-test-data/
 .pytest-run/
+.pytest-cleanllm*/

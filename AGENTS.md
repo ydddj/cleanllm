@@ -24,6 +24,7 @@ Keep the application lightweight and suitable for a single Docker container. Avo
 - Treat `settings.json` as persistent user data. New settings must have safe defaults and remain compatible with older files.
 - Model discovery must continue working for non-Ollama OpenAI-compatible upstreams.
 - Ollama-only operations must fail gracefully when Ollama is unavailable; they must not break the normal model list or proxy.
+- Ollama 请求默认关闭思考模式以兼容旧版客户端；通过 `ollama_disable_thinking` 或 `OLLAMA_DISABLE_THINKING=false` 可恢复模型默认思考行为，仅向 Ollama 上游附加 `think:false`。
 - Long-running Ollama pulls must remain streamed. Do not replace them with a short fixed timeout.
 - Format Unix timestamps in the browser as local date/time and support both seconds and milliseconds.
 - Keep the log file capped at 5 MB and preserve `/data` volume compatibility.
