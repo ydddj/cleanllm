@@ -24,6 +24,15 @@ const usageLogState = { shown: 8, scrollTop: 0 };
     return data;
   };
   const initialSettings = request("/api/settings");
+  let ollamaModelThinking = {};
+  let ollamaDefaultDisableThinking = true;
+  let ollamaThinkingReady = false;
+  initialSettings.then(data => {
+    ollamaModelThinking = {...(data.ollama_model_thinking || {})};
+    ollamaDefaultDisableThinking = data.ollama_disable_thinking !== false;
+    ollamaThinkingReady = true;
+    copyButtons();
+  }).catch(() => {});
   const notify = (message, error = false) => typeof toast === "function" ? toast(message, error) : console.log(message);
   const palettes = [
     ["靛蓝", "#4f46e5", "#3730a3"], ["海蓝", "#2563eb", "#1d4ed8"], ["青色", "#0891b2", "#0e7490"], ["翡翠", "#059669", "#047857"], ["青柠", "#65a30d", "#4d7c0f"], ["琥珀", "#d97706", "#b45309"], ["珊瑚", "#ea580c", "#c2410c"], ["玫红", "#e11d48", "#be123c"], ["紫罗兰", "#7c3aed", "#6d28d9"], ["洋红", "#c026d3", "#a21caf"]
@@ -35,7 +44,7 @@ const usageLogState = { shown: 8, scrollTop: 0 };
   nav?.querySelectorAll("a[data-page]").forEach(link => { link.title = link.textContent.trim(); });
   document.querySelector(".sidebar-status")?.setAttribute("title", "服务运行正常");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.3.11";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.3.12";
   const menuButton = document.querySelector("#menu-button");
   const syncMenuButton = () => { if (!menuButton) return; const mobile=matchMedia("(max-width:760px)").matches, collapsed=document.documentElement.classList.contains("sidebar-collapsed"); const label=mobile?"打开菜单":collapsed?"展开侧栏":"收起侧栏"; menuButton.title=label; menuButton.setAttribute("aria-label",label); menuButton.setAttribute("aria-expanded",String(mobile?document.querySelector("#sidebar")?.classList.contains("open"):!collapsed)); };
   if (menuButton) menuButton.onclick = () => { if (matchMedia("(max-width:760px)").matches) { document.querySelector("#sidebar")?.classList.add("open"); document.querySelector("#backdrop")?.classList.add("open"); } else { document.documentElement.classList.toggle("sidebar-collapsed"); localStorage.setItem("cleanllm-sidebar",document.documentElement.classList.contains("sidebar-collapsed")?"collapsed":"expanded"); } syncMenuButton(); };
@@ -111,7 +120,7 @@ const usageLogState = { shown: 8, scrollTop: 0 };
     const tabs = [primary, ...(Array.isArray(data.upstreams) ? data.upstreams.map(item => ({...item})) : [])];
     if (!tabs.length) tabs.push(primary);
     let active = 0;
-    form.insertAdjacentHTML("afterbegin", '<div id="upstream-tabs" class="wide upstream-tabs"><div class="upstream-bulk-actions"><button type="button" class="button danger" id="select-all-upstreams">全选</button><button type="button" class="button danger" id="copy-upstream">复制</button><button type="button" class="button danger" id="enable-upstreams">启用</button><button type="button" class="button danger" id="disable-upstreams">停用</button><button type="button" class="button danger" id="export-upstreams">导出</button><label class="button danger file-button">导入<input id="import-upstreams" type="file" accept="application/json,.json" hidden></label></div><label class="field wide ollama-thinking-setting"><span>Ollama 思考模式</span><span class="toggle-line"><input id="ollama-disable-thinking" type="checkbox" checked><b>关闭思考模式</b></span><small>关闭后向 Ollama 请求发送 think:false，适合不需要推理内容的模型。</small></label><div class="upstream-tab-list"></div><div class="upstream-tab-editor"></div></div>');
+    form.insertAdjacentHTML("afterbegin", '<div id="upstream-tabs" class="wide upstream-tabs"><div class="upstream-bulk-actions"><button type="button" class="button danger" id="select-all-upstreams">全选</button><button type="button" class="button danger" id="copy-upstream">复制</button><button type="button" class="button danger" id="enable-upstreams">启用</button><button type="button" class="button danger" id="disable-upstreams">停用</button><button type="button" class="button danger" id="export-upstreams">导出</button><label class="button danger file-button">导入<input id="import-upstreams" type="file" accept="application/json,.json" hidden></label></div><label class="field wide ollama-thinking-setting"><span>Ollama 默认思考模式</span><span class="toggle-line"><input id="ollama-disable-thinking" type="checkbox" checked><b>默认关闭思考模式</b></span><small>作为 Ollama 模型的默认值；可在“模型列表 → Ollama 模型管理”中单独覆盖每个模型。</small></label><div class="upstream-tab-list"></div><div class="upstream-tab-editor"></div></div>');
     const list=$("#upstream-tabs .upstream-tab-list"), editor=$("#upstream-tabs .upstream-tab-editor"); $("#ollama-disable-thinking").checked=data.ollama_disable_thinking!==false;
     const selectedNames=new Set(), savedNames=new Set(tabs.map(item=>item.name));
     const readEditor=()=>{const target=tabs[active];if(!target)return;target.name=$("#upstream-tab-name")?.value.trim()||"上游";target.enabled=$("#upstream-tab-enabled")?.checked!==false;target.url=$("#upstream-tab-url")?.value.trim()||"";target.api_key=$("#upstream-tab-key")?.value||"";target.timeout=Number($("#upstream-tab-timeout")?.value||60);target.models_url=$("#upstream-tab-models")?.value.trim()||"";target.ollama_url=$("#upstream-tab-ollama")?.value.trim()||"";target.clean_patterns=($("#upstream-tab-patterns")?.value||"").split("\n").map(v=>v.trim()).filter(Boolean);try{target.model_routes=JSON.parse($("#upstream-tab-routes")?.value||"[]")}catch(_){target.model_routes=[]}};
@@ -205,11 +214,47 @@ const usageLogState = { shown: 8, scrollTop: 0 };
     });
     document.querySelectorAll("#ollama-models tbody tr").forEach((row) => {
       const action = row.lastElementChild, model = row.querySelector("code")?.textContent;
-      if (!action || !model || action.querySelector(".advanced-model-actions")) return;
-      const controls = document.createElement("span"); controls.className = "advanced-model-actions";
-      controls.innerHTML = `<button class="button" data-model-action="detail">详情</button> <button class="button" data-model-action="duplicate">克隆模型</button> <button class="button" data-model-action="load">加载</button> <button class="button" data-model-action="unload">卸载</button> <button class="button" data-model-action="archive">导出压缩包</button> <button class="button" data-model-action="export">导出定义</button>`;
-      action.prepend(controls);
-      controls.querySelectorAll("button").forEach((button) => button.onclick = (event) => { event.stopPropagation(); modelAction(model, button.dataset.modelAction); });
+      if (!action || !model) return;
+      if (!ollamaThinkingReady) return;
+      const table = row.closest("table"), headerRow = table?.querySelector("thead tr");
+      if (headerRow && !headerRow.querySelector("[data-ollama-thinking-header]")) {
+        const heading = document.createElement("th");
+        heading.dataset.ollamaThinkingHeader = "1";
+        heading.textContent = "思考模式";
+        headerRow.lastElementChild?.before(heading);
+      }
+      let thinkingCell = row.querySelector("[data-ollama-thinking-cell]");
+      if (!thinkingCell) {
+        thinkingCell = document.createElement("td");
+        thinkingCell.dataset.ollamaThinkingCell = "1";
+        thinkingCell.innerHTML = `<select class="ollama-thinking-select" aria-label="${escape(model)} 的思考模式"><option value="">跟随默认（${ollamaDefaultDisableThinking?'关闭':'模型默认'}）</option><option value="disabled">关闭</option><option value="enabled">开启</option><option value="low">低强度</option><option value="medium">中强度</option><option value="high">高强度</option></select>`;
+        action.before(thinkingCell);
+        const select = thinkingCell.querySelector("select");
+        const normalizedMode = (value) => value === true ? "enabled" : value === false ? "disabled" : String(value || "");
+        select.value = Object.prototype.hasOwnProperty.call(ollamaModelThinking, model) ? normalizedMode(ollamaModelThinking[model]) : "";
+        select.onchange = async () => {
+          const previous = Object.prototype.hasOwnProperty.call(ollamaModelThinking, model) ? normalizedMode(ollamaModelThinking[model]) : "";
+          select.disabled = true;
+          try {
+            const current = await request("/api/settings"), overrides = {...(current.ollama_model_thinking || {})};
+            if (select.value === "") delete overrides[model]; else overrides[model] = select.value;
+            current.ollama_model_thinking = overrides;
+            await request("/api/settings", {method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(current)});
+            ollamaModelThinking = overrides;
+            const labels = {"":"跟随默认",disabled:"关闭思考",enabled:"开启思考",low:"低强度思考",medium:"中强度思考",high:"高强度思考"};
+            notify(`${model} 已设为${labels[select.value] || select.value}`);
+          } catch (error) {
+            select.value = previous;
+            notify(`保存思考模式失败：${error.message}`, true);
+          } finally { select.disabled = false; }
+        };
+      }
+      if (!action.querySelector(".advanced-model-actions")) {
+        const controls = document.createElement("span"); controls.className = "advanced-model-actions";
+        controls.innerHTML = `<button class="button" data-model-action="detail">详情</button> <button class="button" data-model-action="duplicate">克隆模型</button> <button class="button" data-model-action="load">加载</button> <button class="button" data-model-action="unload">卸载</button> <button class="button" data-model-action="archive">导出压缩包</button> <button class="button" data-model-action="export">导出定义</button>`;
+        action.prepend(controls);
+        controls.querySelectorAll("button").forEach((button) => button.onclick = (event) => { event.stopPropagation(); modelAction(model, button.dataset.modelAction); });
+      }
     });
   };
   new MutationObserver(copyButtons).observe(document.body, {childList:true, subtree:true});
@@ -236,6 +281,7 @@ const usageLogState = { shown: 8, scrollTop: 0 };
   function askModal(title,label,value){ return new Promise((resolve)=>{const modal=createModal(`<h3>${title}</h3><label class="field"><span>${label}</span><input id="modal-input" value="${escape(value)}"></label>`,'<button class="button" id="modal-cancel">取消</button><button class="button primary" id="modal-ok">确定</button>');$("#modal-cancel").onclick=()=>{modal.remove();resolve(null)};$("#modal-ok").onclick=()=>{const result=$("#modal-input").value.trim();modal.remove();resolve(result)};$("#modal-input").focus();}); }
 
   const ollamaPanel = $("#ollama-panel .panel-body");
+  if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", '<p class="form-note ollama-thinking-note">“思考模式”按模型保存并优先于全局默认；CleanLLM 会通过 Ollama 原生接口确保设置生效。GPT-OSS 不支持完全关闭，请选择低、中或高强度。</p>');
   if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", `<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><strong>后台拉取任务</strong><button id="background-pull" class="button primary">后台拉取当前模型</button></div><div id="ollama-tasks" style="margin-top:10px"></div></div>`);
   if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", '<div style="margin-top:18px;border-top:1px solid var(--border);padding-top:16px"><div style="display:flex;justify-content:space-between;align-items:center"><strong>导出任务历史</strong><button id="refresh-export-history" class="button">刷新</button></div><div id="export-history" style="margin-top:10px"></div></div>');
   if (ollamaPanel) ollamaPanel.insertAdjacentHTML("beforeend", '<div style="margin-top:12px"><label class="button">导入模型定义<input id="import-model" type="file" accept=".json,application/json" hidden></label></div>');
@@ -417,4 +463,4 @@ const healthControlStyle = document.createElement('style'); healthControlStyle.t
 const tokenControlStyle=document.createElement('style');tokenControlStyle.textContent='.token-table{min-width:1520px}.token-actions{display:flex;justify-content:flex-end;gap:7px}.token-expiry-field,.token-policy-field{margin-top:16px}.token-expiry-field input{color-scheme:inherit}.token-policy-field textarea{width:100%;padding:10px 12px;border:1px solid var(--border);border-radius:10px;background:var(--soft);color:var(--text);resize:vertical}.token-model-rules{display:block;max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.token-limit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}.virtual-model-head,.virtual-model-row{display:grid;grid-template-columns:1fr 1fr 1.1fr 1.6fr auto;gap:10px;align-items:center}.virtual-model-head{padding:0 0 8px;color:var(--muted2);font-size:11px}.virtual-model-row{padding:8px 0;border-top:1px solid var(--border)}.virtual-model-row input,.trace-filters input{width:100%;height:38px;padding:0 10px;border:1px solid var(--border);border-radius:9px;background:var(--soft);color:var(--text)}.diagnostics-page.active{display:grid;gap:18px}.diagnostic-controls{display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap}.diagnostic-controls .field{min-width:180px}.diagnostic-controls .diagnostic-model{flex:1}.diagnostic-grid{display:grid;gap:9px;margin-top:16px}.diagnostic-item{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px 15px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.diagnostic-item strong,.diagnostic-item small{display:block}.diagnostic-item small,.diagnostic-item p{color:var(--muted);font-size:11px}.diagnostic-item p{flex-basis:100%;margin:0}.trace-filters{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:10px}.trace-actions{display:flex;justify-content:center;padding-top:0}.trace-table{min-width:1640px}.trace-table td:last-child{max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.snapshot-diff{margin-top:4px;color:var(--muted2)!important}@media(max-width:700px){.token-limit-grid,.trace-filters{grid-template-columns:1fr}.virtual-model-head{display:none}.virtual-model-row{grid-template-columns:1fr}.diagnostic-controls .field{width:100%}.diagnostic-item{flex-wrap:wrap}}';document.head.append(tokenControlStyle);
 const analyticsStyle=document.createElement('style');analyticsStyle.textContent='.analytics-page.active{display:grid;gap:18px}.analytics-controls,.snapshot-actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.analytics-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}.analytics-stats article{padding:13px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.analytics-stats span,.analytics-stats strong{display:block}.analytics-stats span{color:var(--muted);font-size:11px}.analytics-stats strong{margin-top:5px;font-size:17px}.analytics-trend{margin:20px 0}.trend-bars{height:130px;display:flex;align-items:flex-end;gap:4px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.trend-bars i{flex:1;min-width:3px;border-radius:3px 3px 0 0;background:var(--primary)}.trend-caption{display:flex;justify-content:space-between;margin-top:5px;color:var(--muted2);font-size:10px}.analytics-table{min-width:920px}.pricing-head,.pricing-row{display:grid;grid-template-columns:1.3fr 1fr .7fr .7fr .7fr auto;gap:9px;align-items:center}.pricing-head{padding-bottom:8px;color:var(--muted2);font-size:11px}.pricing-row{padding:8px 0;border-top:1px solid var(--border)}.pricing-row input{width:100%;height:38px;padding:0 10px;border:1px solid var(--border);border-radius:9px;background:var(--soft);color:var(--text)}.snapshot-list{display:grid;gap:8px}.snapshot-list article{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 13px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.snapshot-list strong,.snapshot-list small{display:block}.snapshot-list small{margin-top:3px;color:var(--muted);font-size:11px}@media(max-width:1050px){.analytics-stats{grid-template-columns:repeat(3,1fr)}}@media(max-width:700px){.analytics-stats{grid-template-columns:repeat(2,1fr)}.pricing-head{display:none}.pricing-row{grid-template-columns:1fr}.analytics-controls{width:100%}}';document.head.append(analyticsStyle);
 const experienceStyle=document.createElement('style');experienceStyle.textContent='.upstream-bulk-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}.upstream-tab-wrap{display:inline-flex;align-items:center;gap:5px;flex:0 0 auto}.upstream-tab-wrap>input{width:15px;height:15px;accent-color:var(--primary)}.upstream-tab.disabled{opacity:.58}.upstream-tab small{margin-left:7px;color:var(--muted2);font-size:10px}.toggle-line{display:flex;align-items:center;gap:9px;min-height:42px;padding:0 11px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.toggle-line input{width:17px!important;height:17px!important;accent-color:var(--primary)}.toggle-line b{font-size:12px}.model-table{min-width:1250px}.model-tags{display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:130px}.model-capability{display:inline-flex;padding:3px 7px;border:1px solid color-mix(in srgb,var(--primary) 25%,var(--border));border-radius:7px;background:var(--primary-soft);color:var(--primary);font-size:10px;white-space:nowrap}.muted-value{color:var(--muted2);font-size:11px}.token-table-v13{min-width:2100px}.cell-ellipsis{display:block;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.service-pill[data-connection=reconnecting]{color:var(--primary)!important;background:var(--primary-soft)!important}.service-pill[data-connection=disconnected]{color:var(--red)!important;background:color-mix(in srgb,var(--red) 14%,transparent)!important}.service-pill[data-connection=reconnecting] i{animation:connection-pulse 1.2s infinite}.service-pill[data-connection=disconnected] i{background:var(--red)!important}@keyframes connection-pulse{50%{opacity:.35}}.audit-table-wrap{max-height:420px;overflow:auto}.audit-table{min-width:820px}.audit-table thead{position:sticky;top:0;z-index:2;background:var(--surface)}@media(max-width:700px){.upstream-bulk-actions .button,.upstream-bulk-actions .file-button{flex:1}.service-pill span{max-width:92px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}';document.head.append(experienceStyle);
-document.querySelector(".sidebar-status small")?.replaceChildren("CleanLLM v1.3.11");
+document.querySelector(".sidebar-status small")?.replaceChildren("CleanLLM v1.3.12");

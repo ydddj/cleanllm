@@ -64,6 +64,7 @@ DEFAULT_SETTINGS = {
     "models_api_url": os.getenv("MODELS_API_URL", ""),
     "ollama_api_url": os.getenv("OLLAMA_API_URL", ""),
     "ollama_disable_thinking": os.getenv("OLLAMA_DISABLE_THINKING", "true").strip().lower() not in {"0", "false", "no", "off"},
+    "ollama_model_thinking": {},
     "clean_patterns": DEFAULT_PATTERNS,
     "upstreams": [],
     "default_upstream_enabled": True,
@@ -140,6 +141,7 @@ class SettingsUpdate(BaseModel):
     models_api_url: str = ""
     ollama_api_url: str = ""
     ollama_disable_thinking: bool = DEFAULT_SETTINGS["ollama_disable_thinking"]
+    ollama_model_thinking: dict[str, str] = Field(default_factory=dict, max_length=200)
     clean_patterns: list[str] = Field(default_factory=list, max_length=30)
     log_max_bytes: int = Field(default=5 * 1024 * 1024, ge=1 * 1024 * 1024, le=50 * 1024 * 1024)
     upstreams: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
@@ -189,6 +191,22 @@ class SettingsUpdate(BaseModel):
             except re.error as exc:
                 raise ValueError(f"无效正则表达式：{pattern}（{exc}）") from exc
             cleaned.append(pattern)
+        return cleaned
+
+    @field_validator("ollama_model_thinking", mode="before")
+    @classmethod
+    def validate_ollama_model_thinking(cls, values: Any) -> dict[str, str]:
+        if not isinstance(values, dict):
+            raise ValueError("Ollama 单模型思考模式必须是对象")
+        cleaned: dict[str, str] = {}
+        for raw_model, enabled in values.items():
+            model = str(raw_model).strip()
+            if not model or len(model) > 200:
+                raise ValueError("Ollama 思考模式的模型名称无效")
+            mode = normalize_ollama_thinking_mode(enabled)
+            if mode is None:
+                raise ValueError(f"Ollama 思考模式无效：{model}")
+            cleaned[model] = mode
         return cleaned
 
     @field_validator("upstreams")
@@ -1149,6 +1167,16 @@ def load_settings() -> dict[str, Any]:
             thinking_setting = settings.get("ollama_disable_thinking", DEFAULT_SETTINGS["ollama_disable_thinking"])
             if isinstance(thinking_setting, str):
                 settings["ollama_disable_thinking"] = thinking_setting.strip().lower() not in {"0", "false", "no", "off"}
+            model_thinking = settings.get("ollama_model_thinking")
+            if not isinstance(model_thinking, dict):
+                settings["ollama_model_thinking"] = {}
+            else:
+                settings["ollama_model_thinking"] = {
+                    str(model).strip(): mode
+                    for model, enabled in model_thinking.items()
+                    if str(model).strip()
+                    if (mode := normalize_ollama_thinking_mode(enabled)) is not None
+                }
             original_background = str(settings.get("appearance_background") or "")
             original_backgrounds = list(settings.get("appearance_backgrounds") or [])
             normalize_background_settings(settings)
@@ -1761,16 +1789,161 @@ def upstream_stream_timeout(upstream: dict[str, Any]) -> httpx.Timeout:
 
 
 def upstream_looks_ollama(upstream: dict[str, Any]) -> bool:
-    """Identify the local Ollama OpenAI adapter without adding provider config."""
+    """Identify an Ollama adapter, including reverse-proxied installations."""
+    if str(upstream.get("ollama_url") or "").strip():
+        return True
     parsed = urlsplit(str(upstream.get("url") or ""))
     return parsed.port == 11434 or parsed.path.rstrip("/").endswith("/ollama")
 
 
+def normalize_ollama_thinking_mode(value: Any) -> str | None:
+    """Normalize old booleans and the modes accepted by Ollama's native API."""
+    if isinstance(value, bool):
+        return "enabled" if value else "disabled"
+    text = str(value or "").strip().lower()
+    aliases = {
+        "true": "enabled", "on": "enabled", "enabled": "enabled",
+        "false": "disabled", "off": "disabled", "disabled": "disabled",
+        "low": "low", "medium": "medium", "high": "high",
+    }
+    return aliases.get(text)
+
+
+def ollama_thinking_value(payload: dict[str, Any], settings: dict[str, Any]) -> bool | str | None:
+    """Return the native Ollama ``think`` value for this specific model."""
+    model = str(payload.get("model") or "").strip()
+    overrides = settings.get("ollama_model_thinking")
+    mode = normalize_ollama_thinking_mode(overrides.get(model)) if isinstance(overrides, dict) and model in overrides else None
+    if mode == "disabled":
+        return False
+    if mode == "enabled":
+        return True
+    if mode in {"low", "medium", "high"}:
+        return mode
+    if bool(settings.get("ollama_disable_thinking", True)):
+        return False
+    client_value = payload.get("think")
+    if isinstance(client_value, bool) or str(client_value or "").strip().lower() in {"low", "medium", "high"}:
+        return client_value
+    reasoning_effort = str(payload.get("reasoning_effort") or "").strip().lower()
+    if reasoning_effort in {"low", "medium", "high"}:
+        return reasoning_effort
+    return None
+
+
 def ollama_request_payload(payload: dict[str, Any], upstream: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
-    """Add Ollama's thinking switch without leaking it to other providers."""
-    if not upstream_looks_ollama(upstream) or not bool(settings.get("ollama_disable_thinking", True)):
+    """Apply the per-model Ollama thinking mode without leaking it elsewhere."""
+    if not upstream_looks_ollama(upstream):
         return payload
-    return {**payload, "think": False}
+    value = ollama_thinking_value(payload, settings)
+    return {**payload, "think": value} if value is not None else payload
+
+
+def ollama_native_chat_url(upstream: dict[str, Any]) -> str:
+    """Build an Ollama native Chat URL while preserving a reverse-proxy prefix."""
+    override = str(upstream.get("ollama_url") or "").strip()
+    parsed = urlsplit(override or str(upstream.get("url") or ""))
+    path = parsed.path.rstrip("/")
+    for suffix in ("/api/chat", "/v1/chat/completions", "/chat/completions"):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+            break
+    return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/api/chat", "", ""))
+
+
+def ollama_native_messages(messages: Any) -> list[dict[str, Any]]:
+    """Normalize common OpenAI message parts for Ollama's native API."""
+    result: list[dict[str, Any]] = []
+    for raw in messages if isinstance(messages, list) else []:
+        if not isinstance(raw, dict):
+            continue
+        message = copy.deepcopy(raw)
+        if message.get("role") == "developer":
+            message["role"] = "system"
+        content = message.get("content")
+        if isinstance(content, list):
+            text_parts: list[str] = []
+            images: list[str] = list(message.get("images") or []) if isinstance(message.get("images"), list) else []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") in {"text", "input_text", "output_text"}:
+                    text_parts.append(str(part.get("text") or ""))
+                elif part.get("type") in {"image_url", "input_image"}:
+                    image = part.get("image_url") or part.get("image")
+                    image = image.get("url") if isinstance(image, dict) else image
+                    if isinstance(image, str) and image:
+                        images.append(image.split(",", 1)[1] if image.startswith("data:") and "," in image else image)
+            message["content"] = "\n".join(text_parts)
+            if images:
+                message["images"] = images
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list):
+            normalized_calls = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = copy.deepcopy(call.get("function") or {})
+                arguments = function.get("arguments")
+                if isinstance(arguments, str):
+                    try:
+                        function["arguments"] = json.loads(arguments)
+                    except ValueError:
+                        pass
+                normalized_calls.append({"function": function})
+            message["tool_calls"] = normalized_calls
+        result.append(message)
+    return result
+
+
+def ollama_native_request_payload(payload: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any]:
+    """Translate an OpenAI Chat request into Ollama's native Chat shape."""
+    result: dict[str, Any] = {
+        "model": payload.get("model"),
+        "messages": ollama_native_messages(payload.get("messages")),
+        "stream": payload.get("stream") is True,
+    }
+    value = ollama_thinking_value(payload, settings)
+    if value is not None:
+        result["think"] = value
+    if isinstance(payload.get("options"), dict):
+        result["options"] = copy.deepcopy(payload["options"])
+    options = result.setdefault("options", {})
+    for source, target in (
+        ("temperature", "temperature"), ("top_p", "top_p"), ("top_k", "top_k"),
+        ("min_p", "min_p"), ("seed", "seed"), ("stop", "stop"),
+        ("frequency_penalty", "frequency_penalty"), ("presence_penalty", "presence_penalty"),
+    ):
+        if source in payload:
+            options[target] = payload[source]
+    for key in ("max_completion_tokens", "max_tokens"):
+        if key in payload:
+            options["num_predict"] = payload[key]
+            break
+    if not options:
+        result.pop("options", None)
+    if isinstance(payload.get("tools"), list) and payload.get("tool_choice") != "none":
+        result["tools"] = copy.deepcopy(payload["tools"])
+    response_format = payload.get("response_format")
+    if isinstance(response_format, dict):
+        if response_format.get("type") == "json_object":
+            result["format"] = "json"
+        elif response_format.get("type") == "json_schema" and isinstance(response_format.get("json_schema"), dict):
+            result["format"] = response_format["json_schema"].get("schema") or response_format["json_schema"]
+    for key in ("format", "keep_alive"):
+        if key in payload:
+            result[key] = copy.deepcopy(payload[key])
+    return result
+
+
+def prepare_chat_upstream_request(
+    upstream: dict[str, Any], payload: dict[str, Any], settings: dict[str, Any]
+) -> tuple[str, dict[str, Any], bool]:
+    """Choose the reliable native Ollama path when a thinking mode is controlled."""
+    native = upstream_looks_ollama(upstream) and ollama_thinking_value(payload, settings) is not None
+    if native:
+        return ollama_native_chat_url(upstream), ollama_native_request_payload(payload, settings), True
+    return str(upstream["url"]), ollama_request_payload(payload, upstream, settings), False
 
 
 def clean_stream_line(
@@ -3491,6 +3664,165 @@ async def iter_sse_frames(response: Any, keepalive_seconds: float = SSE_KEEPALIV
                 pass
 
 
+async def iter_ndjson_objects(response: Any, keepalive_seconds: float = SSE_KEEPALIVE_SECONDS):
+    """Yield Ollama NDJSON objects and ``None`` during idle periods."""
+    iterator = response.aiter_bytes().__aiter__()
+    pending = b""
+    read_task: asyncio.Task | None = None
+    try:
+        while True:
+            if read_task is None:
+                read_task = asyncio.create_task(iterator.__anext__())
+            done, _ = await asyncio.wait({read_task}, timeout=keepalive_seconds)
+            if not done:
+                yield None
+                continue
+            try:
+                chunk = read_task.result()
+            except StopAsyncIteration:
+                read_task = None
+                break
+            read_task = None
+            pending += chunk
+            while b"\n" in pending:
+                raw, pending = pending.split(b"\n", 1)
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    value = json.loads(raw)
+                except (TypeError, ValueError):
+                    value = {"error": "Ollama 返回了无效的流式数据"}
+                yield value if isinstance(value, dict) else {"error": "Ollama 返回了非对象流式数据"}
+        if pending.strip():
+            try:
+                value = json.loads(pending)
+            except (TypeError, ValueError):
+                value = {"error": "Ollama 返回了无效的流式数据"}
+            yield value if isinstance(value, dict) else {"error": "Ollama 返回了非对象流式数据"}
+    finally:
+        if read_task is not None and not read_task.done():
+            read_task.cancel()
+            try:
+                await read_task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+
+
+def ollama_usage_payload(payload: dict[str, Any]) -> dict[str, int]:
+    prompt = max(0, int(payload.get("prompt_eval_count") or 0))
+    completion = max(0, int(payload.get("eval_count") or 0))
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
+def ollama_tool_calls_to_openai(tool_calls: Any, *, streaming: bool = False) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for index, raw in enumerate(tool_calls if isinstance(tool_calls, list) else []):
+        if not isinstance(raw, dict):
+            continue
+        function = raw.get("function") if isinstance(raw.get("function"), dict) else {}
+        arguments = function.get("arguments", {})
+        if not isinstance(arguments, str):
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        call: dict[str, Any] = {
+            "id": str(raw.get("id") or f"call_{secrets.token_hex(8)}"),
+            "type": "function",
+            "function": {"name": str(function.get("name") or ""), "arguments": arguments},
+        }
+        if streaming:
+            call["index"] = index
+        result.append(call)
+    return result
+
+
+def ollama_chat_to_openai(payload: dict[str, Any], requested_model: str) -> dict[str, Any]:
+    """Translate one completed Ollama native response into Chat Completions."""
+    message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+    openai_message: dict[str, Any] = {
+        "role": str(message.get("role") or "assistant"),
+        "content": str(message.get("content") or ""),
+    }
+    if isinstance(message.get("thinking"), str) and message["thinking"]:
+        openai_message["reasoning_content"] = message["thinking"]
+    if isinstance(message.get("tool_calls"), list):
+        openai_message["tool_calls"] = ollama_tool_calls_to_openai(message["tool_calls"])
+    return {
+        "id": f"chatcmpl-{secrets.token_hex(12)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": str(payload.get("model") or requested_model),
+        "choices": [{
+            "index": 0,
+            "message": openai_message,
+            "finish_reason": str(payload.get("done_reason") or "stop"),
+        }],
+        "usage": ollama_usage_payload(payload),
+    }
+
+
+async def iter_ollama_chat_sse_frames(response: Any, requested_model: str):
+    """Convert Ollama native NDJSON into a standards-compliant OpenAI SSE stream."""
+    response_id = f"chatcmpl-{secrets.token_hex(12)}"
+    created = int(time.time())
+    role_emitted = False
+    async for payload in iter_ndjson_objects(response):
+        if payload is None:
+            yield None
+            continue
+        error = _ollama_payload_error(payload)
+        if error:
+            yield (
+                b"data: " + json.dumps(
+                    {"error": {"message": error, "type": "upstream_error"}},
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8") + b"\n\n"
+            )
+            return
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        delta: dict[str, Any] = {}
+        if not role_emitted:
+            delta["role"] = str(message.get("role") or "assistant")
+            role_emitted = True
+        if isinstance(message.get("content"), str) and message["content"]:
+            delta["content"] = message["content"]
+        if isinstance(message.get("thinking"), str) and message["thinking"]:
+            delta["reasoning_content"] = message["thinking"]
+        if isinstance(message.get("tool_calls"), list) and message["tool_calls"]:
+            delta["tool_calls"] = ollama_tool_calls_to_openai(message["tool_calls"], streaming=True)
+        done = payload.get("done") is True
+        event: dict[str, Any] = {
+            "id": response_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": str(payload.get("model") or requested_model),
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": str(payload.get("done_reason") or "stop") if done else None,
+            }],
+        }
+        if done:
+            event["usage"] = ollama_usage_payload(payload)
+        if delta or done:
+            yield b"data: " + json.dumps(event, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n\n"
+        if done:
+            yield b"data: [DONE]\n\n"
+            return
+
+
+async def iter_chat_upstream_frames(response: Any, native_ollama: bool, requested_model: str):
+    if native_ollama:
+        async for frame in iter_ollama_chat_sse_frames(response, requested_model):
+            yield frame
+        return
+    async for frame in iter_sse_frames(response):
+        yield frame
+
+
 def sse_frame_payload(frame: bytes) -> tuple[str, dict[str, Any] | None]:
     data_lines = []
     for line in frame.replace(b"\r\n", b"\n").replace(b"\r", b"\n").split(b"\n"):
@@ -3916,10 +4248,12 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                 headers = {"Content-Type": "application/json"}
                 if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
                 try:
-                    responses_url = upstream["url"]
+                    responses_url, outbound_payload, native_ollama = prepare_chat_upstream_request(
+                        upstream, stream_payload, settings
+                    )
                     logger.info("Responses chat fallback request: %s -> %s", upstream["name"], responses_url)
                     async with httpx.AsyncClient(timeout=upstream_stream_timeout(upstream)) as client:
-                        async with client.stream("POST", responses_url, json=ollama_request_payload(stream_payload, upstream, settings), headers=headers) as upstream_response:
+                        async with client.stream("POST", responses_url, json=outbound_payload, headers=headers) as upstream_response:
                             if upstream_response.status_code >= 400:
                                 logger.warning("Responses upstream %s returned HTTP %s", upstream["name"], upstream_response.status_code)
                                 failures.append(f"{upstream['name']}: {await _ollama_response_error(upstream_response)}")
@@ -3936,7 +4270,9 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                             }
                             fallback_cleaner = StreamTextCleaner(fallback_settings)
                             last_keepalive = time.monotonic()
-                            async for frame in iter_sse_frames(upstream_response):
+                            async for frame in iter_chat_upstream_frames(
+                                upstream_response, native_ollama, target_model
+                            ):
                                 if frame is None:
                                     yield ": cleanllm-keepalive\n\n"
                                     last_keepalive = time.monotonic()
@@ -3961,6 +4297,10 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                                         stream_error = plain_error
                                         break
                                 if isinstance(chunk, dict):
+                                    update_usage_record_safely(
+                                        getattr(request.state, "usage_id", None),
+                                        **usage_values(chunk.get("usage")),
+                                    )
                                     failed, _, _ = chat_event_state(raw, chunk)
                                     if failed:
                                         stream_error = stream_event_error(chunk) or "上游返回错误事件"
@@ -4117,11 +4457,14 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
             if upstream["api_key"]: headers["Authorization"] = f"Bearer {upstream['api_key']}"
             try:
                 if upstream_looks_ollama(upstream):
-                    # Ollama's OpenAI adapter exposes Chat Completions, not
-                    # the native Responses endpoint.  Convert directly and
-                    # avoid a guaranteed /responses 404 on every request.
-                    logger.info("Responses chat fallback request: %s -> %s", upstream["name"], upstream["url"])
-                    response = await client.post(upstream["url"], json=ollama_request_payload(chat_payload, upstream, settings), headers=headers, timeout=float(upstream["timeout"]))
+                    # Use Ollama's native Chat endpoint whenever CleanLLM
+                    # controls thinking; its OpenAI adapter may ignore
+                    # non-standard ``think`` fields on some versions.
+                    chat_url, outbound_payload, native_ollama = prepare_chat_upstream_request(
+                        upstream, chat_payload, settings
+                    )
+                    logger.info("Responses chat fallback request: %s -> %s", upstream["name"], chat_url)
+                    response = await client.post(chat_url, json=outbound_payload, headers=headers, timeout=float(upstream["timeout"]))
                 else:
                     responses_url = upstream["url"].replace("/chat/completions", "/responses")
                     logger.info("Responses upstream request: %s -> %s", upstream["name"], responses_url)
@@ -4141,6 +4484,12 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
                     # unhealthy, so do not trip the circuit breaker.
                     release_upstream_probe(upstream["name"])
                     continue
+                if upstream_looks_ollama(upstream) and native_ollama and data.get("done") is not True:
+                    failures.append(f"{upstream['name']}: Ollama 响应未正常结束")
+                    record_typed_upstream_failure(settings, upstream["name"], "Ollama 响应未正常结束", "stream")
+                    continue
+                if upstream_looks_ollama(upstream) and native_ollama:
+                    data = ollama_chat_to_openai(data, target_model)
                 text = data.get("output_text", "")
                 if not text:
                     output = data.get("output", [])
@@ -4188,6 +4537,8 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
     failures = []
     response = None
     selected = None
+    selected_native_ollama = False
+    selected_data: dict[str, Any] | None = None
     client = None
     attempts = 0
     candidates = route_upstreams(settings, requested_model, request)
@@ -4201,9 +4552,12 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         if upstream["api_key"]:
             headers["Authorization"] = f"Bearer {upstream['api_key']}"
         try:
+            request_url, request_payload, native_ollama = prepare_chat_upstream_request(
+                upstream, upstream_payload, settings
+            )
             if streaming:
                 candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(upstream))
-                candidate = await candidate_client.send(candidate_client.build_request("POST", upstream["url"], json=ollama_request_payload(upstream_payload, upstream, settings), headers=headers), stream=True)
+                candidate = await candidate_client.send(candidate_client.build_request("POST", request_url, json=request_payload, headers=headers), stream=True)
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: {await _ollama_response_error(candidate)}")
                     record_upstream_http_result(
@@ -4214,10 +4568,11 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                     await candidate_client.aclose()
                     continue
                 client, response, selected = candidate_client, candidate, upstream
+                selected_native_ollama = native_ollama
                 selected_index = index
             else:
                 async with httpx.AsyncClient() as candidate_client:
-                    candidate = await candidate_client.post(upstream["url"], json=ollama_request_payload(upstream_payload, upstream, settings), headers=headers, timeout=float(upstream["timeout"]))
+                    candidate = await candidate_client.post(request_url, json=request_payload, headers=headers, timeout=float(upstream["timeout"]))
                 if candidate.status_code >= 400:
                     failures.append(f"{upstream['name']}: {await _ollama_response_error(candidate)}")
                     record_upstream_http_result(settings, upstream["name"], candidate.status_code)
@@ -4233,7 +4588,15 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                     # (e.g. a missing Ollama blob), not an upstream outage.
                     release_upstream_probe(upstream["name"])
                     continue
+                if native_ollama and isinstance(candidate_data, dict) and candidate_data.get("done") is not True:
+                    failures.append(f"{upstream['name']}: Ollama 响应未正常结束")
+                    record_typed_upstream_failure(settings, upstream["name"], "Ollama 响应未正常结束", "stream")
+                    continue
+                if native_ollama and isinstance(candidate_data, dict):
+                    candidate_data = ollama_chat_to_openai(candidate_data, target_model)
                 response, selected = candidate, upstream
+                selected_native_ollama = native_ollama
+                selected_data = candidate_data
                 selected_index = index
             break
         except httpx.RequestError as exc:
@@ -4250,6 +4613,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
         async def stream_response():
             nonlocal attempts
             current_client, current_response, current_upstream = client, response, selected
+            current_native_ollama = selected_native_ollama
             current_index = selected_index
             current_settings = {
                 **settings,
@@ -4266,7 +4630,9 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 stream_error = ""
                 last_keepalive = time.monotonic()
                 try:
-                    async for frame in iter_sse_frames(current_response):
+                    async for frame in iter_chat_upstream_frames(
+                        current_response, current_native_ollama, target_model
+                    ):
                         if frame is None:
                             yield b": cleanllm-keepalive\n\n"
                             continue
@@ -4363,7 +4729,10 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                         headers["Authorization"] = f"Bearer {candidate_upstream['api_key']}"
                     candidate_client = httpx.AsyncClient(timeout=upstream_stream_timeout(candidate_upstream))
                     try:
-                        candidate_response = await candidate_client.send(candidate_client.build_request("POST", candidate_upstream["url"], json=ollama_request_payload(upstream_payload, candidate_upstream, settings), headers=headers), stream=True)
+                        candidate_url, candidate_payload, candidate_native_ollama = prepare_chat_upstream_request(
+                            candidate_upstream, upstream_payload, settings
+                        )
+                        candidate_response = await candidate_client.send(candidate_client.build_request("POST", candidate_url, json=candidate_payload, headers=headers), stream=True)
                     except httpx.RequestError as exc:
                         await candidate_client.aclose()
                         record_typed_upstream_failure(settings, candidate_upstream["name"], str(exc), "transient")
@@ -4376,6 +4745,7 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                         await candidate_response.aclose(); await candidate_client.aclose()
                         continue
                     current_client, current_response, current_upstream, current_index = candidate_client, candidate_response, candidate_upstream, next_index
+                    current_native_ollama = candidate_native_ollama
                     current_settings = {
                         **settings,
                         "clean_patterns": candidate_upstream.get("clean_patterns", settings.get("clean_patterns", [])),
@@ -4390,9 +4760,12 @@ async def proxy_api(request: Request, _: None = Depends(require_api_token)) -> R
                 update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error=detail, termination_reason="no_upstream_available")
                 yield chat_stream_failure_event(detail)
                 return
-        return StreamingResponse(stream_response(), status_code=response.status_code, media_type=response.headers.get("content-type", "text/event-stream"))
+        return StreamingResponse(
+            stream_response(), status_code=response.status_code, media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
+        )
     try:
-        data = response.json()
+        data = selected_data if selected_data is not None else response.json()
     except ValueError:
         record_upstream_failure(settings, selected["name"], "上游返回非 JSON 内容")
         update_usage_record_safely(getattr(request.state, "usage_id", None), status_code=502, error="上游返回了非 JSON 内容", termination_reason="invalid_upstream_response")

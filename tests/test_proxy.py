@@ -141,7 +141,7 @@ def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(t
         status_code = 200
 
         def json(self):
-            return {"choices": [{"message": {"content": "ok"}}]}
+            return {"model": "test", "message": {"role": "assistant", "content": "ok"}, "done": True}
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -160,17 +160,119 @@ def test_non_stream_responses_uses_ollama_chat_adapter_without_responses_probe(t
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
     response = client.post("/v1/responses", json={"model": "test", "input": "hello"})
     assert response.status_code == 200
-    assert calls and calls[0][0].endswith("/chat/completions")
+    assert calls and calls[0][0].endswith("/api/chat")
     assert "/responses" not in calls[0][0]
+    assert calls[0][1]["think"] is False
 
 
 def test_ollama_thinking_switch_is_applied_only_to_ollama_requests() -> None:
     ollama = {"url": "http://ollama:11434/v1/chat/completions"}
+    proxied_ollama = {
+        "url": "https://models.example/v1/chat/completions",
+        "ollama_url": "https://models.example/ollama-api",
+    }
     provider = {"url": "https://provider.example/v1/chat/completions"}
     payload = {"model": "qwen3", "messages": []}
     assert proxy.ollama_request_payload(payload, ollama, {"ollama_disable_thinking": True})["think"] is False
     assert "think" not in proxy.ollama_request_payload(payload, provider, {"ollama_disable_thinking": True})
     assert "think" not in proxy.ollama_request_payload(payload, ollama, {"ollama_disable_thinking": False})
+    assert proxy.upstream_looks_ollama(proxied_ollama) is True
+
+
+def test_ollama_model_thinking_override_takes_precedence_over_default() -> None:
+    ollama = {"url": "http://ollama:11434/v1/chat/completions"}
+    qwen = {"model": "qwen3:8b", "messages": []}
+    deepseek = {"model": "deepseek-r1:8b", "messages": []}
+    settings = {
+        "ollama_disable_thinking": True,
+        "ollama_model_thinking": {"qwen3:8b": "enabled"},
+    }
+    assert proxy.ollama_request_payload(qwen, ollama, settings)["think"] is True
+    assert proxy.ollama_request_payload(deepseek, ollama, settings)["think"] is False
+    settings = {
+        "ollama_disable_thinking": False,
+        "ollama_model_thinking": {"qwen3:8b": "disabled"},
+    }
+    assert proxy.ollama_request_payload(qwen, ollama, settings)["think"] is False
+    assert "think" not in proxy.ollama_request_payload(deepseek, ollama, settings)
+
+    settings["ollama_model_thinking"] = {"gpt-oss:20b": "low"}
+    gpt_oss = {"model": "gpt-oss:20b", "messages": []}
+    assert proxy.ollama_request_payload(gpt_oss, ollama, settings)["think"] == "low"
+    url, native_payload, native = proxy.prepare_chat_upstream_request(ollama, gpt_oss, settings)
+    assert (url, native, native_payload["think"]) == ("http://ollama:11434/api/chat", True, "low")
+
+
+def test_ollama_native_url_preserves_reverse_proxy_prefix() -> None:
+    upstream = {
+        "url": "https://models.example/gateway/v1/chat/completions",
+        "ollama_url": "https://models.example/ollama",
+    }
+    assert proxy.ollama_native_chat_url(upstream) == "https://models.example/ollama/api/chat"
+
+
+def test_ollama_native_stream_is_converted_to_openai_sse() -> None:
+    class FakeResponse:
+        async def aiter_bytes(self):
+            yield b'{"model":"qwen3:8b","message":{"role":"assistant","content":"he"},"done":false}\n'
+            yield b'{"model":"qwen3:8b","message":{"role":"assistant","content":"llo"},"done":false}\n'
+            yield b'{"model":"qwen3:8b","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":4,"eval_count":2}\n'
+
+    async def collect() -> list[bytes]:
+        return [frame async for frame in proxy.iter_ollama_chat_sse_frames(FakeResponse(), "qwen3:8b") if frame]
+
+    frames = asyncio.run(collect())
+    assert any(b'"content":"he"' in frame for frame in frames)
+    assert any(b'"content":"llo"' in frame for frame in frames)
+    assert any(b'"finish_reason":"stop"' in frame and b'"total_tokens":6' in frame for frame in frames)
+    assert frames[-1] == b"data: [DONE]\n\n"
+
+
+def test_chat_stream_uses_native_ollama_and_keeps_openai_contract(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    login(client)
+    settings = proxy.load_settings()
+    settings.update({
+        "target_api_url": "http://ollama:11434/v1/chat/completions",
+        "default_upstream_name": "Ollama",
+        "ollama_disable_thinking": True,
+    })
+    proxy.save_settings(settings)
+    calls = []
+
+    class FakeResponse:
+        status_code = 200
+        headers = {"content-type": "application/x-ndjson"}
+
+        async def aiter_bytes(self):
+            yield b'{"model":"qwen3","message":{"role":"assistant","content":"hello"},"done":false}\n'
+            yield b'{"model":"qwen3","message":{"role":"assistant","content":""},"done":true,"done_reason":"stop","prompt_eval_count":3,"eval_count":1}\n'
+
+        async def aclose(self):
+            return None
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, method, url, **kwargs):
+            calls.append((url, kwargs["json"]))
+            return object()
+
+        async def send(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post("/v1/chat/completions", json={"model": "qwen3", "messages": [], "stream": True})
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert calls == [("http://ollama:11434/api/chat", {"model": "qwen3", "messages": [], "stream": True, "think": False})]
+    assert '"content": "hello"' in response.text
+    assert '"total_tokens": 4' in response.text
+    assert response.text.count("data: [DONE]") == 1
 
 
 def test_chat_request_forwards_ollama_thinking_switch(tmp_path: Path, monkeypatch) -> None:
@@ -189,7 +291,7 @@ def test_chat_request_forwards_ollama_thinking_switch(tmp_path: Path, monkeypatc
         status_code = 200
 
         def json(self):
-            return {"choices": [{"message": {"content": "ok"}}]}
+            return {"model": "qwen3", "message": {"role": "assistant", "content": "ok"}, "done": True}
 
     class FakeClient:
         def __init__(self, *args, **kwargs):
@@ -208,6 +310,7 @@ def test_chat_request_forwards_ollama_thinking_switch(tmp_path: Path, monkeypatc
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
     response = client.post("/v1/chat/completions", json={"model": "qwen3", "messages": []})
     assert response.status_code == 200
+    assert calls[0][0] == "http://ollama:11434/api/chat"
     assert calls[0][1]["think"] is False
 
 
@@ -267,7 +370,7 @@ def test_responses_stream_ollama_error_event_is_reported_without_fake_completion
             return None
 
         async def aiter_bytes(self):
-            yield b'data: {"error":"unable to load model: missing blob"}\n\n'
+            yield b'{"error":"unable to load model: missing blob"}\n'
 
         async def aclose(self):
             return None
@@ -445,6 +548,8 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
         "default_upstream_name": "本地 Ollama",
         "api_key": "secret",
         "timeout_seconds": 42,
+        "ollama_disable_thinking": True,
+        "ollama_model_thinking": {"qwen3:8b": "disabled", "deepseek-r1:8b": "enabled"},
         "clean_patterns": [r"(?is)<think>.*?</think>", r"<tag>"],
     }
     response = client.put("/api/settings", json=settings)
@@ -452,6 +557,7 @@ def test_save_and_reload_regex_settings(tmp_path: Path) -> None:
     loaded = client.get("/api/settings").json()
     assert loaded["default_upstream_name"] == settings["default_upstream_name"]
     assert loaded["clean_patterns"] == settings["clean_patterns"]
+    assert loaded["ollama_model_thinking"] == settings["ollama_model_thinking"]
     assert proxy.clean_content("A<think>hidden</think>B<tag>", loaded) == "AB"
     assert proxy.MODEL_CACHE["data"] is None
     assert proxy.ROUTE_AFFINITY == {}
