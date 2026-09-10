@@ -578,6 +578,31 @@
   left: auto;
   z-index: 260 !important;
   min-width: 160px;
+  max-height: min(260px, calc(100dvh - 16px)) !important;
+  overflow-x: hidden !important;
+  overflow-y: auto !important;
+  overscroll-behavior: contain;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+.copy-model.icon-button {
+  display: inline-grid !important;
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  margin-left: 7px;
+  padding: 0;
+  border-color: transparent !important;
+  background: transparent !important;
+  color: var(--primary) !important;
+  vertical-align: middle;
+  touch-action: manipulation;
+}
+
+.copy-model.icon-button svg {
+  width: 16px;
+  height: 16px;
 }
 
 .usage-log-heading {

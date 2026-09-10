@@ -51,7 +51,7 @@ const usageLogState = { logs: [], hasMore: false, total: 0, tokenId: null, scrol
   nav?.querySelectorAll("a[data-page]").forEach(link => { link.title = link.textContent.trim(); });
   document.querySelector(".sidebar-status")?.setAttribute("title", "服务运行正常");
   const securityLink = nav?.querySelector('[data-page="security"]'), logsLink = nav?.querySelector('[data-page="logs"]'); if (securityLink && logsLink) nav.insertBefore(securityLink, logsLink);
-  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.3.23";
+  const versionLabel = document.querySelector(".sidebar-status small"); if (versionLabel) versionLabel.textContent = "CleanLLM v1.3.24";
   const menuButton = document.querySelector("#menu-button");
   const syncMenuButton = () => { if (!menuButton) return; const mobile=matchMedia("(max-width:760px)").matches, collapsed=document.documentElement.classList.contains("sidebar-collapsed"); const label=mobile?"打开菜单":collapsed?"展开侧栏":"收起侧栏"; menuButton.title=label; menuButton.setAttribute("aria-label",label); menuButton.setAttribute("aria-expanded",String(mobile?document.querySelector("#sidebar")?.classList.contains("open"):!collapsed)); };
   if (menuButton) menuButton.onclick = () => { if (matchMedia("(max-width:760px)").matches) { document.querySelector("#sidebar")?.classList.add("open"); document.querySelector("#backdrop")?.classList.add("open"); } else { document.documentElement.classList.toggle("sidebar-collapsed"); localStorage.setItem("cleanllm-sidebar",document.documentElement.classList.contains("sidebar-collapsed")?"collapsed":"expanded"); } syncMenuButton(); };
@@ -214,15 +214,31 @@ const usageLogState = { logs: [], hasMore: false, total: 0, tokenId: null, scrol
   window.addEventListener("hashchange",()=>{if(currentPage()==="diagnostics"){loadCircuitStatus();loadTraces();loadAudit()}if(currentPage()==="analytics")loadAnalytics()});
   if(currentPage()==="analytics")loadAnalytics();
 
+  async function copyTextReliably(value) {
+    const text=String(value??"");
+    if(navigator.clipboard?.writeText&&window.isSecureContext){try{await navigator.clipboard.writeText(text);return}catch(_){}}
+    const area=document.createElement("textarea");
+    area.value=text;
+    area.readOnly=true;
+    area.setAttribute("aria-hidden","true");
+    area.style.cssText="position:fixed;left:0;top:0;width:2px;height:2px;padding:0;border:0;opacity:.01;font-size:16px;pointer-events:none";
+    document.body.append(area);
+    area.focus({preventScroll:true});
+    area.select();
+    area.setSelectionRange(0,text.length);
+    const copied=document.execCommand("copy");
+    area.remove();
+    if(!copied)throw new Error("copy failed");
+  }
+
   const copyButtons = () => {
     document.querySelectorAll("#models-content tbody td:first-child, #ollama-models tbody td:first-child").forEach((cell) => {
       if (cell.querySelector(".copy-model")) return;
       const name = cell.querySelector("code")?.textContent;
       if (!name) return;
       const button = document.createElement("button");
-      button.className = "copy-model"; button.title = "复制名称"; button.setAttribute("aria-label", "复制名称"); button.textContent = "⧉";
-      button.style.cssText = "margin-left:8px;border:0;background:transparent;color:var(--primary);font-size:17px";
-      button.onclick = async () => { try { await navigator.clipboard.writeText(name); } catch (_) { const area=document.createElement("textarea"); area.value=name; document.body.append(area); area.select(); document.execCommand("copy"); area.remove(); } notify(`已复制：${name}`); };
+      button.type = "button"; button.className = "copy-model icon-button"; button.title = "复制名称"; button.setAttribute("aria-label", `复制模型名称 ${name}`); button.innerHTML = '<svg aria-hidden="true"><use href="#i-copy"/></svg>';
+      button.onclick = async (event) => { event.preventDefault();event.stopPropagation();try { await copyTextReliably(name);notify(`已复制：${name}`); } catch (_) { notify("复制失败，请长按模型名称复制",true); } };
       cell.append(button);
     });
     document.querySelectorAll("#ollama-models tbody tr").forEach((row) => {
@@ -495,11 +511,14 @@ const usageLogStyle = document.createElement("style"); usageLogStyle.textContent
   });
   const observer = new MutationObserver(prepare);
   observer.observe(document.body, {childList:true, subtree:true});
-  document.addEventListener("scroll", () => document.querySelectorAll(".custom-select-menu").forEach(menu => {
+  document.addEventListener("scroll", (event) => {
+    if(event.target instanceof Element&&event.target.closest(".custom-select-menu"))return;
+    document.querySelectorAll(".custom-select-menu").forEach(menu => {
     if (menu.hidden) return;
     menu.hidden = true;
     document.querySelector(`[data-select-owner="${menu.dataset.selectOwner}"] .custom-select-button`)?.setAttribute("aria-expanded", "false");
-  }), true);
+    });
+  }, true);
   prepare();
 })();
 
@@ -510,7 +529,7 @@ const tokenControlStyle=document.createElement('style');tokenControlStyle.textCo
 const analyticsStyle=document.createElement('style');analyticsStyle.textContent='.analytics-page.active{display:grid;gap:18px}.analytics-controls,.snapshot-actions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}.analytics-stats{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}.analytics-stats article{padding:13px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.analytics-stats span,.analytics-stats strong{display:block}.analytics-stats span{color:var(--muted);font-size:11px}.analytics-stats strong{margin-top:5px;font-size:17px}.analytics-trend{margin:20px 0}.trend-bars{height:130px;display:flex;align-items:flex-end;gap:4px;padding:12px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.trend-bars i{flex:1;min-width:3px;border-radius:3px 3px 0 0;background:var(--primary)}.trend-caption{display:flex;justify-content:space-between;margin-top:5px;color:var(--muted2);font-size:10px}.analytics-table{min-width:920px}.pricing-head,.pricing-row{display:grid;grid-template-columns:1.3fr 1fr .7fr .7fr .7fr auto;gap:9px;align-items:center}.pricing-head{padding-bottom:8px;color:var(--muted2);font-size:11px}.pricing-row{padding:8px 0;border-top:1px solid var(--border)}.pricing-row input{width:100%;height:38px;padding:0 10px;border:1px solid var(--border);border-radius:9px;background:var(--soft);color:var(--text)}.snapshot-list{display:grid;gap:8px}.snapshot-list article{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:11px 13px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.snapshot-list strong,.snapshot-list small{display:block}.snapshot-list small{margin-top:3px;color:var(--muted);font-size:11px}@media(max-width:1050px){.analytics-stats{grid-template-columns:repeat(3,1fr)}}@media(max-width:700px){.analytics-stats{grid-template-columns:repeat(2,1fr)}.pricing-head{display:none}.pricing-row{grid-template-columns:1fr}.analytics-controls{width:100%}}';document.head.append(analyticsStyle);
 const experienceStyle=document.createElement('style');experienceStyle.textContent='.upstream-bulk-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}.upstream-tab-wrap{display:inline-flex;align-items:center;gap:5px;flex:0 0 auto}.upstream-tab-wrap>input{width:15px;height:15px;accent-color:var(--primary)}.upstream-tab.disabled{opacity:.58}.upstream-tab small{margin-left:7px;color:var(--muted2);font-size:10px}.toggle-line{display:flex;align-items:center;gap:9px;min-height:42px;padding:0 11px;border:1px solid var(--border);border-radius:10px;background:var(--soft)}.toggle-line input{width:17px!important;height:17px!important;accent-color:var(--primary)}.toggle-line b{font-size:12px}.model-table{min-width:1250px}.model-tags{display:flex;align-items:center;gap:5px;flex-wrap:wrap;min-width:130px}.model-capability{display:inline-flex;padding:3px 7px;border:1px solid color-mix(in srgb,var(--primary) 25%,var(--border));border-radius:7px;background:var(--primary-soft);color:var(--primary);font-size:10px;white-space:nowrap}.muted-value{color:var(--muted2);font-size:11px}.token-table-v13{min-width:2100px}.cell-ellipsis{display:block;max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.service-pill[data-connection=reconnecting]{color:var(--primary)!important;background:var(--primary-soft)!important}.service-pill[data-connection=disconnected]{color:var(--red)!important;background:color-mix(in srgb,var(--red) 14%,transparent)!important}.service-pill[data-connection=reconnecting] i{animation:connection-pulse 1.2s infinite}.service-pill[data-connection=disconnected] i{background:var(--red)!important}@keyframes connection-pulse{50%{opacity:.35}}.audit-table-wrap{max-height:420px;overflow:auto}.audit-table{min-width:820px}.audit-table thead{position:sticky;top:0;z-index:2;background:var(--surface)}@media(max-width:700px){.upstream-bulk-actions .button,.upstream-bulk-actions .file-button{flex:1}.service-pill span{max-width:92px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}';document.head.append(experienceStyle);
 const ollamaLayoutStyle=document.createElement('style');ollamaLayoutStyle.textContent='#ollama-models .data-table{min-width:1080px}#models-content .model-table{min-width:1080px}#ollama-models .data-table th:last-child,#ollama-models .data-table td:last-child{white-space:nowrap}.advanced-model-actions{display:inline-flex!important;flex-wrap:nowrap!important;align-items:center;gap:6px;margin:0!important}.model-thinking-select+.custom-select-button,.model-thinking-select~.custom-select-button{min-width:112px}';document.head.append(ollamaLayoutStyle);
-document.querySelector(".sidebar-status small")?.replaceChildren("CleanLLM v1.3.23");
+document.querySelector(".sidebar-status small")?.replaceChildren("CleanLLM v1.3.24");
 // Dynamic management pages are created below the initial HTML shell; activate the requested hash once they exist.
 if (typeof showPage === "function") showPage();
 document.querySelector("#initial-page-placeholder")?.setAttribute("aria-busy", "false");

@@ -80,6 +80,11 @@ def test_admin_history_panels_and_chat_toolbar_layout() -> None:
     assert app_script.index('id="ollama-model-name"') < app_script.index('id="background-pull"') < app_script.index('id="ollama-tasks"') < app_script.index('id="ollama-models"')
     assert "后台拉取当前模型" not in features
     assert "scheduleTaskRefresh" in features
+    assert "event.target.closest(\".custom-select-menu\")" in features
+    assert "copyTextReliably" in features
+    assert 'if(!copied)throw new Error("copy failed")' in features
+    assert "touch-action: pan-y" in overrides
+    assert "-webkit-overflow-scrolling: touch" in overrides
 
 
 def client_for(tmp_path: Path) -> TestClient:
