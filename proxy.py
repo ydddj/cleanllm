@@ -4242,7 +4242,67 @@ def stream_event_error(payload: dict[str, Any] | None) -> str:
     return ""
 
 
-def stream_failure_event(model: str, message: str) -> bytes:
+def responses_control_event(
+    event_type: str,
+    response_id: str,
+    model: str,
+    created_at: int,
+    sequence_number: int,
+    *,
+    message: str = "",
+    response_template: dict[str, Any] | None = None,
+) -> bytes:
+    """Build a valid Responses control event without exposing request content."""
+    status = {
+        "response.created": "in_progress",
+        "response.in_progress": "in_progress",
+        "response.failed": "failed",
+    }.get(event_type, "in_progress")
+    response: dict[str, Any] = dict(response_template or {})
+    response.update({
+        "id": response_id, "object": "response", "created_at": created_at,
+        "model": model, "status": status,
+    })
+    response.setdefault("output", [])
+    if message:
+        response["error"] = {
+            "code": "upstream_error", "type": "upstream_error", "message": message,
+        }
+    event = {
+        "type": event_type,
+        "response": response,
+        "sequence_number": sequence_number,
+    }
+    return (
+        f"event: {event_type}\ndata: "
+        f"{json.dumps(event, ensure_ascii=False, separators=(',', ':'))}\n\n"
+    ).encode()
+
+
+def normalize_responses_stream_sequence(
+    event: dict[str, Any], sequence_number: int
+) -> dict[str, Any]:
+    """Keep injected heartbeats and upstream events in monotonic order."""
+    normalized = dict(event)
+    normalized["sequence_number"] = sequence_number
+    return normalized
+
+
+def stream_failure_event(
+    model: str,
+    message: str,
+    *,
+    response_id: str | None = None,
+    created_at: int | None = None,
+    sequence_number: int = 1,
+    response_template: dict[str, Any] | None = None,
+) -> bytes:
+    if response_id:
+        return responses_control_event(
+            "response.failed", response_id, model,
+            int(created_at or time.time()), sequence_number, message=message,
+            response_template=response_template,
+        )
     failed = {
         "type": "response.failed",
         "response": {
@@ -4342,10 +4402,14 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
     async def relay() -> Any:
         connection = first_connection
         output_started = False
+        client_started = False
         chat_compat = False
-        compat_response_id = f"resp-{secrets.token_hex(12)}"
+        response_id = ""
+        response_created_at = int(time.time())
+        response_template: dict[str, Any] = {}
+        sequence_number = 0
+        created_sent = False
         compat_item_id = f"msg-{secrets.token_hex(8)}"
-        compat_sequence = 0
         for index in range(first_index, len(candidates)):
             upstream = candidates[index]
             if index != first_index:
@@ -4366,10 +4430,20 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             stream_error = ""
             cleaner = StreamTextCleaner(response_settings)
             last_keepalive = time.monotonic()
+            failure_sent = False
             try:
                 async for frame in iter_sse_frames(response):
                     if frame is None:
-                        yield b": cleanllm-keepalive\n\n"
+                        if client_started and response_id:
+                            sequence_number += 1
+                            yield responses_control_event(
+                                "response.in_progress", response_id,
+                                requested_model, response_created_at, sequence_number,
+                                response_template=response_template,
+                            )
+                        else:
+                            yield b": cleanllm-keepalive\n\n"
+                        last_keepalive = time.monotonic()
                         continue
                     raw, event = sse_frame_payload(frame)
                     # A few compatibility gateways accept /responses but
@@ -4385,15 +4459,15 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                         delta = delta if isinstance(delta, dict) else {}
                         content = delta.get("content")
                         if isinstance(content, str) or delta.get("tool_calls") or delta.get("function_call"):
-                            compat_sequence += 1
+                            if not response_id:
+                                response_id = f"resp-{secrets.token_hex(12)}"
                             event = {
                                 "type": "response.output_text.delta",
                                 "delta": content if isinstance(content, str) else "",
                                 "item_id": compat_item_id,
                                 "output_index": 0,
                                 "content_index": 0,
-                                "response_id": compat_response_id,
-                                "sequence_number": compat_sequence,
+                                "response_id": response_id,
                             }
                             if delta.get("tool_calls") or delta.get("function_call"):
                                 event["tool_calls"] = delta.get("tool_calls") or delta.get("function_call")
@@ -4403,11 +4477,39 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                     if event is not None:
                         event_type = str(event.get("type") or "")
                         response_data = event.get("response") if isinstance(event.get("response"), dict) else {}
+                        # Relay upstream control events immediately so the
+                        # client does not sit idle during long reasoning. Keep
+                        # the real identity because clients may reuse it as
+                        # ``previous_response_id``.
+                        if event_type in {"response.created", "response.in_progress", "response.queued"}:
+                            if event_type == "response.created" and created_sent:
+                                continue
+                            if response_data:
+                                response_template = dict(response_data)
+                                response_id = str(response_data.get("id") or response_id)
+                                response_created_at = int(
+                                    response_data.get("created_at") or response_created_at
+                                )
+                            sequence_number += 1
+                            event = normalize_responses_stream_sequence(event, sequence_number)
+                            frame = rewrite_sse_payload(frame, event)
+                            client_started = True
+                            created_sent = created_sent or event_type == "response.created"
+                            yield frame
+                            continue
                         if event_type == "response.output_text.delta":
                             raw_delta = str(event.get("delta") or "")
                             event["delta"] = cleaner.feed(raw_delta)
                             if raw_delta and not event["delta"] and time.monotonic() - last_keepalive >= SSE_KEEPALIVE_SECONDS:
-                                yield b": cleanllm-keepalive\n\n"
+                                if client_started and response_id:
+                                    sequence_number += 1
+                                    yield responses_control_event(
+                                        "response.in_progress", response_id,
+                                        requested_model, response_created_at, sequence_number,
+                                        response_template=response_template,
+                                    )
+                                else:
+                                    yield b": cleanllm-keepalive\n\n"
                                 last_keepalive = time.monotonic()
                         elif event_type == "response.output_text.done":
                             event["text"] = clean_content(str(event.get("text") or ""), response_settings)
@@ -4431,20 +4533,24 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                                 usage_id, termination_reason=reason,
                                 **usage_values(response_data.get("usage")),
                             )
+                        sequence_number += 1
+                        event = normalize_responses_stream_sequence(event, sequence_number)
                         frame = rewrite_sse_payload(frame, event)
                     else:
                         if raw == "[DONE]" and chat_compat:
-                            compat_sequence += 1
+                            sequence_number += 1
+                            if not response_id:
+                                response_id = f"resp-{secrets.token_hex(12)}"
                             event = {
                                 "type": "response.completed",
                                 "response": {
-                                    "id": compat_response_id,
+                                    "id": response_id,
                                     "object": "response",
-                                    "created_at": int(time.time()),
+                                    "created_at": response_created_at,
                                     "model": requested_model,
                                     "status": "completed",
                                 },
-                                "sequence_number": compat_sequence,
+                                "sequence_number": sequence_number,
                             }
                             raw = ""
                             frame = (
@@ -4461,9 +4567,13 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
                             failed, meaningful, successful = False, raw == "[DONE]", False
 
                     if semantic_failure and not output_started:
+                        if client_started:
+                            yield frame
+                            failure_sent = True
                         break
                     if meaningful and not output_started:
                         output_started = True
+                        client_started = True
                         for item in buffered:
                             yield item
                         buffered.clear()
@@ -4501,17 +4611,30 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
             failure_message = stream_error or "上游响应流未正常结束"
             failures.append(f"{upstream['name']}: {failure_message}")
             record_upstream_stream_failure(settings, upstream["name"], failure_message)
-            if output_started:
+            if client_started:
                 logger.warning(
-                    "Responses stream from %s disconnected after output: %s",
-                    upstream["name"], failure_message,
+                    "Responses stream from %s failed after %s: %s",
+                    upstream["name"],
+                    "business output" if output_started else "response start",
+                    failure_message,
                 )
                 update_usage_record_safely(
                     usage_id, status_code=502, error=failure_message,
-                    termination_reason="stream_disconnected" if stream_error else "missing_terminal_event",
+                    termination_reason=(
+                        "response.failed" if semantic_failure else
+                        "stream_disconnected" if stream_error else
+                        "missing_terminal_event"
+                    ),
                 )
-                if not terminal:
-                    yield stream_failure_event(requested_model, failure_message)
+                if not failure_sent:
+                    sequence_number += 1
+                    yield stream_failure_event(
+                        requested_model, failure_message,
+                        response_id=response_id or None,
+                        created_at=response_created_at,
+                        sequence_number=sequence_number,
+                        response_template=response_template,
+                    )
                 return
             logger.warning(
                 "Responses stream from %s failed before business output; trying next upstream: %s",
@@ -4522,7 +4645,9 @@ async def native_responses_stream(payload: dict[str, Any], settings: dict[str, A
         update_usage_record_safely(
             usage_id, status_code=502, error=detail, termination_reason="no_upstream_available"
         )
-        yield stream_failure_event(requested_model, detail)
+        yield stream_failure_event(
+            requested_model, detail,
+        )
 
     return StreamingResponse(
         relay(), status_code=200, media_type="text/event-stream",
@@ -4652,6 +4777,14 @@ async def responses_api(request: Request, _: None = Depends(require_api_token)) 
         native_stream = await native_responses_stream(payload, settings, request)
         if native_stream.status_code != 502:
             return native_stream
+        # A native endpoint can be unavailable while this same upstream still
+        # supports Chat Completions.  The following compatibility fallback is
+        # a continuation of this request, so clear the provisional failure in
+        # request tracing before it starts.
+        update_usage_record_safely(
+            getattr(request.state, "usage_id", None),
+            status_code=None, error="", termination_reason="",
+        )
     if payload.get("stream") is True:
         response_id = f"resp-{secrets.token_hex(12)}"
         created_at = int(time.time())

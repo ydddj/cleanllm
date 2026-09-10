@@ -1295,6 +1295,140 @@ def test_native_responses_stream_preserves_split_completed_event(tmp_path: Path,
     assert '"id":"resp_test"' in response.text
 
 
+def test_native_responses_stream_sends_semantic_keepalive_and_preserves_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = client_for(tmp_path)
+    configure_non_ollama_upstream()
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            if False:
+                yield b""
+
+        async def aclose(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, *args, **kwargs):
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    async def fake_frames(_response):
+        yield (
+            b'event: response.created\n'
+            b'data: {"type":"response.created","response":{"id":"resp_upstream",'
+            b'"status":"in_progress"},"sequence_number":0}\n\n'
+        )
+        yield None
+        yield (
+            b'event: response.output_text.delta\n'
+            b'data: {"type":"response.output_text.delta","response_id":"resp_upstream",'
+            b'"delta":"ok","sequence_number":1}\n\n'
+        )
+        yield (
+            b'event: response.completed\n'
+            b'data: {"type":"response.completed","response":{"id":"resp_upstream",'
+            b'"status":"completed"},"sequence_number":2}\n\n'
+        )
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    monkeypatch.setattr(proxy, "iter_sse_frames", fake_frames)
+    response = client.post(
+        "/v1/responses", json={"model": "test", "input": "hello", "stream": True}
+    )
+    assert response.status_code == 200
+    assert response.text.startswith("event: response.created\n")
+    assert response.text.count("event: response.created") == 1
+    assert response.text.count("event: response.in_progress") == 1
+    assert response.text.count("event: response.completed") == 1
+    assert "resp_upstream" in response.text
+    events = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    ]
+    sequences = [item["sequence_number"] for item in events]
+    assert sequences == sorted(set(sequences))
+    proxy_id = events[0]["response"]["id"]
+    assert proxy_id == "resp_upstream"
+    assert events[2]["response_id"] == proxy_id
+    assert events[3]["response"]["id"] == proxy_id
+
+
+def test_native_responses_stream_does_not_switch_identity_after_created(
+    tmp_path: Path, monkeypatch
+) -> None:
+    client = client_for(tmp_path)
+    configure_non_ollama_upstream()
+    settings = proxy.load_settings()
+    settings["upstreams"] = [{
+        "name": "backup", "url": "https://backup.example/v1",
+        "api_key": "", "enabled": True,
+    }]
+    proxy.save_settings(settings)
+    calls = 0
+
+    class FakeResponse:
+        status_code = 200
+
+        async def aiter_bytes(self):
+            yield (
+                b'event: response.created\n'
+                b'data: {"type":"response.created","response":{"id":"resp_primary",'
+                b'"status":"in_progress"}}\n\n'
+            )
+            yield (
+                b'event: response.failed\n'
+                b'data: {"type":"response.failed","response":{"id":"resp_primary",'
+                b'"status":"failed","error":{"message":"generation failed"}}}\n\n'
+            )
+
+        async def aclose(self):
+            pass
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def build_request(self, *args, **kwargs):
+            return object()
+
+        async def send(self, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return FakeResponse()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.post(
+        "/v1/responses", json={"model": "test", "input": "hello", "stream": True}
+    )
+    assert response.status_code == 200
+    assert calls == 1
+    assert response.text.count("event: response.created") == 1
+    assert response.text.count("event: response.failed") == 1
+    assert "resp_primary" in response.text
+    assert "response.completed" not in response.text
+    with proxy.database_connection() as database:
+        trace = database.execute(
+            "SELECT termination_reason FROM api_usage ORDER BY rowid DESC LIMIT 1"
+        ).fetchone()
+    assert trace["termination_reason"] == "response.failed"
+
+
 def test_native_responses_stream_translates_chat_sse_compatibility_response(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     configure_non_ollama_upstream()

@@ -12,3 +12,4 @@ venv/
 .pytest-run/
 .pytest-cleanllm*/
 .ui-test-*/
+.tmp/
