@@ -304,8 +304,8 @@
 
 .chat-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, .8fr) minmax(320px, 1.7fr) auto;
-  align-items: end;
+  grid-template-columns: minmax(260px, .8fr) minmax(320px, 1.7fr);
+  align-items: start;
   gap: 14px;
   padding-bottom: 16px;
   border-bottom: 1px solid var(--border);
@@ -313,6 +313,13 @@
 
 .chat-toolbar .field {
   margin: 0;
+}
+
+.chat-model-stack {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
 }
 
 .chat-toolbar .custom-select {
@@ -338,6 +345,7 @@
   font-size: 12px;
   font-weight: 650;
   white-space: nowrap;
+  width: 100%;
 }
 
 .chat-stream-toggle input {
@@ -507,7 +515,7 @@
   }
 
   .chat-stream-toggle {
-    width: max-content;
+    width: 100%;
   }
 }
 
@@ -591,6 +599,45 @@
   box-shadow: 0 1px 0 var(--border);
 }
 .usage-log-actions { justify-content: flex-start; margin-top: 12px; }
+
+.trace-table-wrap {
+  max-height: min(560px, 62vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  border-block: 1px solid var(--border);
+}
+
+.trace-table-wrap .trace-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  background: color-mix(in srgb, var(--surface) 94%, var(--primary-soft));
+  box-shadow: 0 1px 0 var(--border);
+}
+
+.trace-actions,
+.snapshot-history-actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.trace-actions .form-note,
+.snapshot-history-actions small {
+  margin: 0 0 0 4px;
+  color: var(--muted2);
+  font-size: 11px;
+}
+
+.snapshot-history-actions {
+  padding-top: 16px;
+}
+
+#snapshot-panel {
+  order: -1;
+}
 
 @media (max-width: 1120px) and (min-width: 761px) {
   .topbar { padding-inline: 20px; }

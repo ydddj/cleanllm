@@ -59,6 +59,22 @@ def test_admin_shell_restores_hash_before_deferred_scripts() -> None:
     assert "window.cleanllmModelsReady" in chat
 
 
+def test_admin_history_panels_and_chat_toolbar_layout() -> None:
+    index = (proxy.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
+
+    assert "const TRACE_PAGE_SIZE=20" in features
+    assert 'id="collapse-traces"' in features
+    assert "trace-table-wrap" in features
+    assert "const SNAPSHOT_PAGE_SIZE=6" in features
+    assert "insertAdjacentHTML('afterbegin'" in features
+    assert 'id="snapshot-more"' in features
+    assert 'id="snapshot-less"' in features
+    chat_toolbar = index[index.index('<div class="chat-toolbar panel-body">'):index.index('<div id="chat-messages"')]
+    assert chat_toolbar.index('id="chat-model"') < chat_toolbar.index('id="chat-stream"')
+    assert "chat-model-stack" in chat_toolbar
+
+
 def client_for(tmp_path: Path) -> TestClient:
     proxy.DATA_DIR = tmp_path
     proxy.SETTINGS_FILE = tmp_path / "settings.json"
