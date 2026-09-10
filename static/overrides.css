@@ -305,7 +305,7 @@
 .chat-toolbar {
   display: grid;
   grid-template-columns: minmax(260px, .8fr) minmax(320px, 1.7fr);
-  align-items: start;
+  align-items: stretch;
   gap: 14px;
   padding-bottom: 16px;
   border-bottom: 1px solid var(--border);
@@ -327,9 +327,16 @@
 }
 
 .chat-system-field textarea {
-  min-height: 62px;
+  flex: 1 1 auto;
+  min-height: 90px;
   max-height: 120px;
   resize: vertical;
+}
+
+.chat-system-field {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 }
 
 .chat-stream-toggle {
@@ -635,10 +642,6 @@
   padding-top: 16px;
 }
 
-#snapshot-panel {
-  order: -1;
-}
-
 @media (max-width: 1120px) and (min-width: 761px) {
   .topbar { padding-inline: 20px; }
   .search { width: min(330px, 38vw); }
@@ -647,4 +650,186 @@
   .service-pill { width: 38px; height: 38px; justify-content: center; padding: 0; }
   .topbar-actions { gap: 6px; }
   .user-button small { display: none; }
+}
+
+.ollama-panel {
+  margin-bottom: 18px;
+}
+
+.ollama-pull-workspace {
+  display: grid;
+  gap: 14px;
+}
+
+.ollama-pull-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+
+#ollama-model-name {
+  width: 100%;
+  height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--soft);
+  color: var(--text);
+  outline: 0;
+}
+
+#ollama-model-name:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 15%, transparent);
+}
+
+.ollama-foreground-progress,
+.ollama-task-section {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--soft) 78%, transparent);
+}
+
+.ollama-foreground-progress > div,
+.ollama-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ollama-foreground-progress progress {
+  width: 100%;
+  margin-top: 10px;
+  accent-color: var(--primary);
+}
+
+.ollama-section-heading strong,
+.ollama-section-heading small {
+  display: block;
+}
+
+.ollama-section-heading small {
+  margin-top: 3px;
+  color: var(--muted2);
+  font-size: 11px;
+}
+
+.ollama-task-list {
+  max-height: 300px;
+  margin-top: 10px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.ollama-task-item {
+  display: grid;
+  grid-template-columns: minmax(170px, 1fr) minmax(170px, .9fr) auto 64px;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  padding: 9px 2px;
+  border-top: 1px solid var(--border);
+}
+
+.ollama-task-item:first-child {
+  border-top: 0;
+}
+
+.ollama-task-main {
+  min-width: 0;
+}
+
+.ollama-task-main code,
+.ollama-task-main small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ollama-task-main small {
+  margin-top: 4px;
+  color: var(--muted2);
+  font-size: 11px;
+}
+
+.ollama-task-progress {
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) 38px;
+  align-items: center;
+  gap: 8px;
+}
+
+.ollama-task-progress > div {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--border) 75%, transparent);
+}
+
+.ollama-task-progress i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--primary);
+}
+
+.ollama-task-progress span {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+.ollama-task-action {
+  display: flex;
+  justify-content: flex-end;
+  min-width: 64px;
+}
+
+.ollama-task-empty {
+  padding: 8px 2px 2px;
+}
+
+.ollama-model-list {
+  margin-top: 18px;
+}
+
+@media (max-width: 760px) {
+  .ollama-pull-row {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .ollama-pull-row input {
+    grid-column: 1 / -1;
+  }
+
+  .ollama-pull-row .button {
+    width: 100%;
+  }
+
+  .ollama-section-heading {
+    align-items: flex-start;
+  }
+
+  .ollama-task-item {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .ollama-task-progress {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  .ollama-task-item > .status-badge {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .ollama-task-action {
+    grid-column: 1 / -1;
+    min-width: 0;
+  }
 }

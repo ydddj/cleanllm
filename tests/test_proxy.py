@@ -61,18 +61,25 @@ def test_admin_shell_restores_hash_before_deferred_scripts() -> None:
 
 def test_admin_history_panels_and_chat_toolbar_layout() -> None:
     index = (proxy.STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    app_script = (proxy.STATIC_DIR / "app.js").read_text(encoding="utf-8")
     features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
+    overrides = (proxy.STATIC_DIR / "overrides.css").read_text(encoding="utf-8")
 
     assert "const TRACE_PAGE_SIZE=20" in features
     assert 'id="collapse-traces"' in features
     assert "trace-table-wrap" in features
     assert "const SNAPSHOT_PAGE_SIZE=6" in features
-    assert "insertAdjacentHTML('afterbegin'" in features
+    assert "settingsPanel.append($(\"#snapshot-panel\"))" in features
     assert 'id="snapshot-more"' in features
     assert 'id="snapshot-less"' in features
     chat_toolbar = index[index.index('<div class="chat-toolbar panel-body">'):index.index('<div id="chat-messages"')]
     assert chat_toolbar.index('id="chat-model"') < chat_toolbar.index('id="chat-stream"')
     assert "chat-model-stack" in chat_toolbar
+    assert ".chat-system-field textarea" in overrides
+    assert "min-height: 90px" in overrides
+    assert app_script.index('id="ollama-model-name"') < app_script.index('id="background-pull"') < app_script.index('id="ollama-tasks"') < app_script.index('id="ollama-models"')
+    assert "后台拉取当前模型" not in features
+    assert "scheduleTaskRefresh" in features
 
 
 def client_for(tmp_path: Path) -> TestClient:
