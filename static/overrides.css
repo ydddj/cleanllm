@@ -917,7 +917,7 @@
 :root[data-theme="light"] .search,
 :root[data-theme="light"] .icon-button,
 :root[data-theme="light"] .user-button,
-:root[data-theme="light"] .button,
+:root[data-theme="light"] .button:not(.primary),
 :root[data-theme="light"] .field input,
 :root[data-theme="light"] .field textarea,
 :root[data-theme="light"] .custom-select-button,
@@ -926,6 +926,14 @@
   border-color: var(--border) !important;
   background-color: rgba(255, 255, 255, .82) !important;
   color: var(--text) !important;
+}
+
+/* 实心主题按钮始终使用高对比文字，深色配色下也必须清晰可读。 */
+:root[data-theme="light"] .button.primary,
+:root[data-theme="light"] .button.primary:hover:not(:disabled),
+:root[data-theme="light"] .button.primary:active:not(:disabled) {
+  color: #fff !important;
+  -webkit-text-fill-color: #fff;
 }
 
 :root[data-theme="light"] .panel-header,

@@ -92,6 +92,9 @@ def test_admin_history_panels_and_chat_toolbar_layout() -> None:
     assert '<h3>备忘录</h3>' in chat
     assert ':root[data-theme="light"]' in overrides
     assert "--bg: #eaf1f5" in overrides
+    assert ':root[data-theme="light"] .button:not(.primary)' in overrides
+    assert ':root[data-theme="light"] .button.primary' in overrides
+    assert "-webkit-text-fill-color: #fff" in overrides
     assert "touch-action: pan-y" in overrides
     assert "-webkit-overflow-scrolling: touch" in overrides
 
