@@ -858,3 +858,133 @@
     min-width: 0;
   }
 }
+
+/* 浅色主题使用独立的高对比玻璃配色，避免深色蒙版使整页发灰。 */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #eaf1f5;
+  --surface: #ffffff;
+  --soft: #f2f6f8;
+  --hover: #e5eef2;
+  --border: #c7d4dc;
+  --text: #17212b;
+  --muted: #526273;
+  --muted2: #718192;
+  --sidebar: #f5f9fb;
+  --green: #087f5b;
+  --green-soft: #dff3ea;
+  --blue: #1769aa;
+  --blue-soft: #e1effa;
+  --orange: #a85a06;
+  --orange-soft: #f9ead7;
+  --red: #b63850;
+  --shadow: 0 18px 46px -22px rgba(36, 58, 74, .32), 0 2px 8px rgba(36, 58, 74, .08);
+}
+
+:root[data-theme="light"] body,
+:root[data-theme="light"] .login-view {
+  background-color: var(--bg) !important;
+  background-image:
+    linear-gradient(rgba(247, 251, 253, .54), rgba(235, 243, 247, .7)),
+    var(--instance-background, none) !important;
+  background-size: cover !important;
+  background-position: center !important;
+  background-repeat: no-repeat !important;
+}
+
+:root[data-theme="light"] .sidebar,
+:root[data-theme="light"] .topbar,
+:root[data-theme="light"] .panel,
+:root[data-theme="light"] .stat-card {
+  border-color: color-mix(in srgb, var(--border) 90%, var(--primary)) !important;
+  background:
+    linear-gradient(rgba(255, 255, 255, .2), rgba(255, 255, 255, .2)),
+    color-mix(in srgb, var(--surface) var(--glass-opacity, 51%), transparent) !important;
+  box-shadow: var(--shadow);
+}
+
+:root[data-theme="light"] .sidebar {
+  background:
+    linear-gradient(rgba(255, 255, 255, .26), rgba(255, 255, 255, .26)),
+    color-mix(in srgb, var(--surface) var(--sidebar-opacity, 51%), transparent) !important;
+  box-shadow: 10px 0 32px -28px rgba(35, 59, 76, .55);
+}
+
+:root[data-theme="light"] .topbar {
+  box-shadow: 0 8px 26px -24px rgba(35, 59, 76, .58);
+}
+
+:root[data-theme="light"] .search,
+:root[data-theme="light"] .icon-button,
+:root[data-theme="light"] .user-button,
+:root[data-theme="light"] .button,
+:root[data-theme="light"] .field input,
+:root[data-theme="light"] .field textarea,
+:root[data-theme="light"] .custom-select-button,
+:root[data-theme="light"] .custom-select-menu,
+:root[data-theme="light"] select {
+  border-color: var(--border) !important;
+  background-color: rgba(255, 255, 255, .82) !important;
+  color: var(--text) !important;
+}
+
+:root[data-theme="light"] .panel-header,
+:root[data-theme="light"] .chat-toolbar,
+:root[data-theme="light"] .data-table th,
+:root[data-theme="light"] .data-table td {
+  border-color: var(--border);
+}
+
+:root[data-theme="light"] .page-header h1,
+:root[data-theme="light"] .panel-header h2,
+:root[data-theme="light"] .empty-state h3,
+:root[data-theme="light"] .field > span,
+:root[data-theme="light"] .chat-message,
+:root[data-theme="light"] .data-table td {
+  color: var(--text);
+}
+
+:root[data-theme="light"] .page-header p,
+:root[data-theme="light"] .panel-header p,
+:root[data-theme="light"] .form-note,
+:root[data-theme="light"] .field small,
+:root[data-theme="light"] .empty-state p,
+:root[data-theme="light"] .chat-empty p {
+  color: var(--muted);
+}
+
+:root[data-theme="light"] .nav a {
+  color: var(--muted);
+}
+
+:root[data-theme="light"] .nav a:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, .54);
+}
+
+:root[data-theme="light"] .nav a.active {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 16%, rgba(255, 255, 255, .72));
+}
+
+:root[data-theme="light"] .sidebar-status,
+:root[data-theme="light"] .chat-stream-toggle,
+:root[data-theme="light"] .diagnostic-item,
+:root[data-theme="light"] .release-note,
+:root[data-theme="light"] .analytics-stats article,
+:root[data-theme="light"] .snapshot-list article,
+:root[data-theme="light"] .toggle-line {
+  border-color: var(--border);
+  background: rgba(255, 255, 255, .62);
+}
+
+:root[data-theme="light"] .login-panel {
+  border-color: color-mix(in srgb, var(--primary) 24%, var(--border));
+  background: rgba(255, 255, 255, .78) !important;
+  box-shadow: 0 28px 80px -34px rgba(27, 58, 76, .5);
+}
+
+:root[data-theme="light"] ::placeholder {
+  color: #718192;
+  opacity: .9;
+}

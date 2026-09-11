@@ -340,13 +340,13 @@
     const overlay = document.createElement("div");
     overlay.id = "admin-note-modal";
     overlay.className = "cleanllm-modal";
-    overlay.innerHTML = '<form class="cleanllm-modal-card admin-note-card"><div><p class="eyebrow">管理员工具</p><h3>备注</h3><p class="admin-note-help">用于临时记录实例相关事项，保存后同一实例的其他设备也可查看。</p></div><label class="field"><span>记事内容</span><textarea id="admin-note-text" rows="12" maxlength="10000" placeholder="例如：待测试的模型、临时维护安排或上游说明"></textarea><small id="admin-note-count">0 / 10000</small></label><div class="cleanllm-modal-actions"><button id="admin-note-cancel" class="button" type="button">取消</button><button id="admin-note-save" class="button primary" type="submit">保存备注</button></div></form>';
+    overlay.innerHTML = '<form class="cleanllm-modal-card admin-note-card"><div><p class="eyebrow">管理员工具</p><h3>备忘录</h3><p class="admin-note-help">用于临时记录实例相关事项，保存后同一实例的其他设备也可查看。</p></div><label class="field"><span>备忘内容</span><textarea id="admin-note-text" rows="12" maxlength="10000" placeholder="例如：待测试的模型、临时维护安排或上游说明"></textarea><small id="admin-note-count">0 / 10000</small></label><div class="cleanllm-modal-actions"><button id="admin-note-cancel" class="button" type="button">取消</button><button id="admin-note-save" class="button primary" type="submit">保存备忘录</button></div></form>';
     document.body.append(overlay);
     const textarea = $("#admin-note-text");
     const count = $("#admin-note-count");
     const syncCount = () => { count.textContent = `${textarea.value.length} / 10000`; };
     textarea.disabled = true;
-    textarea.placeholder = "正在读取备注…";
+    textarea.placeholder = "正在读取备忘录…";
     textarea.addEventListener("input", syncCount);
     $("#admin-note-cancel").onclick = closeNoteModal;
     overlay.addEventListener("click", (event) => { if (event.target === overlay) closeNoteModal(); });

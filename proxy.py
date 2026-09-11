@@ -2307,7 +2307,7 @@ def audit_event_for(method: str, path: str) -> tuple[str, str] | None:
     if path == "/api/account":
         return "更新管理员账户", "账户安全"
     if path == "/api/account/note":
-        return "更新管理员备注", "管理员备注"
+        return "更新管理员备忘录", "管理员备忘录"
     if path == "/api/system/restart":
         return "重启服务", "系统"
     if path in {"/api/logs", "/api/usage/logs"} and method == "DELETE":
@@ -2866,7 +2866,7 @@ async def update_admin_note(
     settings = load_settings()
     settings["admin_note"] = update.note
     save_settings(settings)
-    return {"message": "备注已保存"}
+    return {"message": "备忘录已保存"}
 
 
 @app.get("/api/tokens")

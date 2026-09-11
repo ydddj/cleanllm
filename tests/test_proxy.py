@@ -63,6 +63,7 @@ def test_admin_history_panels_and_chat_toolbar_layout() -> None:
     index = (proxy.STATIC_DIR / "index.html").read_text(encoding="utf-8")
     app_script = (proxy.STATIC_DIR / "app.js").read_text(encoding="utf-8")
     features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
+    chat = (proxy.STATIC_DIR / "chat.js").read_text(encoding="utf-8")
     overrides = (proxy.STATIC_DIR / "overrides.css").read_text(encoding="utf-8")
 
     assert "const TRACE_PAGE_SIZE=20" in features
@@ -82,7 +83,15 @@ def test_admin_history_panels_and_chat_toolbar_layout() -> None:
     assert "scheduleTaskRefresh" in features
     assert "event.target.closest(\".custom-select-menu\")" in features
     assert "copyTextReliably" in features
-    assert 'if(!copied)throw new Error("copy failed")' in features
+    assert "diagnosticsView.insertBefore(alertPanel,tracePanel)" in features
+    assert "legacyCopyContentEditable" in features
+    assert 'button.addEventListener("pointerup"' in features
+    assert 'button.addEventListener("touchend"' in features
+    assert 'if(!ok)throw new Error("copy failed")' in features
+    assert '<span>备忘录</span>' in features
+    assert '<h3>备忘录</h3>' in chat
+    assert ':root[data-theme="light"]' in overrides
+    assert "--bg: #eaf1f5" in overrides
     assert "touch-action: pan-y" in overrides
     assert "-webkit-overflow-scrolling: touch" in overrides
 
@@ -894,7 +903,7 @@ def test_admin_note_requires_login_and_persists_without_logging_content(tmp_path
     assert client.put("/api/settings", json=current).status_code == 200
     assert client.get("/api/account/note").json()["note"] == note
     audit = client.get("/api/audit/logs").json()["data"]
-    assert any(item["action"] == "更新管理员备注" for item in audit)
+    assert any(item["action"] == "更新管理员备忘录" for item in audit)
     assert note not in json.dumps(audit, ensure_ascii=False)
 
 
