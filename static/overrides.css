@@ -1027,6 +1027,12 @@
   white-space: nowrap;
 }
 
+.model-table th:nth-child(5),
+.model-table td:nth-child(5) {
+  min-width: 130px;
+  white-space: nowrap;
+}
+
 /* Dynamic feature styles use display with !important in a few layouts. Keep
    search filtering authoritative regardless of those layout declarations. */
 html body .page [data-search-hidden="1"] {

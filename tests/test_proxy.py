@@ -112,6 +112,10 @@ def test_global_search_and_ollama_updates_are_wired_in_admin_ui() -> None:
     assert "row.lastElementChild?.before(cell)" in app_script
     assert "window.cleanllmRefreshOllamaTasks" in features
     assert "grid-template-columns: minmax(220px, 1fr) repeat(3, auto)" in overrides
+    assert "if(!size)return '未声明'" in app_script
+    assert 'model.context_length?`<span class="model-capability">' in app_script
+    assert ".model-table td:nth-child(5)" in overrides
+    assert "min-width: 130px" in overrides
     assert 'id="i-sidebar-collapse"' in index
     assert 'id="i-sidebar-expand"' in index
     assert 'id="menu-icon" href="#i-sidebar-collapse"' in index
