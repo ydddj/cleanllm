@@ -3555,14 +3555,36 @@ def _ollama_registry_target(model: str) -> tuple[str, str, str] | None:
     return registry, repository, tag
 
 
+def _normalize_ollama_digest(value: Any) -> str | None:
+    """Return an Ollama/Registry digest in canonical ``sha256:...`` form."""
+    digest = str(value or "").strip().strip('"').lower()
+    if re.fullmatch(r"[0-9a-f]{64}", digest):
+        return f"sha256:{digest}"
+    if re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        return digest
+    return None
+
+
+def _ollama_manifest_payload(response: httpx.Response) -> dict[str, Any] | None:
+    """Parse only an actual Ollama/OCI image manifest, never an HTML error page."""
+    try:
+        payload = response.json()
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schemaVersion") != 2:
+        return None
+    if not isinstance(payload.get("config"), dict) or not isinstance(payload.get("layers"), list):
+        return None
+    return payload
+
+
 async def _ollama_remote_digest(
-    client: httpx.AsyncClient, model: str
+    client: httpx.AsyncClient, model: str, local_digest: str | None = None
 ) -> tuple[str | None, str]:
     target = _ollama_registry_target(model)
     if target is None:
         return None, "仅支持 Ollama 公共仓库模型"
     registry, repository, tag = target
-    url = f"https://{registry}/v2/{repository}/manifests/{tag}"
     headers = {
         "Accept": ", ".join(
             (
@@ -3575,13 +3597,16 @@ async def _ollama_remote_digest(
         "User-Agent": f"CleanLLM/{APP_VERSION}",
     }
     try:
-        response = await client.get(url, headers=headers)
-        if response.status_code == 401:
+        async def fetch_manifest(reference: str) -> tuple[httpx.Response | None, str]:
+            manifest_url = f"https://{registry}/v2/{repository}/manifests/{reference}"
+            response = await client.get(manifest_url, headers=headers)
+            if response.status_code != 401:
+                return response, ""
             challenge = response.headers.get("www-authenticate", "")
-            match = re.match(r"Bearer\\s+(.+)", challenge, re.IGNORECASE)
+            match = re.match(r"Bearer\s+(.+)", challenge, re.IGNORECASE)
             if not match:
                 return None, "公共仓库要求鉴权，但未返回 Bearer 信息"
-            values = {key: value for key, value in re.findall(r'(\\w+)="([^"]*)"', match.group(1))}
+            values = {key: value for key, value in re.findall(r'(\w+)="([^"]*)"', match.group(1))}
             realm = values.get("realm")
             if not realm:
                 return None, "公共仓库鉴权地址缺失"
@@ -3602,25 +3627,52 @@ async def _ollama_remote_digest(
             if not token:
                 return None, "公共仓库鉴权响应缺少令牌"
             headers["Authorization"] = f"Bearer {token}"
-            response = await client.get(url, headers=headers)
+            return await client.get(manifest_url, headers=headers), ""
+
+        response, fetch_error = await fetch_manifest(tag)
+        if fetch_error or response is None:
+            return None, fetch_error
         if response.status_code == 404:
             return None, "公共仓库未找到此模型或标签"
         if response.status_code >= 400:
             return None, f"公共仓库返回 HTTP {response.status_code}"
         digest = response.headers.get("docker-content-digest") or response.headers.get("etag")
-        if digest:
-            normalized_digest = str(digest).strip().removeprefix("W/").strip('"').lower()
-            if re.fullmatch(r"sha256:[0-9a-f]{64}", normalized_digest):
-                return normalized_digest, ""
-        # registry.ollama.ai does not consistently include the optional
-        # Docker-Content-Digest header.  The local /api/tags digest is the
-        # SHA-256 of the raw manifest, so calculate the same value as a safe
-        # compatibility fallback.  identity encoding avoids hashing a
-        # transparently decompressed representation.
-        content = bytes(response.content or b"")
-        if content:
-            return f"sha256:{hashlib.sha256(content).hexdigest()}", ""
-        return None, "公共仓库响应缺少 manifest 摘要"
+        normalized_digest = _normalize_ollama_digest(
+            str(digest or "").strip().removeprefix("W/")
+        )
+        if normalized_digest and normalized_digest == local_digest:
+            return normalized_digest, ""
+
+        # Some Ollama Registry responses omit Docker-Content-Digest or rewrite
+        # insignificant JSON formatting after a redirect.  Hashing that body
+        # directly can falsely report every installed model as outdated.
+        # Resolve the installed digest through the same registry and compare
+        # parsed manifests; only a real structural difference counts as an
+        # update.
+        remote_manifest = _ollama_manifest_payload(response)
+        if local_digest and remote_manifest is not None:
+            local_response, local_error = await fetch_manifest(local_digest)
+            if local_error or local_response is None:
+                return None, local_error
+            if local_response.status_code >= 400:
+                # A different tag digest alone is not enough for the body-hash
+                # compatibility path.  Prefer "unknown" over telling users to
+                # update a model that may already be current.
+                return None, f"公共仓库无法校验本地版本（HTTP {local_response.status_code}）"
+            installed_manifest = _ollama_manifest_payload(local_response)
+            if installed_manifest is None:
+                return None, "公共仓库返回的本地版本 manifest 无效"
+            if installed_manifest == remote_manifest:
+                return local_digest, ""
+            canonical = json.dumps(
+                remote_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            return normalized_digest or f"sha256:{hashlib.sha256(canonical).hexdigest()}", ""
+        if normalized_digest:
+            return normalized_digest, ""
+        if remote_manifest is None:
+            return None, "公共仓库响应不是有效的 Ollama manifest"
+        return None, "公共仓库缺少权威摘要，且无法校验本地版本"
     except httpx.TimeoutException:
         return None, "连接公共仓库超时"
     except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
@@ -3649,8 +3701,10 @@ async def check_ollama_model_updates(_: None = Depends(require_admin)) -> dict[s
             async def inspect(item: dict[str, Any]) -> dict[str, Any]:
                 async with semaphore:
                     model = str(item.get("name") or item.get("model"))
-                    local_digest = str(item.get("digest") or "").strip().lower() or None
-                    remote_digest, detail = await _ollama_remote_digest(client, model)
+                    local_digest = _normalize_ollama_digest(item.get("digest"))
+                    remote_digest, detail = await _ollama_remote_digest(
+                        client, model, local_digest
+                    )
                     if not local_digest or not remote_digest:
                         state = "unknown"
                         if not local_digest:

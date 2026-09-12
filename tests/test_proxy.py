@@ -1833,6 +1833,53 @@ def test_ollama_registry_targets_only_public_registry_models() -> None:
     assert proxy._ollama_registry_target("local-model@sha256:abc") is None
 
 
+def test_ollama_digest_normalization_accepts_ollama_variants() -> None:
+    digest = "A" * 64
+    assert proxy._normalize_ollama_digest(digest) == f"sha256:{digest.lower()}"
+    assert proxy._normalize_ollama_digest(f"SHA256:{digest}") == f"sha256:{digest.lower()}"
+    assert proxy._normalize_ollama_digest("sha256:short") is None
+
+
+def test_ollama_registry_bearer_challenge_is_parsed() -> None:
+    digest = f"sha256:{'d' * 64}"
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, *, status_code=200, headers=None, payload=None):
+            self.status_code = status_code
+            self.headers = headers or {}
+            self.payload = payload or {}
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        async def get(self, url, **kwargs):
+            calls.append((url, kwargs))
+            if url == "https://auth.ollama.com/token":
+                return FakeResponse(payload={"token": "registry-token"})
+            if kwargs.get("headers", {}).get("Authorization") == "Bearer registry-token":
+                return FakeResponse(headers={"docker-content-digest": digest})
+            return FakeResponse(
+                status_code=401,
+                headers={
+                    "www-authenticate": (
+                        'Bearer realm="https://auth.ollama.com/token",'
+                        'service="registry.ollama.ai",'
+                        'scope="repository:library/qwen3:pull"'
+                    )
+                },
+            )
+
+    remote_digest, detail = asyncio.run(
+        proxy._ollama_remote_digest(FakeClient(), "qwen3:8b", digest)
+    )
+
+    assert remote_digest == digest
+    assert detail == ""
+    assert any(url == "https://auth.ollama.com/token" for url, _ in calls)
+
+
 def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     assert client.get("/api/ollama/models/updates").status_code == 401
@@ -1842,7 +1889,21 @@ def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, mon
     old_digest = f"sha256:{'b' * 64}"
     new_digest = f"sha256:{'c' * 64}"
 
-    manifest_without_digest = b'{"schemaVersion":2,"layers":[]}'
+    same_manifest = {
+        "schemaVersion": 2,
+        "config": {"digest": f"sha256:{'d' * 64}", "size": 1},
+        "layers": [],
+    }
+    old_manifest = {
+        "schemaVersion": 2,
+        "config": {"digest": f"sha256:{'e' * 64}", "size": 1},
+        "layers": [],
+    }
+    new_manifest = {
+        "schemaVersion": 2,
+        "config": {"digest": f"sha256:{'f' * 64}", "size": 1},
+        "layers": [],
+    }
 
     class FakeResponse:
         def __init__(self, payload=None, *, status_code=200, headers=None, content=b""):
@@ -1874,18 +1935,22 @@ def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, mon
             calls.append(url)
             if url.endswith("/api/tags"):
                 return FakeResponse({"models": [
-                    {"name": "qwen3:8b", "digest": same_digest},
+                    # Ollama versions exist that omit the sha256: prefix.
+                    {"name": "qwen3:8b", "digest": same_digest.removeprefix("sha256:")},
                     {"name": "rinex20/translategemma3:12b", "digest": old_digest},
-                    {
-                        "name": "headerless:latest",
-                        "digest": f"sha256:{proxy.hashlib.sha256(manifest_without_digest).hexdigest()}",
-                    },
+                    {"name": "headerless:latest", "digest": old_digest},
                     {"name": "local-model@sha256:abc", "digest": old_digest},
                 ]})
             if "/library/headerless/" in url:
-                return FakeResponse(content=manifest_without_digest)
-            digest = same_digest if "/library/qwen3/" in url else new_digest
-            return FakeResponse(headers={"docker-content-digest": digest})
+                # The tag and digest URLs deliberately expose differently
+                # formatted bytes but equivalent parsed manifests.
+                content = b'{"layers":[],"config":{"size":1},"schemaVersion":2}'
+                return FakeResponse(same_manifest, content=content)
+            if "/rinex20/translategemma3/manifests/12b" in url:
+                return FakeResponse(new_manifest, headers={"docker-content-digest": new_digest})
+            if url.endswith(old_digest):
+                return FakeResponse(old_manifest, headers={"docker-content-digest": old_digest})
+            return FakeResponse(headers={"docker-content-digest": same_digest})
 
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
     response = client.get("/api/ollama/models/updates")
@@ -1893,6 +1958,7 @@ def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, mon
     assert response.status_code == 200
     by_model = {item["id"]: item for item in response.json()["data"]}
     assert by_model["qwen3:8b"]["state"] == "latest"
+    assert by_model["qwen3:8b"]["local_digest"] == same_digest
     assert by_model["headerless:latest"]["state"] == "latest"
     assert by_model["rinex20/translategemma3:12b"]["state"] == "update"
     assert by_model["rinex20/translategemma3:12b"]["update_available"] is True
