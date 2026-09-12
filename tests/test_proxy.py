@@ -99,6 +99,30 @@ def test_admin_history_panels_and_chat_toolbar_layout() -> None:
     assert "-webkit-overflow-scrolling: touch" in overrides
 
 
+def test_global_search_and_ollama_updates_are_wired_in_admin_ui() -> None:
+    app_script = (proxy.STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
+    overrides = (proxy.STATIC_DIR / "overrides.css").read_text(encoding="utf-8")
+
+    assert 'id="check-ollama-updates"' in app_script
+    assert 'api("/api/ollama/models/updates")' in app_script
+    assert "dataset.ollamaUpdateHeading" in app_script
+    assert "row.lastElementChild?.before(cell)" in app_script
+    assert "window.cleanllmRefreshOllamaTasks" in features
+    assert ".ollama-header-actions" in overrides
+    assert 'html body .page [data-search-hidden="1"]' in overrides
+
+    assert "cleanllmSearchableText" in app_script
+    assert '"tbody tr"' in app_script
+    assert '".diagnostic-item"' in app_script
+    assert '".release-note"' in app_script
+    assert '".snapshot-list > article"' in app_script
+    assert '".ollama-task-item"' in app_script
+    assert ".observe(cleanllmContent, {childList: true, subtree: true})" in app_script
+    assert 'input.placeholder = `搜索${meta[1]}`' in app_script
+    assert '"Ctrl K"' in app_script
+
+
 def client_for(tmp_path: Path) -> TestClient:
     proxy.DATA_DIR = tmp_path
     proxy.SETTINGS_FILE = tmp_path / "settings.json"
@@ -1796,6 +1820,71 @@ def test_ollama_models_and_delete(tmp_path: Path, monkeypatch) -> None:
         "http://host.docker.internal:11434/api/delete",
         {"name": "qwen3:8b"},
     ) in calls
+
+
+def test_ollama_registry_targets_only_public_registry_models() -> None:
+    assert proxy._ollama_registry_target("qwen3:8b") == (
+        "registry.ollama.ai", "library/qwen3", "8b"
+    )
+    assert proxy._ollama_registry_target("rinex20/translategemma3:12b") == (
+        "registry.ollama.ai", "rinex20/translategemma3", "12b"
+    )
+    assert proxy._ollama_registry_target("registry.example:5000/team/model:latest") is None
+    assert proxy._ollama_registry_target("local-model@sha256:abc") is None
+
+
+def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, monkeypatch) -> None:
+    client = client_for(tmp_path)
+    assert client.get("/api/ollama/models/updates").status_code == 401
+    login(client)
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload=None, *, status_code=200, headers=None):
+            self.payload = payload or {}
+            self.status_code = status_code
+            self.headers = headers or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise proxy.httpx.HTTPStatusError(
+                    "failed", request=proxy.httpx.Request("GET", "http://test"), response=None
+                )
+
+        def json(self):
+            return self.payload
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url, **kwargs):
+            calls.append(url)
+            if url.endswith("/api/tags"):
+                return FakeResponse({"models": [
+                    {"name": "qwen3:8b", "digest": "sha256:same"},
+                    {"name": "rinex20/translategemma3:12b", "digest": "sha256:old"},
+                    {"name": "local-model@sha256:abc", "digest": "sha256:local"},
+                ]})
+            digest = "sha256:same" if "/library/qwen3/" in url else "sha256:new"
+            return FakeResponse(headers={"docker-content-digest": digest})
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
+    response = client.get("/api/ollama/models/updates")
+
+    assert response.status_code == 200
+    by_model = {item["id"]: item for item in response.json()["data"]}
+    assert by_model["qwen3:8b"]["state"] == "latest"
+    assert by_model["rinex20/translategemma3:12b"]["state"] == "update"
+    assert by_model["rinex20/translategemma3:12b"]["update_available"] is True
+    assert by_model["local-model@sha256:abc"]["state"] == "unknown"
+    assert not any("local-model" in url for url in calls)
 
 
 def test_ollama_pull_surfaces_stream_errors_instead_of_reporting_success(tmp_path: Path, monkeypatch) -> None:

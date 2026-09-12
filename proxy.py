@@ -3518,6 +3518,139 @@ async def get_ollama_models(_: None = Depends(require_admin)) -> dict[str, Any]:
     return {"source": base_url, "count": len(data), "data": data}
 
 
+def _ollama_registry_target(model: str) -> tuple[str, str, str] | None:
+    """Translate an Ollama model name into a public registry manifest URL.
+
+    Ollama's tags endpoint only exposes the digest currently installed on the
+    server.  For the common registry-backed names we can compare that digest
+    with the registry manifest without pulling the model.  Custom/local model
+    names are returned as unknown instead of guessing or making an unsafe
+    request.
+    """
+    value = str(model or "").strip()
+    if not value or "@" in value:
+        return None
+    parts = value.split("/")
+    registry = "registry.ollama.ai"
+    # The check endpoint must not turn an Ollama-supplied model name into an
+    # arbitrary outbound request.  Private registries and local Modelfiles are
+    # intentionally reported as unknown.
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        return None
+    if not parts or any(not part for part in parts):
+        return None
+    image = parts[-1]
+    tag = "latest"
+    if ":" in image:
+        image, tag = image.rsplit(":", 1)
+    if not image or not tag or any(ch in tag for ch in "\\/?#"):
+        return None
+    if any(
+        not re.fullmatch(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", part, re.IGNORECASE)
+        for part in [*parts[:-1], image]
+    ):
+        return None
+    repository_parts = ["library", image] if len(parts) == 1 else [*parts[:-1], image]
+    repository = "/".join(repository_parts)
+    return registry, repository, tag
+
+
+async def _ollama_remote_digest(client: httpx.AsyncClient, model: str) -> str | None:
+    target = _ollama_registry_target(model)
+    if target is None:
+        return None
+    registry, repository, tag = target
+    url = f"https://{registry}/v2/{repository}/manifests/{tag}"
+    headers = {
+        "Accept": ", ".join(
+            (
+                "application/vnd.docker.distribution.manifest.v2+json",
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.oci.image.index.v1+json",
+            )
+        )
+    }
+    try:
+        response = await client.get(url, headers=headers)
+        if response.status_code == 401:
+            challenge = response.headers.get("www-authenticate", "")
+            match = re.match(r"Bearer\\s+(.+)", challenge, re.IGNORECASE)
+            if not match:
+                return None
+            values = {key: value for key, value in re.findall(r'(\\w+)="([^"]*)"', match.group(1))}
+            realm = values.get("realm")
+            if not realm:
+                return None
+            realm_url = urlsplit(realm)
+            realm_host = (realm_url.hostname or "").lower()
+            if realm_url.scheme != "https" or not (
+                realm_host in {"ollama.ai", "ollama.com"}
+                or realm_host.endswith(".ollama.ai")
+                or realm_host.endswith(".ollama.com")
+            ):
+                return None
+            token_params = {key: values[key] for key in ("service", "scope") if values.get(key)}
+            token_response = await client.get(realm, params=token_params)
+            if token_response.status_code >= 400:
+                return None
+            token_payload = token_response.json()
+            token = token_payload.get("token") or token_payload.get("access_token")
+            if not token:
+                return None
+            headers["Authorization"] = f"Bearer {token}"
+            response = await client.get(url, headers=headers)
+        if response.status_code >= 400:
+            return None
+        digest = response.headers.get("docker-content-digest")
+        return str(digest).strip() if digest else None
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        return None
+
+
+@app.get("/api/ollama/models/updates")
+async def check_ollama_model_updates(_: None = Depends(require_admin)) -> dict[str, Any]:
+    """Compare installed Ollama manifests with the public Ollama registry.
+
+    This is deliberately best-effort.  A model from a private registry or a
+    locally-created Modelfile reports ``unknown`` and remains fully usable.
+    """
+    base_url = ollama_base_url(load_settings())
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.get(f"{base_url}/api/tags")
+            response.raise_for_status()
+            payload = response.json()
+            installed = [
+                item for item in (payload.get("models", []) if isinstance(payload, dict) else [])
+                if isinstance(item, dict) and (item.get("name") or item.get("model"))
+            ]
+            semaphore = asyncio.Semaphore(6)
+
+            async def inspect(item: dict[str, Any]) -> dict[str, Any]:
+                async with semaphore:
+                    model = str(item.get("name") or item.get("model"))
+                    local_digest = str(item.get("digest") or "").strip() or None
+                    remote_digest = await _ollama_remote_digest(client, model)
+                    if not local_digest or not remote_digest:
+                        state = "unknown"
+                    elif local_digest == remote_digest:
+                        state = "latest"
+                    else:
+                        state = "update"
+                    return {
+                        "id": model,
+                        "local_digest": local_digest,
+                        "remote_digest": remote_digest,
+                        "state": state,
+                        "update_available": state == "update",
+                    }
+
+            results = await asyncio.gather(*(inspect(item) for item in installed))
+    except (httpx.RequestError, httpx.HTTPStatusError, ValueError) as exc:
+        raise HTTPException(status_code=502, detail=f"检查 Ollama 模型更新失败：{exc}") from exc
+    return {"checked_at": int(time.time()), "data": sorted(results, key=lambda item: item["id"].lower())}
+
+
 def _ollama_payload_error(payload: Any) -> str:
     """Return a short, useful error from an Ollama JSON response.
 

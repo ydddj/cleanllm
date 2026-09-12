@@ -996,3 +996,29 @@
   color: #718192;
   opacity: .9;
 }
+
+.ollama-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+  flex-wrap: wrap;
+}
+
+#ollama-models [data-ollama-update-heading],
+#ollama-models [data-ollama-update-cell] {
+  white-space: nowrap;
+}
+
+/* Dynamic feature styles use display with !important in a few layouts. Keep
+   search filtering authoritative regardless of those layout declarations. */
+html body .page [data-search-hidden="1"] {
+  display: none !important;
+}
+
+@media (max-width: 700px) {
+  .ollama-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+}

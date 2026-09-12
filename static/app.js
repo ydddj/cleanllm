@@ -15,7 +15,7 @@ async function pullOllamaModel(){const model=$('#ollama-model-name').value.trim(
 async function loadLogs(){try{const result=await api('/api/logs?limit=800');logs=result.lines||[];logMeta=result;$('#log-size').textContent=`${bytes(result.size_bytes)} / ${bytes(result.max_bytes)}`;$('#dash-log-size').textContent=bytes(result.size_bytes);$('#log-meter-fill').style.width=`${Math.min(100,result.size_bytes/result.max_bytes*100)}%`;renderLogs()}catch(error){toast(error.message,true)}}function renderLogs(){const view=$('#log-view'),scrollTop=view.scrollTop,query=$('#global-search').value.trim().toLowerCase(),filtered=logs.filter(line=>line.toLowerCase().includes(query)).reverse();if(!filtered.length){view.innerHTML='<div class="empty-state"><div><h3>暂无匹配日志</h3><p>新请求会显示在这里。</p></div></div>';return}const shown=Math.min(logShown,filtered.length);view.innerHTML=filtered.slice(0,shown).map(line=>{const parts=line.split(' | '),time=parts.shift()||'',level=parts.shift()||'INFO',message=parts.join(' | ');return `<div class="log-line"><span>${escapeHtml(time)}</span><span class="level ${escapeHtml(level)}">${escapeHtml(level)}</span><span>${escapeHtml(message)}</span></div>`}).join('')+`<div class="log-history-actions"><button id="log-more" class="button" ${shown>=filtered.length?'hidden':''}>加载更多</button><button id="log-less" class="button" ${logShown<=LOG_PAGE_SIZE?'hidden':''}>收起历史</button><small>已显示 ${shown} / ${filtered.length} 条</small></div>`;view.scrollTop=scrollTop;$('#log-more')?.addEventListener('click',()=>{logShown=Math.min(logShown+LOG_PAGE_SIZE,filtered.length);renderLogs()});$('#log-less')?.addEventListener('click',()=>{logShown=LOG_PAGE_SIZE;renderLogs();view.scrollTop=0})}
 $('#settings-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.currentTarget.querySelector('button[type=submit]');button.disabled=true;try{settings=await api('/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_api_url:$('#target_api_url').value,api_key:$('#api_key').value,timeout_seconds:Number($('#timeout_seconds').value),models_api_url:$('#models_api_url').value,ollama_api_url:$('#ollama_api_url').value,upstreams:settings.upstreams||[],model_routes:settings.model_routes||[],clean_patterns:$('#clean_patterns').value.split('\n').map(line=>line.trim()).filter(Boolean)})});toast(settings.message||'代理设置已保存');await loadSettings()}catch(error){toast(error.message,true)}finally{button.disabled=false}});
 $('#account-form').addEventListener('submit',async event=>{event.preventDefault();const button=event.currentTarget.querySelector('button[type=submit]'),password=$('#new_password').value;if(password!==$('#confirm_password').value){toast('两次输入的新密码不一致',true);return}button.disabled=true;try{const result=await api('/api/account',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('#account_username').value,current_password:$('#current_password').value,new_password:password})});toast(result.message);setTimeout(()=>location.assign('/login'),900)}catch(error){toast(error.message,true)}finally{button.disabled=false}});
-$('#pull-ollama-model').onclick=pullOllamaModel;$('.reveal').onclick=event=>{const input=$('#api_key');input.type=input.type==='password'?'text':'password';event.currentTarget.textContent=input.type==='password'?'显示':'隐藏'};$('#logout').onclick=async()=>{await fetch('/api/logout',{method:'POST'});location.assign('/login')};$('#global-search').addEventListener('input',()=>{if(currentPage()==='models')renderModels();if(currentPage()==='logs')renderLogs()});document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){event.preventDefault();$('#global-search').focus()}});function closeMenu(){$('#sidebar').classList.remove('open');$('#backdrop').classList.remove('open')}$('#menu-button').onclick=()=>{$('#sidebar').classList.add('open');$('#backdrop').classList.add('open')};$('#backdrop').onclick=closeMenu;$('#theme-button').onclick=()=>{const dark=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=dark?'dark':'';localStorage.setItem('cleanllm-theme',dark?'dark':'light')};if(localStorage.getItem('cleanllm-theme')==='dark')document.documentElement.dataset.theme='dark';window.addEventListener('hashchange',showPage);setInterval(()=>{if(!document.hidden&&currentPage()==='logs')loadLogs()},5000);Promise.all([loadSettings(),loadAccount(),loadOllama()]).then(showPage).catch(error=>toast(error.message,true));
+$('#pull-ollama-model').onclick=pullOllamaModel;$('.reveal').onclick=event=>{const input=$('#api_key');input.type=input.type==='password'?'text':'password';event.currentTarget.textContent=input.type==='password'?'显示':'隐藏'};$('#logout').onclick=async()=>{await fetch('/api/logout',{method:'POST'});location.assign('/login')};$('#global-search').addEventListener('input',()=>{if(currentPage()==='models')renderModels();if(currentPage()==='logs')renderLogs()});document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='k'){event.preventDefault();$('#global-search').focus()}});function closeMenu(){$('#sidebar').classList.remove('open');$('#backdrop').classList.remove('open')}$('#menu-button').onclick=()=>{$('#sidebar').classList.add('open');$('#backdrop').classList.add('open')};$('#backdrop').onclick=closeMenu;$('#theme-button').onclick=()=>{const dark=document.documentElement.dataset.theme!=='dark';document.documentElement.dataset.theme=dark?'dark':'';localStorage.setItem('cleanllm-theme',dark?'dark':'light')};if(localStorage.getItem('cleanllm-theme')==='dark')document.documentElement.dataset.theme='dark';window.addEventListener('hashchange',showPage);setInterval(()=>{if(!document.hidden&&currentPage()==='logs')loadLogs()},5000);const cleanllmInitialLoad=Promise.all([loadSettings(),loadAccount(),loadOllama()]).then(showPage).catch(error=>toast(error.message,true));
 // Render the URL-selected shell immediately; slow data requests hydrate it in the background.
 let logsRequest = null;
 const loadLogsOnce = loadLogs;
@@ -26,3 +26,187 @@ loadLogs = (...args) => {
 };
 loadLogs();
 showPage();
+
+// Ollama updates are checked separately from the installed-model list so the
+// normal model manager stays responsive when the public registry is slow or
+// does not know about a private/local model.
+const cleanllmBaseLoadOllama = loadOllama;
+let cleanllmUpdateCheck = null;
+let cleanllmOllamaUpdates = [];
+function ensureOllamaUpdateButton() {
+  const version = $("#ollama-version");
+  if (!version || $("#check-ollama-updates")) return;
+  const actions = document.createElement("div");
+  actions.className = "ollama-header-actions";
+  version.before(actions);
+  actions.append(version);
+  actions.insertAdjacentHTML("beforeend", '<button id="check-ollama-updates" class="button compact" type="button" disabled>检查更新</button>');
+  $("#check-ollama-updates").addEventListener("click", checkOllamaUpdates);
+}
+function syncOllamaUpdateButton() {
+  const button = $("#check-ollama-updates");
+  if (!button || cleanllmUpdateCheck) return;
+  const unavailable = $("#ollama-version")?.textContent === "不可用";
+  button.disabled = unavailable;
+  button.title = unavailable ? "Ollama 不可用，无法检查模型更新" : "";
+}
+function renderOllamaUpdateCells(updates) {
+  const table = $("#ollama-models .data-table");
+  if (!table) return;
+  const header = table.querySelector("thead tr");
+  if (header && !header.querySelector("[data-ollama-update-heading]")) {
+    const heading = document.createElement("th");
+    heading.dataset.ollamaUpdateHeading = "";
+    heading.textContent = "更新状态";
+    header.lastElementChild?.before(heading);
+  }
+  const map = new Map((updates || []).map(item => [String(item.id), item]));
+  table.querySelectorAll("tbody tr").forEach(row => {
+    const code = row.querySelector("td code");
+    if (!code) return;
+    const model = code.textContent.trim();
+    const item = map.get(model);
+    let content = '<span class="muted-value">未检查</span>';
+    if (updates && updates.length && (!item || item.state === "unknown")) content = '<span class="muted-value" title="私有仓库、本地模型或公共仓库暂不可用">无法检查</span>';
+    if (item?.state === "latest") content = '<span class="status-badge active">最新</span>';
+    if (item?.state === "update") content = `<button class="button primary compact" type="button" data-ollama-update="${escapeHtml(model)}">更新模型</button>`;
+    if (item?.state === "updating") content = '<span class="status-badge active">更新中</span>';
+    let cell = row.querySelector("[data-ollama-update-cell]");
+    if (!cell) {
+      cell = document.createElement("td");
+      cell.dataset.ollamaUpdateCell = "";
+      row.lastElementChild?.before(cell);
+    }
+    cell.innerHTML = content;
+  });
+  $$('[data-ollama-update]').forEach(button => {
+    button.addEventListener("click", async () => {
+      const model = button.dataset.ollamaUpdate;
+      button.disabled = true;
+      try {
+        await api("/api/ollama/tasks", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({model})});
+        cleanllmOllamaUpdates = cleanllmOllamaUpdates.map(item => item.id === model ? {...item, state: "updating", update_available: false} : item);
+        renderOllamaUpdateCells(cleanllmOllamaUpdates);
+        window.cleanllmRefreshOllamaTasks?.();
+        toast(`模型 ${model} 的更新任务已开始`);
+      } catch (error) {
+        button.disabled = false;
+        toast(error.message, true);
+      }
+    }, {once: true});
+  });
+}
+async function checkOllamaUpdates() {
+  if (cleanllmUpdateCheck) return cleanllmUpdateCheck;
+  const button = $("#check-ollama-updates");
+  if (button) { button.disabled = true; button.textContent = "检查中…"; }
+  cleanllmUpdateCheck = api("/api/ollama/models/updates").then(result => {
+    cleanllmOllamaUpdates = result.data || [];
+    renderOllamaUpdateCells(cleanllmOllamaUpdates);
+    const found = cleanllmOllamaUpdates.filter(item => item.update_available).length;
+    const unknown = cleanllmOllamaUpdates.some(item => item.state === "unknown");
+    if (button) button.textContent = found ? `发现 ${found} 个更新` : unknown ? "检查完成" : "已是最新";
+    return result;
+  }).catch(error => {
+    if (button) button.textContent = "检查更新";
+    if (error.message !== "请先登录") toast(error.message, true);
+    return null;
+  }).finally(() => {
+    cleanllmUpdateCheck = null;
+    syncOllamaUpdateButton();
+  });
+  return cleanllmUpdateCheck;
+}
+loadOllama = async function loadOllamaWithUpdates() {
+  await cleanllmBaseLoadOllama();
+  ensureOllamaUpdateButton();
+  renderOllamaUpdateCells(cleanllmOllamaUpdates);
+  syncOllamaUpdateButton();
+};
+ensureOllamaUpdateButton();
+cleanllmInitialLoad.then(() => {
+  renderOllamaUpdateCells(cleanllmOllamaUpdates);
+  syncOllamaUpdateButton();
+});
+
+// Match notify-router's single-query behavior: the top field searches the
+// current page, including data that is rendered or refreshed after typing.
+const cleanllmSearchItemSelector = [
+  "tbody tr", ".diagnostic-item", ".release-note", ".snapshot-list > article",
+  ".pricing-row", ".virtual-model-row", ".health-row", ".ollama-task-item",
+  ".stats-grid > .stat-card", ".analytics-stats > article", ".feature-list > div",
+  ".info-list > div", ".log-line", ".appearance-thumb"
+].join(",");
+function cleanllmSearchCandidates(page) {
+  return [...page.querySelectorAll(":scope > .panel, :scope > .stats-grid > .stat-card, :scope > .dashboard-grid > .panel, :scope > .settings-grid > .panel")];
+}
+function cleanllmSearchableText(node) {
+  if (!node) return "";
+  const controls = [...node.querySelectorAll("input, textarea, select")].map(control => {
+    const option = control.selectedOptions?.[0]?.textContent || "";
+    return `${control.value || ""} ${control.placeholder || ""} ${option}`;
+  }).join(" ");
+  return `${node.textContent || ""} ${node.getAttribute?.("title") || ""} ${node.getAttribute?.("aria-label") || ""} ${controls}`.toLocaleLowerCase("zh-CN");
+}
+function cleanllmSetSearchVisibility(node, visible) {
+  node.hidden = !visible;
+  if (visible) delete node.dataset.searchHidden;
+  else node.dataset.searchHidden = "1";
+}
+function cleanllmPanelSearch(panel, query) {
+  const items = [...panel.querySelectorAll(cleanllmSearchItemSelector)].filter(item =>
+    !item.parentElement?.closest(cleanllmSearchItemSelector)
+  );
+  if (!query) {
+    items.forEach(item => cleanllmSetSearchVisibility(item, true));
+    cleanllmSetSearchVisibility(panel, true);
+    return true;
+  }
+  if (!items.length) {
+    const matches = cleanllmSearchableText(panel).includes(query);
+    cleanllmSetSearchVisibility(panel, matches);
+    return matches;
+  }
+  const headerMatches = cleanllmSearchableText(panel.querySelector(":scope > .panel-header")).includes(query);
+  let matches = 0;
+  items.forEach(item => {
+    const visible = headerMatches || cleanllmSearchableText(item).includes(query);
+    cleanllmSetSearchVisibility(item, visible);
+    if (visible) matches += 1;
+  });
+  cleanllmSetSearchVisibility(panel, headerMatches || matches > 0);
+  return headerMatches || matches > 0;
+}
+function cleanllmApplyPageSearch() {
+  const page = document.querySelector(`.page[data-view="${currentPage()}"]`);
+  const input = $("#global-search");
+  if (!page || !input) return;
+  const query = input.value.trim().toLocaleLowerCase("zh-CN");
+  if (currentPage() === "logs") return;
+  const candidates = cleanllmSearchCandidates(page);
+  let empty = page.querySelector(".global-search-empty");
+  if (!empty) { page.insertAdjacentHTML("beforeend", '<div class="empty-state global-search-empty" hidden><div><h3>没有匹配内容</h3><p>请尝试其他关键词。</p></div></div>'); empty = page.querySelector(".global-search-empty"); }
+  const visible = candidates.reduce((count, node) => count + (cleanllmPanelSearch(node, query) ? 1 : 0), 0);
+  empty.hidden = !query || visible > 0;
+}
+function cleanllmResetPageSearch() {
+  document.querySelectorAll("[data-search-hidden]").forEach(node => { node.hidden = false; delete node.dataset.searchHidden; });
+  document.querySelectorAll(".global-search-empty").forEach(node => { node.hidden = true; });
+  const input = $("#global-search");
+  const meta = pages[currentPage()];
+  if (input && meta) { input.placeholder = `搜索${meta[1]}`; input.setAttribute("aria-label", `搜索${meta[1]}`); }
+}
+$("#global-search")?.addEventListener("input", cleanllmApplyPageSearch);
+window.addEventListener("hashchange", () => { cleanllmResetPageSearch(); });
+let cleanllmSearchFrame = 0;
+const cleanllmContent = document.querySelector(".content-wrap");
+if (cleanllmContent) new MutationObserver(() => {
+  if (!$("#global-search")?.value.trim() || cleanllmSearchFrame) return;
+  cleanllmSearchFrame = requestAnimationFrame(() => {
+    cleanllmSearchFrame = 0;
+    cleanllmApplyPageSearch();
+  });
+}).observe(cleanllmContent, {childList: true, subtree: true});
+const cleanllmShortcut = document.querySelector(".search kbd");
+if (cleanllmShortcut) cleanllmShortcut.textContent = /Mac|iPhone|iPad/i.test(navigator.platform || navigator.userAgent) ? "⌘ K" : "Ctrl K";
+cleanllmResetPageSearch();
