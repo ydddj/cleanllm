@@ -1840,8 +1840,46 @@ def test_ollama_digest_normalization_accepts_ollama_variants() -> None:
     assert proxy._normalize_ollama_digest("sha256:short") is None
 
 
+def test_ollama_serialized_manifest_digest_matches_go_encoding() -> None:
+    payload = {
+        "layers": [
+            {
+                "size": 2,
+                "digest": "sha256:layer",
+                "mediaType": "application/vnd.ollama.image.model",
+                "from": "base&model",
+            }
+        ],
+        "config": {
+            "size": 1,
+            "digest": "sha256:config",
+            "mediaType": "application/vnd.docker.container.image.v1+json",
+        },
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "schemaVersion": 2,
+        "ignoredByOllama": True,
+    }
+    go_encoded = (
+        b'{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json",'
+        b'"config":{"mediaType":"application/vnd.docker.container.image.v1+json",'
+        b'"digest":"sha256:config","size":1},"layers":[{"mediaType":'
+        b'"application/vnd.ollama.image.model","digest":"sha256:layer","size":2,'
+        b'"from":"base\\u0026model"}]}\n'
+    )
+    assert proxy._ollama_serialized_manifest_digest(payload) == (
+        f"sha256:{proxy.hashlib.sha256(go_encoded).hexdigest()}"
+    )
+
+
 def test_ollama_registry_bearer_challenge_is_parsed() -> None:
-    digest = f"sha256:{'d' * 64}"
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {"mediaType": "config", "digest": f"sha256:{'d' * 64}", "size": 1},
+        "layers": [],
+    }
+    digest = proxy._ollama_serialized_manifest_digest(manifest)
+    assert digest
     calls = []
 
     class FakeResponse:
@@ -1859,7 +1897,10 @@ def test_ollama_registry_bearer_challenge_is_parsed() -> None:
             if url == "https://auth.ollama.com/token":
                 return FakeResponse(payload={"token": "registry-token"})
             if kwargs.get("headers", {}).get("Authorization") == "Bearer registry-token":
-                return FakeResponse(headers={"docker-content-digest": digest})
+                return FakeResponse(
+                    headers={"docker-content-digest": f"sha256:{'e' * 64}"},
+                    payload=manifest,
+                )
             return FakeResponse(
                 status_code=401,
                 headers={
@@ -1880,30 +1921,33 @@ def test_ollama_registry_bearer_challenge_is_parsed() -> None:
     assert any(url == "https://auth.ollama.com/token" for url, _ in calls)
 
 
-def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, monkeypatch) -> None:
+def test_ollama_model_update_check_compares_serialized_manifest_digests(tmp_path: Path, monkeypatch) -> None:
     client = client_for(tmp_path)
     assert client.get("/api/ollama/models/updates").status_code == 401
     login(client)
     calls = []
-    same_digest = f"sha256:{'a' * 64}"
-    old_digest = f"sha256:{'b' * 64}"
-    new_digest = f"sha256:{'c' * 64}"
-
     same_manifest = {
         "schemaVersion": 2,
-        "config": {"digest": f"sha256:{'d' * 64}", "size": 1},
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {"mediaType": "config", "digest": f"sha256:{'a' * 64}", "size": 1},
         "layers": [],
     }
     old_manifest = {
         "schemaVersion": 2,
-        "config": {"digest": f"sha256:{'e' * 64}", "size": 1},
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {"mediaType": "config", "digest": f"sha256:{'b' * 64}", "size": 1},
         "layers": [],
     }
     new_manifest = {
         "schemaVersion": 2,
-        "config": {"digest": f"sha256:{'f' * 64}", "size": 1},
+        "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+        "config": {"mediaType": "config", "digest": f"sha256:{'c' * 64}", "size": 1},
         "layers": [],
     }
+    same_digest = proxy._ollama_serialized_manifest_digest(same_manifest)
+    old_digest = proxy._ollama_serialized_manifest_digest(old_manifest)
+    new_digest = proxy._ollama_serialized_manifest_digest(new_manifest)
+    assert same_digest and old_digest and new_digest
 
     class FakeResponse:
         def __init__(self, payload=None, *, status_code=200, headers=None, content=b""):
@@ -1942,15 +1986,15 @@ def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, mon
                     {"name": "local-model@sha256:abc", "digest": old_digest},
                 ]})
             if "/library/headerless/" in url:
-                # The tag and digest URLs deliberately expose differently
-                # formatted bytes but equivalent parsed manifests.
-                content = b'{"layers":[],"config":{"size":1},"schemaVersion":2}'
-                return FakeResponse(same_manifest, content=content)
+                return FakeResponse(old_manifest)
             if "/rinex20/translategemma3/manifests/12b" in url:
                 return FakeResponse(new_manifest, headers={"docker-content-digest": new_digest})
-            if url.endswith(old_digest):
-                return FakeResponse(old_manifest, headers={"docker-content-digest": old_digest})
-            return FakeResponse(headers={"docker-content-digest": same_digest})
+            return FakeResponse(
+                same_manifest,
+                # The Registry body/header digest is intentionally different
+                # from Ollama's locally re-serialized manifest digest.
+                headers={"docker-content-digest": f"sha256:{'d' * 64}"},
+            )
 
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeClient)
     response = client.get("/api/ollama/models/updates")
@@ -1965,6 +2009,7 @@ def test_ollama_model_update_check_compares_manifest_digests(tmp_path: Path, mon
     assert by_model["local-model@sha256:abc"]["state"] == "unknown"
     assert by_model["local-model@sha256:abc"]["detail"] == "仅支持 Ollama 公共仓库模型"
     assert not any("local-model" in url for url in calls)
+    assert not any(url.endswith(old_digest) for url in calls)
 
 
 def test_ollama_pull_surfaces_stream_errors_instead_of_reporting_success(tmp_path: Path, monkeypatch) -> None:

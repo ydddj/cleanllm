@@ -3578,6 +3578,62 @@ def _ollama_manifest_payload(response: httpx.Response) -> dict[str, Any] | None:
     return payload
 
 
+def _ollama_serialized_manifest_digest(payload: dict[str, Any]) -> str | None:
+    """Reproduce the digest Ollama exposes through ``/api/tags``.
+
+    Ollama decodes a registry manifest into its Go ``Manifest``/``Layer``
+    structs and writes it back with ``json.Encoder.Encode``.  The local model
+    ID is the SHA-256 of those bytes, including the trailing newline.  A
+    registry/CDN may serve semantically identical JSON with different spacing
+    or key order, so hashing the HTTP response body is not reliable.
+    """
+
+    def layer_value(value: Any) -> dict[str, Any] | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            size = int(value.get("size", 0))
+        except (TypeError, ValueError, OverflowError):
+            return None
+        layer: dict[str, Any] = {
+            "mediaType": str(value.get("mediaType") or ""),
+            "digest": str(value.get("digest") or ""),
+            "size": size,
+        }
+        # These are the only omitempty JSON fields in Ollama's Layer struct.
+        if value.get("from"):
+            layer["from"] = str(value["from"])
+        if value.get("name"):
+            layer["name"] = str(value["name"])
+        return layer
+
+    config = layer_value(payload.get("config"))
+    source_layers = payload.get("layers")
+    if config is None or not isinstance(source_layers, list):
+        return None
+    layers = [layer_value(layer) for layer in source_layers]
+    if any(layer is None for layer in layers):
+        return None
+    manifest = {
+        "schemaVersion": 2,
+        "mediaType": str(payload.get("mediaType") or ""),
+        "config": config,
+        "layers": layers,
+    }
+    encoded = json.dumps(
+        manifest, ensure_ascii=False, separators=(",", ":")
+    )
+    # Go encoding/json uses HTML-safe escaping by default.
+    encoded = (
+        encoded.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("\u2028", "\\u2028")
+        .replace("\u2029", "\\u2029")
+    )
+    return f"sha256:{hashlib.sha256((encoded + chr(10)).encode('utf-8')).hexdigest()}"
+
+
 async def _ollama_remote_digest(
     client: httpx.AsyncClient, model: str, local_digest: str | None = None
 ) -> tuple[str | None, str]:
@@ -3636,43 +3692,31 @@ async def _ollama_remote_digest(
             return None, "公共仓库未找到此模型或标签"
         if response.status_code >= 400:
             return None, f"公共仓库返回 HTTP {response.status_code}"
-        digest = response.headers.get("docker-content-digest") or response.headers.get("etag")
-        normalized_digest = _normalize_ollama_digest(
-            str(digest or "").strip().removeprefix("W/")
+        manifest_header = response.headers.get("docker-content-digest") or response.headers.get("etag")
+        manifest_digest = _normalize_ollama_digest(
+            str(manifest_header or "").strip().removeprefix("W/")
         )
-        if normalized_digest and normalized_digest == local_digest:
-            return normalized_digest, ""
-
-        # Some Ollama Registry responses omit Docker-Content-Digest or rewrite
-        # insignificant JSON formatting after a redirect.  Hashing that body
-        # directly can falsely report every installed model as outdated.
-        # Resolve the installed digest through the same registry and compare
-        # parsed manifests; only a real structural difference counts as an
-        # update.
         remote_manifest = _ollama_manifest_payload(response)
-        if local_digest and remote_manifest is not None:
-            local_response, local_error = await fetch_manifest(local_digest)
-            if local_error or local_response is None:
-                return None, local_error
-            if local_response.status_code >= 400:
-                # A different tag digest alone is not enough for the body-hash
-                # compatibility path.  Prefer "unknown" over telling users to
-                # update a model that may already be current.
-                return None, f"公共仓库无法校验本地版本（HTTP {local_response.status_code}）"
-            installed_manifest = _ollama_manifest_payload(local_response)
-            if installed_manifest is None:
-                return None, "公共仓库返回的本地版本 manifest 无效"
-            if installed_manifest == remote_manifest:
-                return local_digest, ""
-            canonical = json.dumps(
-                remote_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            ).encode("utf-8")
-            return normalized_digest or f"sha256:{hashlib.sha256(canonical).hexdigest()}", ""
-        if normalized_digest:
-            return normalized_digest, ""
         if remote_manifest is None:
             return None, "公共仓库响应不是有效的 Ollama manifest"
-        return None, "公共仓库缺少权威摘要，且无法校验本地版本"
+        ollama_digest = _ollama_serialized_manifest_digest(remote_manifest)
+        raw_content = bytes(getattr(response, "content", b"") or b"")
+        raw_digest = (
+            f"sha256:{hashlib.sha256(raw_content).hexdigest()}" if raw_content else None
+        )
+        # The serialized digest follows current Ollama behavior.  Header/raw
+        # candidates retain compatibility with releases that stored registry
+        # bytes directly rather than rewriting the manifest locally.
+        candidates = {ollama_digest, manifest_digest, raw_digest}
+        if local_digest and local_digest in candidates:
+            return local_digest, ""
+        if ollama_digest:
+            return ollama_digest, ""
+        if manifest_digest:
+            return manifest_digest, ""
+        if raw_digest:
+            return raw_digest, ""
+        return None, "公共仓库 manifest 无法计算可比较的模型摘要"
     except httpx.TimeoutException:
         return None, "连接公共仓库超时"
     except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
