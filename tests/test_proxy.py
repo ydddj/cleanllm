@@ -79,6 +79,7 @@ def test_admin_history_panels_and_chat_toolbar_layout() -> None:
     assert ".chat-system-field textarea" in overrides
     assert "min-height: 90px" in overrides
     assert app_script.index('id="ollama-model-name"') < app_script.index('id="background-pull"') < app_script.index('id="ollama-tasks"') < app_script.index('id="ollama-models"')
+    assert 'pullRow.insertAdjacentHTML("beforeend", \'<button id="check-ollama-updates"' in app_script
     assert "后台拉取当前模型" not in features
     assert "scheduleTaskRefresh" in features
     assert "event.target.closest(\".custom-select-menu\")" in features
@@ -100,6 +101,7 @@ def test_admin_history_panels_and_chat_toolbar_layout() -> None:
 
 
 def test_global_search_and_ollama_updates_are_wired_in_admin_ui() -> None:
+    index = (proxy.STATIC_DIR / "index.html").read_text(encoding="utf-8")
     app_script = (proxy.STATIC_DIR / "app.js").read_text(encoding="utf-8")
     features = (proxy.STATIC_DIR / "features.js").read_text(encoding="utf-8")
     overrides = (proxy.STATIC_DIR / "overrides.css").read_text(encoding="utf-8")
@@ -109,7 +111,13 @@ def test_global_search_and_ollama_updates_are_wired_in_admin_ui() -> None:
     assert "dataset.ollamaUpdateHeading" in app_script
     assert "row.lastElementChild?.before(cell)" in app_script
     assert "window.cleanllmRefreshOllamaTasks" in features
-    assert ".ollama-header-actions" in overrides
+    assert "grid-template-columns: minmax(220px, 1fr) repeat(3, auto)" in overrides
+    assert 'id="i-sidebar-collapse"' in index
+    assert 'id="i-sidebar-expand"' in index
+    assert 'id="menu-icon" href="#i-sidebar-collapse"' in index
+    assert 'id="i-sidebar-collapse"' in features
+    assert 'id="i-sidebar-expand"' in features
+    assert 'menuIcon?.setAttribute("href",mobile?"#i-menu":collapsed?"#i-sidebar-expand":"#i-sidebar-collapse")' in features
     assert ".topbar .service-pill > span" in overrides
     assert "flex-basis: 34px" in overrides
     assert 'html body .page [data-search-hidden="1"]' in overrides

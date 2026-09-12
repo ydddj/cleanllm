@@ -713,7 +713,7 @@
 
 .ollama-pull-row {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto;
+  grid-template-columns: minmax(220px, 1fr) repeat(3, auto);
   align-items: center;
   gap: 10px;
 }
@@ -849,7 +849,7 @@
 
 @media (max-width: 760px) {
   .ollama-pull-row {
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .ollama-pull-row input {
@@ -1022,14 +1022,6 @@
   opacity: .9;
 }
 
-.ollama-header-actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 9px;
-  flex-wrap: wrap;
-}
-
 #ollama-models [data-ollama-update-heading],
 #ollama-models [data-ollama-update-cell] {
   white-space: nowrap;
@@ -1039,11 +1031,4 @@
    search filtering authoritative regardless of those layout declarations. */
 html body .page [data-search-hidden="1"] {
   display: none !important;
-}
-
-@media (max-width: 700px) {
-  .ollama-header-actions {
-    width: 100%;
-    justify-content: flex-start;
-  }
 }

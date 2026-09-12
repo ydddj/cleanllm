@@ -34,14 +34,16 @@ const cleanllmBaseLoadOllama = loadOllama;
 let cleanllmUpdateCheck = null;
 let cleanllmOllamaUpdates = [];
 function ensureOllamaUpdateButton() {
-  const version = $("#ollama-version");
-  if (!version || $("#check-ollama-updates")) return;
-  const actions = document.createElement("div");
-  actions.className = "ollama-header-actions";
-  version.before(actions);
-  actions.append(version);
-  actions.insertAdjacentHTML("beforeend", '<button id="check-ollama-updates" class="button compact" type="button" disabled>检查更新</button>');
-  $("#check-ollama-updates").addEventListener("click", checkOllamaUpdates);
+  const pullRow = document.querySelector(".ollama-pull-row");
+  if (!pullRow) return;
+  if (!$("#check-ollama-updates")) {
+    pullRow.insertAdjacentHTML("beforeend", '<button id="check-ollama-updates" class="button" type="button" disabled>检查更新</button>');
+  }
+  const button = $("#check-ollama-updates");
+  if (button.dataset.bound !== "true") {
+    button.addEventListener("click", checkOllamaUpdates);
+    button.dataset.bound = "true";
+  }
 }
 function syncOllamaUpdateButton() {
   const button = $("#check-ollama-updates");
