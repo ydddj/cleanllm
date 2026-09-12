@@ -667,6 +667,22 @@
   padding-top: 16px;
 }
 
+/* Keep the live connection indicator aligned with the icon-only top actions.
+   Its complete state text remains available through the dynamic title. */
+.topbar .service-pill {
+  display: flex;
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  justify-content: center;
+  padding: 0;
+  white-space: nowrap;
+}
+
+.topbar .service-pill > span {
+  display: none;
+}
+
 @media (max-width: 1120px) and (min-width: 761px) {
   .topbar { padding-inline: 20px; }
   .search { width: min(330px, 38vw); }
@@ -675,6 +691,15 @@
   .service-pill { width: 38px; height: 38px; justify-content: center; padding: 0; }
   .topbar-actions { gap: 6px; }
   .user-button small { display: none; }
+}
+
+@media (max-width: 760px) {
+  .topbar .service-pill {
+    display: flex;
+    width: 34px;
+    height: 34px;
+    flex-basis: 34px;
+  }
 }
 
 .ollama-panel {

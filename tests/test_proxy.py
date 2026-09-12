@@ -110,6 +110,8 @@ def test_global_search_and_ollama_updates_are_wired_in_admin_ui() -> None:
     assert "row.lastElementChild?.before(cell)" in app_script
     assert "window.cleanllmRefreshOllamaTasks" in features
     assert ".ollama-header-actions" in overrides
+    assert ".topbar .service-pill > span" in overrides
+    assert "flex-basis: 34px" in overrides
     assert 'html body .page [data-search-hidden="1"]' in overrides
 
     assert "cleanllmSearchableText" in app_script
