@@ -67,7 +67,10 @@ function renderOllamaUpdateCells(updates) {
     const model = code.textContent.trim();
     const item = map.get(model);
     let content = '<span class="muted-value">未检查</span>';
-    if (updates && updates.length && (!item || item.state === "unknown")) content = '<span class="muted-value" title="私有仓库、本地模型或公共仓库暂不可用">无法检查</span>';
+    if (updates && updates.length && (!item || item.state === "unknown")) {
+      const detail = item?.detail || "私有仓库、本地模型或公共仓库暂不可用";
+      content = `<span class="muted-value" title="${escapeHtml(detail)}">无法检查</span>`;
+    }
     if (item?.state === "latest") content = '<span class="status-badge active">最新</span>';
     if (item?.state === "update") content = `<button class="button primary compact" type="button" data-ollama-update="${escapeHtml(model)}">更新模型</button>`;
     if (item?.state === "updating") content = '<span class="status-badge active">更新中</span>';

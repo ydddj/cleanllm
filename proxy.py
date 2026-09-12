@@ -3555,10 +3555,12 @@ def _ollama_registry_target(model: str) -> tuple[str, str, str] | None:
     return registry, repository, tag
 
 
-async def _ollama_remote_digest(client: httpx.AsyncClient, model: str) -> str | None:
+async def _ollama_remote_digest(
+    client: httpx.AsyncClient, model: str
+) -> tuple[str | None, str]:
     target = _ollama_registry_target(model)
     if target is None:
-        return None
+        return None, "仅支持 Ollama 公共仓库模型"
     registry, repository, tag = target
     url = f"https://{registry}/v2/{repository}/manifests/{tag}"
     headers = {
@@ -3568,7 +3570,9 @@ async def _ollama_remote_digest(client: httpx.AsyncClient, model: str) -> str | 
                 "application/vnd.oci.image.manifest.v1+json",
                 "application/vnd.oci.image.index.v1+json",
             )
-        )
+        ),
+        "Accept-Encoding": "identity",
+        "User-Agent": f"CleanLLM/{APP_VERSION}",
     }
     try:
         response = await client.get(url, headers=headers)
@@ -3576,11 +3580,11 @@ async def _ollama_remote_digest(client: httpx.AsyncClient, model: str) -> str | 
             challenge = response.headers.get("www-authenticate", "")
             match = re.match(r"Bearer\\s+(.+)", challenge, re.IGNORECASE)
             if not match:
-                return None
+                return None, "公共仓库要求鉴权，但未返回 Bearer 信息"
             values = {key: value for key, value in re.findall(r'(\\w+)="([^"]*)"', match.group(1))}
             realm = values.get("realm")
             if not realm:
-                return None
+                return None, "公共仓库鉴权地址缺失"
             realm_url = urlsplit(realm)
             realm_host = (realm_url.hostname or "").lower()
             if realm_url.scheme != "https" or not (
@@ -3588,23 +3592,39 @@ async def _ollama_remote_digest(client: httpx.AsyncClient, model: str) -> str | 
                 or realm_host.endswith(".ollama.ai")
                 or realm_host.endswith(".ollama.com")
             ):
-                return None
+                return None, "公共仓库返回了不受信任的鉴权地址"
             token_params = {key: values[key] for key in ("service", "scope") if values.get(key)}
             token_response = await client.get(realm, params=token_params)
             if token_response.status_code >= 400:
-                return None
+                return None, f"公共仓库鉴权失败（HTTP {token_response.status_code}）"
             token_payload = token_response.json()
             token = token_payload.get("token") or token_payload.get("access_token")
             if not token:
-                return None
+                return None, "公共仓库鉴权响应缺少令牌"
             headers["Authorization"] = f"Bearer {token}"
             response = await client.get(url, headers=headers)
+        if response.status_code == 404:
+            return None, "公共仓库未找到此模型或标签"
         if response.status_code >= 400:
-            return None
-        digest = response.headers.get("docker-content-digest")
-        return str(digest).strip() if digest else None
-    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
-        return None
+            return None, f"公共仓库返回 HTTP {response.status_code}"
+        digest = response.headers.get("docker-content-digest") or response.headers.get("etag")
+        if digest:
+            normalized_digest = str(digest).strip().removeprefix("W/").strip('"').lower()
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", normalized_digest):
+                return normalized_digest, ""
+        # registry.ollama.ai does not consistently include the optional
+        # Docker-Content-Digest header.  The local /api/tags digest is the
+        # SHA-256 of the raw manifest, so calculate the same value as a safe
+        # compatibility fallback.  identity encoding avoids hashing a
+        # transparently decompressed representation.
+        content = bytes(response.content or b"")
+        if content:
+            return f"sha256:{hashlib.sha256(content).hexdigest()}", ""
+        return None, "公共仓库响应缺少 manifest 摘要"
+    except httpx.TimeoutException:
+        return None, "连接公共仓库超时"
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError) as exc:
+        return None, f"公共仓库检查失败：{type(exc).__name__}"
 
 
 @app.get("/api/ollama/models/updates")
@@ -3616,7 +3636,7 @@ async def check_ollama_model_updates(_: None = Depends(require_admin)) -> dict[s
     """
     base_url = ollama_base_url(load_settings())
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             response = await client.get(f"{base_url}/api/tags")
             response.raise_for_status()
             payload = response.json()
@@ -3629,10 +3649,12 @@ async def check_ollama_model_updates(_: None = Depends(require_admin)) -> dict[s
             async def inspect(item: dict[str, Any]) -> dict[str, Any]:
                 async with semaphore:
                     model = str(item.get("name") or item.get("model"))
-                    local_digest = str(item.get("digest") or "").strip() or None
-                    remote_digest = await _ollama_remote_digest(client, model)
+                    local_digest = str(item.get("digest") or "").strip().lower() or None
+                    remote_digest, detail = await _ollama_remote_digest(client, model)
                     if not local_digest or not remote_digest:
                         state = "unknown"
+                        if not local_digest:
+                            detail = "Ollama 未返回本地 manifest 摘要"
                     elif local_digest == remote_digest:
                         state = "latest"
                     else:
@@ -3642,6 +3664,7 @@ async def check_ollama_model_updates(_: None = Depends(require_admin)) -> dict[s
                         "local_digest": local_digest,
                         "remote_digest": remote_digest,
                         "state": state,
+                        "detail": detail if state == "unknown" else "",
                         "update_available": state == "update",
                     }
 
